@@ -5,6 +5,7 @@ from sqlalchemy import select
 
 
 KEY_LATEST_TASK_ID = "latest_task_id"
+KEY_NEXT_TASK_ID = "next_task_id"
 
 
 class SamplingStateStore:
@@ -35,7 +36,18 @@ class SamplingStateStore:
             return None
 
     async def set_latest_task_id(self, task_id: int) -> None:
-        await self.set_value(KEY_LATEST_TASK_ID, str(task_id))
+        """Commit successful round: publish latest_task_id and advance next_task_id for observers."""
+        async with get_session() as session:
+            for key, value in (
+                (KEY_LATEST_TASK_ID, str(task_id)),
+                (KEY_NEXT_TASK_ID, str(task_id + 1)),
+            ):
+                r = await session.execute(select(SamplingState).where(SamplingState.key == key))
+                row = r.scalar_one_or_none()
+                if row:
+                    row.value = value
+                else:
+                    session.add(SamplingState(key=key, value=value))
 
     async def ensure_next_task_id_synced(self) -> None:
         latest = await self.get_latest_task_id()
@@ -43,23 +55,17 @@ class SamplingStateStore:
             return
         async with get_session() as session:
             r = await session.execute(
-                select(SamplingState).where(SamplingState.key == "next_task_id")
+                select(SamplingState).where(SamplingState.key == KEY_NEXT_TASK_ID)
             )
             row = r.scalar_one_or_none()
             if row is None:
-                session.add(SamplingState(key="next_task_id", value=str(latest + 1)))
+                session.add(SamplingState(key=KEY_NEXT_TASK_ID, value=str(latest + 1)))
 
-    async def get_and_increment_next_task_id(self) -> int:
-        async with get_session() as session:
-            r = await session.execute(
-                select(SamplingState).where(SamplingState.key == "next_task_id")
-            )
-            row = r.scalar_one_or_none()
-            if row is None:
-                next_id = 1
-                session.add(SamplingState(key="next_task_id", value="2"))
-            else:
-                next_id = int(row.value)
-                row.value = str(next_id + 1)
-            await session.flush()
-            return next_id
+    async def peek_next_task_id(self) -> int:
+        """Next task id to attempt for this round (read-only).
+
+        Does not advance the counter. On a failed round, the same id is returned again;
+        the counter only moves when :meth:`set_latest_task_id` runs after a successful upload.
+        """
+        latest = await self.get_latest_task_id()
+        return (latest or 0) + 1

@@ -343,8 +343,8 @@ async def run_owner_sampler_loop() -> None:
                 await _sleep_until_next_round()
                 continue
 
-            task_id = await sampling_state_dao.get_and_increment_next_task_id()
-            log(f"Allocated task_id={task_id}", "info")
+            task_id = await sampling_state_dao.peek_next_task_id()
+            log(f"Attempting task_id={task_id} (latest_task_id advances only after successful upload)", "info")
 
             miners = _build_generation_miners(valid_miners)
             log(f"Found {len(miners)} valid miners", "info")
