@@ -2,11 +2,14 @@
 Score calculation background task for dashboard.
 
 1) Per-validator scores: from validator_samples into rank_scores (dashboard).
-2) Stake-weighted scorer: every SCORER_INTERVAL (1h), use latest 100 evaluated tasks,
-   compute per (task_id, miner) pass/fail via stake-weighted validator votes, rank miners
-   with completeness >= 0.8, persist to miner_task_ranks.
-3) Rank (dominance): same 1h cycle, compute top-ranked miner by dominance (block order + 5%
-   threshold), full rank by passed_count, persist to miner_ranks for /weights and /rank.
+2) Stake-weighted scorer: every SCORER_INTERVAL, use a **consecutive** task_id window of
+   length SCORER_TASK_WINDOW ending at max(task_id) in validator_samples, i.e.
+   [max_id - N + 1, max_id]. Scoring does not run until max_id >= N (full window exists).
+   Eligibility: completeness = (tasks evaluated in that window) / N must be >=
+   COMPLETENESS_ELIGIBILITY_THRESHOLD (default 80%). Pass/fail per task uses stake-weighted
+   validator votes; rank eligible miners by task_passed_count (win rate over evaluated tasks).
+3) Rank (dominance): same cycle, among eligible miners compute top by dominance
+   (block order + DOMINANCE_THRESHOLD), persist to miner_ranks for /weights and /rank.
 """
 
 import os
@@ -15,6 +18,10 @@ from typing import Dict, Set, List, Tuple, Optional
 
 from leoma.bootstrap import emit_log as log, emit_header as log_header, log_exception
 from leoma.infra.rank import find_dominant_winner, compute_rank_from_miner_stats
+from leoma.infra.scorer_constants import (
+    COMPLETENESS_ELIGIBILITY_THRESHOLD,
+    SCORER_TASK_WINDOW,
+)
 from leoma.infra.db.stores import (
     MinerRankStore,
     MinerTaskRankStore,
@@ -28,8 +35,6 @@ from leoma.infra.db.stores import (
 # Configuration
 SCORE_CALCULATION_INTERVAL = int(os.environ.get("SCORE_CALCULATION_INTERVAL", "300"))  # 5 min
 SCORER_INTERVAL = int(os.environ.get("SCORER_INTERVAL", "1800"))  # 30 mins
-SCORER_TASK_WINDOW = 100
-SCORER_COMPLETENESS_THRESHOLD = 0.8
 # Dominance: late miner must beat each earlier miner's pass_rate by this threshold to be top
 DOMINANCE_THRESHOLD = float(os.environ.get("DOMINANCE_THRESHOLD", "0.05"))
 
@@ -102,17 +107,6 @@ class ScoreCalculationTask:
                 "pass_rate": pass_rate,
             }
         return scores_to_save
-
-    @staticmethod
-    def _aggregate_miner_totals(all_scores: list) -> Dict[str, Dict[str, int]]:
-        """Aggregate total passed_count/samples by miner across validators."""
-        miner_totals: Dict[str, Dict[str, int]] = {}
-        for score in all_scores:
-            if score.miner_hotkey not in miner_totals:
-                miner_totals[score.miner_hotkey] = {"passed_count": 0, "total": 0}
-            miner_totals[score.miner_hotkey]["passed_count"] += score.total_passed
-            miner_totals[score.miner_hotkey]["total"] += score.total_samples
-        return miner_totals
 
     @staticmethod
     def _find_leader(miner_totals: Dict[str, Dict[str, int]]) -> tuple[str | None, float]:
@@ -213,7 +207,17 @@ class ScoreCalculationTask:
         # Log current leader (based on simple pass rate, not weighted)
         all_scores = await self.rank_scores_dao.get_all_scores()
         if all_scores:
-            miner_totals = self._aggregate_miner_totals(all_scores)
+            validators = await self.validators_dao.get_all_validators()
+            stake_map = {v.hotkey: max(0.0, float(v.stake)) for v in validators}
+            miner_hotkeys = {s.miner_hotkey for s in all_scores}
+            sampling = await self.validator_samples_dao.get_miner_sampling_stats_by_hotkeys(
+                stake_map, miner_hotkeys
+            )
+            miner_totals = {
+                hk: {"passed_count": s["passed_tasks"], "total": s["total_tasks"]}
+                for hk, s in sampling.items()
+                if s["total_tasks"] > 0
+            }
             leader, leader_rate = self._find_leader(miner_totals)
             
             if leader:
@@ -225,14 +229,24 @@ class ScoreCalculationTask:
                 )
 
     async def _run_stake_weighted_scorer(self) -> None:
-        """Stake-weighted scorer: latest 100 tasks, completeness >= 0.8, rank by task_passed_count."""
-        log_header("Stake-weighted Scorer (latest 100 tasks)")
-        task_ids = await self.validator_samples_dao.get_latest_evaluated_task_ids(
-            limit=SCORER_TASK_WINDOW
-        )
-        if len(task_ids) < 10:
-            log("Not enough evaluated tasks for scorer", "info")
+        """Stake-weighted scorer: consecutive task_id window of length SCORER_TASK_WINDOW.
+
+        Window = [max_task_id - N + 1, max_task_id]. No rankings until max_task_id >= N.
+        Eligible miners must have evaluations on every task_id in that window.
+        """
+        log_header(f"Stake-weighted Scorer ({SCORER_TASK_WINDOW}-task consecutive window)")
+        max_tid = await self.validator_samples_dao.get_max_evaluated_task_id()
+        if max_tid is None or max_tid < SCORER_TASK_WINDOW:
+            log(
+                f"Scorer skipped: max_task_id={max_tid}, need max_task_id>={SCORER_TASK_WINDOW} "
+                f"to form window [max-{SCORER_TASK_WINDOW - 1} … max]",
+                "info",
+            )
+            await self.miner_task_rank_dao.delete_miners_not_in(set())
             return
+
+        task_ids = list(range(max_tid - SCORER_TASK_WINDOW + 1, max_tid + 1))
+        window_set = frozenset(task_ids)
         window_size = len(task_ids)
         samples = await self.validator_samples_dao.get_samples_in_task_window(task_ids)
         validators = await self.validators_dao.get_all_validators()
@@ -263,17 +277,19 @@ class ScoreCalculationTask:
             if avg_score > 0.5:
                 task_passes[miner_hotkey].add(task_id)
 
-        # completeness = tasks_evaluated / window_size; rank only miners with completeness >= 0.8
+        # Eligible if evaluated task count in window / window_size >= completeness threshold (default 80%).
         valid_miners = await self._get_valid_miner_hotkeys()
         eligible: List[Tuple[str, int, int, float]] = []
-        for miner_hotkey in set(task_evaluated.keys()):
+        for miner_hotkey, ev_set in task_evaluated.items():
             if miner_hotkey not in valid_miners:
                 continue
-            evaluated = len(task_evaluated[miner_hotkey])
+            ev_in_window = ev_set & window_set
+            evaluated = len(ev_in_window)
             completeness = evaluated / window_size if window_size else 0.0
-            if completeness < SCORER_COMPLETENESS_THRESHOLD:
+            if completeness < COMPLETENESS_ELIGIBILITY_THRESHOLD - 1e-12:
                 continue
-            passed_count = len(task_passes.get(miner_hotkey, set()))
+            # Passes only among tasks that both were evaluated and passed stake vote
+            passed_count = len(task_passes.get(miner_hotkey, set()) & ev_in_window)
             eligible.append((miner_hotkey, passed_count, evaluated, completeness))
         eligible.sort(key=lambda x: (-x[1], -x[2]))
 
@@ -285,7 +301,14 @@ class ScoreCalculationTask:
                 completeness=completeness,
                 rank=r,
             )
-        log(f"Stake-weighted scorer: {len(eligible)} miners ranked (window={window_size}, completeness>={SCORER_COMPLETENESS_THRESHOLD})", "success")
+        keep = {hk for hk, _, _, _ in eligible}
+        await self.miner_task_rank_dao.delete_miners_not_in(keep)
+        log(
+            f"Stake-weighted scorer: {len(eligible)} miners ranked "
+            f"(window task_ids {task_ids[0]}…{task_ids[-1]}, size={window_size}, "
+            f"completeness>={COMPLETENESS_ELIGIBILITY_THRESHOLD})",
+            "success",
+        )
         if eligible:
             top = eligible[0]
             log(f"Top miner: {top[0][:12]}... ({top[1]} task passes, rank 1)", "info")
@@ -294,7 +317,7 @@ class ScoreCalculationTask:
         """Compute rank by dominance (block + 5% threshold), persist to miner_ranks.
         Rank 1 = top-ranked miner; rest by passed_count desc. Used by GET /weights and /rank.
         
-        Only includes miners who are eligible (completeness >= threshold from miner_task_ranks).
+        Only includes miners present in miner_task_ranks (met completeness threshold).
         """
         log_header("Rank update (dominance)")
         

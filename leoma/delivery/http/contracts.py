@@ -143,7 +143,7 @@ class MinerRankEntry(BaseModel):
     passed_count: int
     pass_rate: float
     block: Optional[int] = None
-    eligible: bool = False  # True when completeness (completed_tasks/window) >= 0.8
+    eligible: bool = False  # True when completeness (evaluated tasks / window size) >= threshold (e.g. 80%)
 
 
 class RankResponse(BaseModel):

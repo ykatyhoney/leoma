@@ -3,16 +3,7 @@
 from typing import Any
 
 from leoma.delivery.http.contracts import MinerTaskEntry, TaskDetailMinerEntry
-
-
-def stake_weighted_pass(samples_with_stakes: list[tuple[bool, float]]) -> bool:
-    """Return True when stake-weighted average score is above 0.5."""
-    total_stake = sum(stake for _, stake in samples_with_stakes)
-    if total_stake <= 0:
-        return False
-    weighted = sum((1 if passed else 0) * stake for passed, stake in samples_with_stakes)
-    return (weighted / total_stake) > 0.5
-
+from leoma.infra.stake_voting import stake_weighted_pass
 
 def build_miner_task_entries(samples: list[Any], stake_map: dict[str, float]) -> list[MinerTaskEntry]:
     """Aggregate validator samples into per-task pass/fail entries for one miner."""

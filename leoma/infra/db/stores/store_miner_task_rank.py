@@ -1,7 +1,7 @@
 """Miner task rank store."""
-from typing import List, Optional
+from typing import List, Optional, Set
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from leoma.infra.db.pool import get_session
 from leoma.infra.db.tables import MinerTaskRank
@@ -57,3 +57,18 @@ class MinerTaskRankStore:
                 select(MinerTaskRank).where(MinerTaskRank.miner_hotkey == miner_hotkey)
             )
             return r.scalar_one_or_none()
+
+    async def delete_miners_not_in(self, keep_hotkeys: Set[str]) -> int:
+        """Remove rows for miners no longer meeting completeness (stale eligibility fix).
+
+        After each scorer run, only ``keep_hotkeys`` should remain; everyone else is dropped
+        so dashboard eligibility and dominance do not use outdated completeness.
+        """
+        async with get_session() as session:
+            if not keep_hotkeys:
+                result = await session.execute(delete(MinerTaskRank))
+            else:
+                result = await session.execute(
+                    delete(MinerTaskRank).where(~MinerTaskRank.miner_hotkey.in_(keep_hotkeys))
+                )
+            return result.rowcount or 0

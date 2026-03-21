@@ -24,17 +24,23 @@ from leoma.delivery.http.contracts import (
     MinerRankEntry,
 )
 from leoma.delivery.http.validators import validate_miner_hotkey, validate_validator_hotkey
-from leoma.infra.db.stores import MinerRankStore, MinerTaskRankStore, ParticipantStore, RankStore, SampleStore
-
+from leoma.infra.db.stores import (
+    MinerRankStore,
+    MinerTaskRankStore,
+    ParticipantStore,
+    RankStore,
+    SampleStore,
+    ValidatorStore,
+)
+from leoma.infra.scorer_constants import COMPLETENESS_ELIGIBILITY_THRESHOLD
 
 router = APIRouter()
 rank_scores_dao = RankStore()
 validator_samples_dao = SampleStore()
+validators_dao = ValidatorStore()
 miner_rank_dao = MinerRankStore()
 miner_task_rank_dao = MinerTaskRankStore()
 valid_miners_dao = ParticipantStore()
-
-ELIGIBLE_COMPLETENESS_THRESHOLD = 0.8
 
 
 def _format_timestamp(timestamp: datetime | None) -> str | None:
@@ -67,7 +73,12 @@ def _miner_score_entry(score: Any) -> MinerScoreEntry:
 
 
 def _aggregate_miner_scores(scores: list[Any]) -> AggregatedStats:
-    """Aggregate validator-reported scores for one miner."""
+    """Aggregate validator-reported scores for one miner (per-validator rows only).
+
+    Do not use total_samples/total_passed from this for cross-validator "sampling count":
+    those fields sum evaluation rows; use :meth:`SampleStore.get_miner_sampling_stats_by_hotkeys`
+    for distinct tasks per miner.
+    """
     if not scores:
         return AggregatedStats(
             total_samples=0,
@@ -89,6 +100,30 @@ def _aggregate_miner_scores(scores: list[Any]) -> AggregatedStats:
         pass_rate=pass_rate,
         validator_count=len(scores),
     )
+
+def _stake_map_from_validators(validators: list[Any]) -> dict[str, float]:
+    return {v.hotkey: max(0.0, float(v.stake)) for v in validators}
+
+
+async def _merge_sampling_into_aggregated_scores(
+    aggregated: dict[str, dict[str, Any]],
+) -> None:
+    """Replace total_samples/total_passed/pass_rate with distinct-task sampling stats."""
+    if not aggregated:
+        return
+    validators = await validators_dao.get_all_validators()
+    stake_map = _stake_map_from_validators(validators)
+    sampling = await validator_samples_dao.get_miner_sampling_stats_by_hotkeys(
+        stake_map, aggregated.keys()
+    )
+    for hk, data in aggregated.items():
+        s = sampling.get(hk)
+        if not s or s["total_tasks"] <= 0:
+            continue
+        tt, pt = s["total_tasks"], s["passed_tasks"]
+        data["total_samples"] = tt
+        data["total_passed"] = pt
+        data["pass_rate"] = pt / tt if tt else 0.0
 
 
 @router.get("/validators", response_model=List[ValidatorSummaryResponse])
@@ -127,6 +162,7 @@ async def get_aggregated_scores() -> AggregatedScoreResponse:
         Aggregated scores for all miners (dashboard view)
     """
     scores = await rank_scores_dao.get_aggregated_scores()
+    await _merge_sampling_into_aggregated_scores(scores)
     all_scores = await rank_scores_dao.get_all_scores()
 
     validators = set(s.validator_hotkey for s in all_scores)
@@ -156,11 +192,27 @@ async def get_miner_scores(
     """
     miner_hotkey = validate_miner_hotkey(miner_hotkey)
     scores = await rank_scores_dao.get_scores_by_miner(miner_hotkey)
+    agg = _aggregate_miner_scores(scores)
+    validators = await validators_dao.get_all_validators()
+    sampling = await validator_samples_dao.get_miner_sampling_stats_by_hotkeys(
+        _stake_map_from_validators(validators), [miner_hotkey]
+    )
+    s = sampling.get(miner_hotkey)
+    if s and s["total_tasks"] > 0:
+        tt, pt = s["total_tasks"], s["passed_tasks"]
+        agg = AggregatedStats(
+            total_samples=tt,
+            total_passed=pt,
+            avg_score=agg.avg_score,
+            pass_rate=pt / tt if tt else 0.0,
+            validator_count=agg.validator_count,
+        )
+
     
     return MinerScoresResponse(
         miner_hotkey=miner_hotkey,
         by_validator=[_validator_score_detail(score) for score in scores],
-        aggregated=_aggregate_miner_scores(scores),
+        aggregated=agg,
     )
 
 
@@ -199,7 +251,8 @@ async def get_rank() -> RankResponse:
     
     Rank is calculated by dominance: block order first; to dominate earlier miners,
     pass_rate must exceed theirs by 5%. Rank 1 = top-ranked miner. Updated every 1h with score calculation.
-    eligible = True when completeness (completed_tasks / window) >= 0.8.
+    eligible = True when completeness (evaluated tasks / window size) >= threshold
+    for the consecutive scoring window ending at max task_id (default threshold 80%).
     """
     rows = await miner_rank_dao.get_all_ordered_by_rank()
     entries: List[MinerRankEntry] = []
@@ -207,7 +260,8 @@ async def get_rank() -> RankResponse:
         miner = await valid_miners_dao.get_miner_by_hotkey(r.miner_hotkey)
         uid = _uid_for_rank_miner(miner)
         task_rank = await miner_task_rank_dao.get_by_miner(r.miner_hotkey)
-        eligible = task_rank is not None and getattr(task_rank, "completeness", 0.0) >= ELIGIBLE_COMPLETENESS_THRESHOLD
+        comp = float(getattr(task_rank, "completeness", 0.0)) if task_rank else 0.0
+        eligible = task_rank is not None and comp >= COMPLETENESS_ELIGIBILITY_THRESHOLD - 1e-9
         entries.append(
             MinerRankEntry(
                 miner_hotkey=r.miner_hotkey,

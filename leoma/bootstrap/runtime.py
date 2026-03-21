@@ -418,7 +418,7 @@ class Settings:
     def __init__(self) -> None:
         self.netuid = _read_int("NETUID", 99)
         self.epoch_len = _read_int("EPOCH_LEN", 180)
-        self.request_timeout = _read_int("REQUEST_TIMEOUT", 600)
+        self.request_timeout = _read_int("REQUEST_TIMEOUT", 300)
         self.chutes_api_url = _read_str("CHUTES_API_URL", "https://api.chutes.ai")
         self.chutes_api_key = _read_optional_str("CHUTES_API_KEY")
         self.wallet_name = _read_str("WALLET_NAME", "default")

@@ -170,7 +170,7 @@ class MinerRank(Base):
 
 
 class MinerTaskRank(Base):
-    """Per-miner task-pass ranking (stake-weighted, completeness >= 0.8)."""
+    """Per-miner task-pass ranking (stake-weighted; consecutive window + completeness threshold)."""
     __tablename__ = "miner_task_ranks"
 
     miner_hotkey: Mapped[str] = mapped_column(String(64), primary_key=True)

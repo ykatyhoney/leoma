@@ -150,7 +150,7 @@ To run a **miner** on the Leoma subnet: upload your **Text-Image to Video (TI2V)
   ```bash
   leoma get-rank
   ```
-- **API:** `GET /miners/list`, `GET /miners/{hotkey}`, `GET /scores/rank` — check `is_valid`, `invalid_reason`, and `eligible` (completeness ≥ 80%).
+- **API:** `GET /miners/list`, `GET /miners/{hotkey}`, `GET /scores/rank` — check `is_valid`, `invalid_reason`, and `eligible` (completeness ≥ `SCORER_COMPLETENESS_THRESHOLD`, default **80%**, over the consecutive `SCORER_TASK_WINDOW` task_ids ending at max `task_id`).
 
 ---
 
