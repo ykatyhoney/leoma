@@ -280,6 +280,7 @@ class SampleStore:
         self,
         stake_by_validator: Dict[str, float],
         miner_hotkeys: Collection[str],
+        task_ids: Optional[Collection[int]] = None,
     ) -> Dict[str, Dict[str, int]]:
         """Per-miner distinct task counts (sampling count) and stake-weighted pass counts.
 
@@ -287,12 +288,24 @@ class SampleStore:
         (one per sampled task, not sum of per-validator evaluation rows).
 
         ``passed_tasks`` = among those tasks, how many pass stake-weighted voting across validators.
+
+        If ``task_ids`` is set (see ``scoring_window_task_ids`` in ``leoma.infra.scorer_constants``),
+        only samples whose ``task_id`` is in that set are counted — pass rate is then
+        ``passed_tasks / total_tasks`` **within that window**, matching the stake-weighted scorer.
         """
         keys = frozenset(miner_hotkeys)
         if not keys:
             return {}
         async with get_session() as session:
             q = select(ValidatorSample).where(ValidatorSample.miner_hotkey.in_(keys))
+            if task_ids is not None:
+                tid = frozenset(task_ids)
+                if not tid:
+                    return {hk: {"total_tasks": 0, "passed_tasks": 0} for hk in keys}
+                q = q.where(
+                    ValidatorSample.task_id.isnot(None),
+                    ValidatorSample.task_id.in_(tid),
+                )
             r = await session.execute(q)
             samples = list(r.scalars().all())
 

@@ -21,6 +21,7 @@ from leoma.infra.rank import find_dominant_winner, compute_rank_from_miner_stats
 from leoma.infra.scorer_constants import (
     COMPLETENESS_ELIGIBILITY_THRESHOLD,
     SCORER_TASK_WINDOW,
+    scoring_window_task_ids,
 )
 from leoma.infra.db.stores import (
     MinerRankStore,
@@ -210,8 +211,10 @@ class ScoreCalculationTask:
             validators = await self.validators_dao.get_all_validators()
             stake_map = {v.hotkey: max(0.0, float(v.stake)) for v in validators}
             miner_hotkeys = {s.miner_hotkey for s in all_scores}
+            max_tid = await self.validator_samples_dao.get_max_evaluated_task_id()
+            window = scoring_window_task_ids(max_tid)
             sampling = await self.validator_samples_dao.get_miner_sampling_stats_by_hotkeys(
-                stake_map, miner_hotkeys
+                stake_map, miner_hotkeys, task_ids=window
             )
             miner_totals = {
                 hk: {"passed_count": s["passed_tasks"], "total": s["total_tasks"]}

@@ -32,7 +32,10 @@ from leoma.infra.db.stores import (
     SampleStore,
     ValidatorStore,
 )
-from leoma.infra.scorer_constants import COMPLETENESS_ELIGIBILITY_THRESHOLD
+from leoma.infra.scorer_constants import (
+    COMPLETENESS_ELIGIBILITY_THRESHOLD,
+    scoring_window_task_ids,
+)
 
 router = APIRouter()
 rank_scores_dao = RankStore()
@@ -108,22 +111,38 @@ def _stake_map_from_validators(validators: list[Any]) -> dict[str, float]:
 async def _merge_sampling_into_aggregated_scores(
     aggregated: dict[str, dict[str, Any]],
 ) -> None:
-    """Replace total_samples/total_passed/pass_rate with distinct-task sampling stats."""
+    """Replace total_samples/total_passed/pass_rate with stake-weighted distinct-task stats.
+
+    When ``max(task_id)`` is known, counts are restricted to the current scoring window
+    (same consecutive ``task_id`` range as the stake-weighted scorer). Otherwise falls
+    back to all-time distinct-task stats (no ``max_task_id`` yet).
+    """
     if not aggregated:
         return
     validators = await validators_dao.get_all_validators()
     stake_map = _stake_map_from_validators(validators)
+    max_tid = await validator_samples_dao.get_max_evaluated_task_id()
+    window = scoring_window_task_ids(max_tid)
     sampling = await validator_samples_dao.get_miner_sampling_stats_by_hotkeys(
-        stake_map, aggregated.keys()
+        stake_map, aggregated.keys(), task_ids=window
     )
     for hk, data in aggregated.items():
         s = sampling.get(hk)
-        if not s or s["total_tasks"] <= 0:
-            continue
-        tt, pt = s["total_tasks"], s["passed_tasks"]
+        if window is None:
+            if not s or s["total_tasks"] <= 0:
+                continue
+            tt, pt = s["total_tasks"], s["passed_tasks"]
+        else:
+            if s and s["total_tasks"] > 0:
+                tt, pt = s["total_tasks"], s["passed_tasks"]
+            else:
+                tt, pt = 0, 0
+        pr = pt / tt if tt else 0.0
         data["total_samples"] = tt
         data["total_passed"] = pt
-        data["pass_rate"] = pt / tt if tt else 0.0
+        data["pass_rate"] = pr
+        if window is not None:
+            data["avg_score"] = pr
 
 
 @router.get("/validators", response_model=List[ValidatorSummaryResponse])
@@ -194,17 +213,33 @@ async def get_miner_scores(
     scores = await rank_scores_dao.get_scores_by_miner(miner_hotkey)
     agg = _aggregate_miner_scores(scores)
     validators = await validators_dao.get_all_validators()
+    max_tid = await validator_samples_dao.get_max_evaluated_task_id()
+    window = scoring_window_task_ids(max_tid)
     sampling = await validator_samples_dao.get_miner_sampling_stats_by_hotkeys(
-        _stake_map_from_validators(validators), [miner_hotkey]
+        _stake_map_from_validators(validators), [miner_hotkey], task_ids=window
     )
     s = sampling.get(miner_hotkey)
-    if s and s["total_tasks"] > 0:
-        tt, pt = s["total_tasks"], s["passed_tasks"]
+    if window is None:
+        if s and s["total_tasks"] > 0:
+            tt, pt = s["total_tasks"], s["passed_tasks"]
+            agg = AggregatedStats(
+                total_samples=tt,
+                total_passed=pt,
+                avg_score=agg.avg_score,
+                pass_rate=pt / tt if tt else 0.0,
+                validator_count=agg.validator_count,
+            )
+    else:
+        if s and s["total_tasks"] > 0:
+            tt, pt = s["total_tasks"], s["passed_tasks"]
+        else:
+            tt, pt = 0, 0
+        pr = pt / tt if tt else 0.0
         agg = AggregatedStats(
             total_samples=tt,
             total_passed=pt,
-            avg_score=agg.avg_score,
-            pass_rate=pt / tt if tt else 0.0,
+            avg_score=pr,
+            pass_rate=pr,
             validator_count=agg.validator_count,
         )
 
