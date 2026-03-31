@@ -458,19 +458,18 @@ class Settings:
         self.hippius_samples_write_secret_key = _read_optional_str("HIPPIUS_SAMPLES_WRITE_SECRET_KEY")
         self.source_bucket = _read_str("HIPPIUS_SOURCE_BUCKET", "videos")
         self.samples_bucket = _read_str("HIPPIUS_SAMPLES_BUCKET", "samples")
-        self.object_storage_backend = _parse_object_storage_backend(
-            os.environ.get("OBJECT_STORAGE_BACKEND", "r2")
-        )
-        self.r2_endpoint_raw = _read_str("R2_ENDPOINT", "https://cce499ad4f3a4703b069771d8ff4215a.r2.cloudflarestorage.com")
-        self.r2_region = _read_str("R2_REGION", "auto")
-        self.r2_source_bucket = _read_str("R2_SOURCE_BUCKET", "leoma-videos")
-        self.r2_samples_bucket = _read_str("R2_SAMPLES_BUCKET", "leoma-samples")
+        self.object_storage_backend = "r2"
+
+        self.r2_endpoint_raw = "https://cce499ad4f3a4703b069771d8ff4215a.r2.cloudflarestorage.com"
+        self.r2_region = "auto"
+        self.r2_source_bucket = "leoma-videos"
+        self.r2_samples_bucket = "leoma-samples"
         self.r2_videos_read_access_key = _read_optional_str("R2_VIDEOS_READ_ACCESS_KEY")
         self.r2_videos_read_secret_key = _read_optional_str("R2_VIDEOS_READ_SECRET_KEY")
         self.r2_videos_write_access_key = _read_optional_str("R2_VIDEOS_WRITE_ACCESS_KEY")
         self.r2_videos_write_secret_key = _read_optional_str("R2_VIDEOS_WRITE_SECRET_KEY")
-        self.r2_samples_read_access_key = _read_str("R2_SAMPLES_READ_ACCESS_KEY", "a15afa64fb77da5cd98a511ce20759bd")
-        self.r2_samples_read_secret_key = _read_str("R2_SAMPLES_READ_SECRET_KEY", "bec439451a21f972542b470f1bfe4f8dd71e802a983fe51cdc71477515564c45")
+        self.r2_samples_read_access_key = "a15afa64fb77da5cd98a511ce20759bd"
+        self.r2_samples_read_secret_key = "bec439451a21f972542b470f1bfe4f8dd71e802a983fe51cdc71477515564c45"
         self.r2_samples_write_access_key = _read_optional_str("R2_SAMPLES_WRITE_ACCESS_KEY")
         self.r2_samples_write_secret_key = _read_optional_str("R2_SAMPLES_WRITE_SECRET_KEY")
         self.openai_api_key = _read_optional_str("OPENAI_API_KEY")
