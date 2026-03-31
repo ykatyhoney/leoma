@@ -1,29 +1,31 @@
 """
-Hippius S3 storage: client creation, bucket management, sample uploads.
+S3-compatible object storage (Hippius or Cloudflare R2): clients, buckets, sample uploads.
+
+Backend is selected with OBJECT_STORAGE_BACKEND=r2|hippius (default r2; see env.example).
 """
 import io
 import os
 import json
 import asyncio
 from datetime import timedelta
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from minio import Minio
 
-from leoma.bootstrap import (
-    HIPPIUS_ENDPOINT,
-    HIPPIUS_REGION,
-    HIPPIUS_SAMPLES_READ_ACCESS_KEY,
-    HIPPIUS_SAMPLES_READ_SECRET_KEY,
-    HIPPIUS_SAMPLES_WRITE_ACCESS_KEY,
-    HIPPIUS_SAMPLES_WRITE_SECRET_KEY,
-    HIPPIUS_VIDEOS_READ_ACCESS_KEY,
-    HIPPIUS_VIDEOS_READ_SECRET_KEY,
-    HIPPIUS_VIDEOS_WRITE_ACCESS_KEY,
-    HIPPIUS_VIDEOS_WRITE_SECRET_KEY,
-    SAMPLES_BUCKET,
-    emit_log,
-)
+from leoma.bootstrap import SAMPLES_BUCKET, emit_log
+from leoma.bootstrap.runtime import normalize_s3_endpoint_host, settings
+
+
+def _active_s3_host_and_region() -> Tuple[str, str]:
+    if settings.object_storage_backend == "r2":
+        raw = settings.r2_endpoint_raw
+        if not raw or not raw.strip():
+            raise ValueError(
+                "R2_ENDPOINT is required when OBJECT_STORAGE_BACKEND=r2 "
+                "(e.g. https://<ACCOUNT_ID>.r2.cloudflarestorage.com)"
+            )
+        return normalize_s3_endpoint_host(raw), settings.r2_region
+    return settings.hippius_endpoint, settings.hippius_region
 
 
 def _create_minio_client(
@@ -33,16 +35,19 @@ def _create_minio_client(
     purpose: str,
 ) -> Minio:
     if not access_key or not secret_key:
+        backend = settings.object_storage_backend
         raise ValueError(
-            f"Missing Hippius credentials for {purpose}. "
-            "Set both access key and secret key environment variables."
+            f"Missing object storage credentials for {purpose} (backend={backend}). "
+            "Set the matching access key and secret key environment variables "
+            f"({'R2_*' if backend == 'r2' else 'HIPPIUS_*'})."
         )
+    endpoint, region = _active_s3_host_and_region()
     return Minio(
-        HIPPIUS_ENDPOINT,
+        endpoint,
         access_key=access_key,
         secret_key=secret_key,
         secure=True,
-        region=HIPPIUS_REGION,
+        region=region,
     )
 
 
@@ -67,35 +72,37 @@ def _write_metadata_file(prefix: str, metadata: Dict[str, Any]) -> str:
 
 
 def create_source_read_client() -> Minio:
-    return _create_minio_client(
-        HIPPIUS_VIDEOS_READ_ACCESS_KEY,
-        HIPPIUS_VIDEOS_READ_SECRET_KEY,
-        purpose="source bucket read access",
-    )
+    if settings.object_storage_backend == "r2":
+        ak, sk = settings.r2_videos_read_access_key, settings.r2_videos_read_secret_key
+    else:
+        ak, sk = settings.hippius_videos_read_access_key, settings.hippius_videos_read_secret_key
+    return _create_minio_client(ak, sk, purpose="source bucket read access")
 
 
 def create_source_write_client() -> Minio:
-    return _create_minio_client(
-        HIPPIUS_VIDEOS_WRITE_ACCESS_KEY,
-        HIPPIUS_VIDEOS_WRITE_SECRET_KEY,
-        purpose="source bucket write access",
-    )
+    if settings.object_storage_backend == "r2":
+        ak, sk = settings.r2_videos_write_access_key, settings.r2_videos_write_secret_key
+    else:
+        ak, sk = settings.hippius_videos_write_access_key, settings.hippius_videos_write_secret_key
+    return _create_minio_client(ak, sk, purpose="source bucket write access")
 
 
 def create_samples_write_client() -> Minio:
-    return _create_minio_client(
-        HIPPIUS_SAMPLES_WRITE_ACCESS_KEY,
-        HIPPIUS_SAMPLES_WRITE_SECRET_KEY,
-        purpose="samples bucket write access",
-    )
+    if settings.object_storage_backend == "r2":
+        ak, sk = settings.r2_samples_write_access_key, settings.r2_samples_write_secret_key
+    else:
+        ak, sk = settings.hippius_samples_write_access_key, settings.hippius_samples_write_secret_key
+    return _create_minio_client(ak, sk, purpose="samples bucket write access")
 
 
 def create_samples_read_client() -> Minio:
-    return _create_minio_client(
-        HIPPIUS_SAMPLES_READ_ACCESS_KEY or HIPPIUS_SAMPLES_WRITE_ACCESS_KEY,
-        HIPPIUS_SAMPLES_READ_SECRET_KEY or HIPPIUS_SAMPLES_WRITE_SECRET_KEY,
-        purpose="samples bucket read access",
-    )
+    if settings.object_storage_backend == "r2":
+        ak = settings.r2_samples_read_access_key or settings.r2_samples_write_access_key
+        sk = settings.r2_samples_read_secret_key or settings.r2_samples_write_secret_key
+    else:
+        ak = settings.hippius_samples_read_access_key or settings.hippius_samples_write_access_key
+        sk = settings.hippius_samples_read_secret_key or settings.hippius_samples_write_secret_key
+    return _create_minio_client(ak, sk, purpose="samples bucket read access")
 
 
 def get_presigned_get_url(

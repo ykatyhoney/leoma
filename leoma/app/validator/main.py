@@ -2,7 +2,7 @@
 Validator service for Leoma.
 
 Runs two loops in one process:
-1. Evaluator: poll GET /tasks/latest, download task from S3, run GPT-4o per miner, POST results to API.
+1. Evaluator: poll GET /tasks/latest, download task from object storage (R2 or Hippius), run GPT-4o per miner, POST results to API.
 2. Weight-setter: at each epoch boundary, GET /weights from API, set top-ranked-only weights on-chain
    (weight 1.0 for winner_uid, 0 for others; if no top-ranked miner, UID 0 to burn alpha).
 """
@@ -16,6 +16,7 @@ import bittensor as bt
 from leoma.bootstrap import (
     NETUID,
     EPOCH_LEN,
+    OBJECT_STORAGE_BACKEND,
     OPENAI_API_KEY,
     WALLET_NAME,
     HOTKEY_NAME,
@@ -116,7 +117,10 @@ async def main() -> None:
         return
 
     log(f"Using centralized API: {API_URL}", "info")
-    log(f"Samples bucket for evaluator: {SAMPLES_BUCKET}", "info")
+    log(
+        f"Evaluator object storage: backend={OBJECT_STORAGE_BACKEND}, samples_bucket={SAMPLES_BUCKET}",
+        "info",
+    )
 
     subtensor = bt.AsyncSubtensor(network=NETWORK)
     wallet = bt.Wallet(name=WALLET_NAME, hotkey=HOTKEY_NAME)

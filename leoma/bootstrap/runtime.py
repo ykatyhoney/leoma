@@ -412,6 +412,28 @@ def _read_optional_str(name: str) -> Optional[str]:
     return os.environ.get(name)
 
 
+def normalize_s3_endpoint_host(raw: str) -> str:
+    """Strip URL scheme and trailing slash for Minio ``endpoint`` (Hippius or Cloudflare R2 S3 API)."""
+    s = raw.strip()
+    if s.startswith("https://"):
+        s = s[8:]
+    elif s.startswith("http://"):
+        s = s[7:]
+    return s.rstrip("/")
+
+
+def _parse_object_storage_backend(raw: str) -> str:
+    v = raw.strip().lower()
+    if v in ("hippius", "hippius-s3", "s3-hippius"):
+        return "hippius"
+    if v in ("r2", "cloudflare", "cloudflare-r2", "cf-r2", ""):
+        return "r2"
+    raise ValueError(
+        "OBJECT_STORAGE_BACKEND must be 'hippius' or 'r2' "
+        f"(got {raw!r}). See env.example."
+    )
+
+
 class Settings:
     """Central settings loaded from the environment."""
 
@@ -436,6 +458,21 @@ class Settings:
         self.hippius_samples_write_secret_key = _read_optional_str("HIPPIUS_SAMPLES_WRITE_SECRET_KEY")
         self.source_bucket = _read_str("HIPPIUS_SOURCE_BUCKET", "videos")
         self.samples_bucket = _read_str("HIPPIUS_SAMPLES_BUCKET", "samples")
+        self.object_storage_backend = _parse_object_storage_backend(
+            os.environ.get("OBJECT_STORAGE_BACKEND", "r2")
+        )
+        self.r2_endpoint_raw = _read_str("R2_ENDPOINT", "https://cce499ad4f3a4703b069771d8ff4215a.r2.cloudflarestorage.com")
+        self.r2_region = _read_str("R2_REGION", "auto")
+        self.r2_source_bucket = _read_str("R2_SOURCE_BUCKET", "leoma-videos")
+        self.r2_samples_bucket = _read_str("R2_SAMPLES_BUCKET", "leoma-samples")
+        self.r2_videos_read_access_key = _read_optional_str("R2_VIDEOS_READ_ACCESS_KEY")
+        self.r2_videos_read_secret_key = _read_optional_str("R2_VIDEOS_READ_SECRET_KEY")
+        self.r2_videos_write_access_key = _read_optional_str("R2_VIDEOS_WRITE_ACCESS_KEY")
+        self.r2_videos_write_secret_key = _read_optional_str("R2_VIDEOS_WRITE_SECRET_KEY")
+        self.r2_samples_read_access_key = _read_str("R2_SAMPLES_READ_ACCESS_KEY", "a15afa64fb77da5cd98a511ce20759bd")
+        self.r2_samples_read_secret_key = _read_str("R2_SAMPLES_READ_SECRET_KEY", "bec439451a21f972542b470f1bfe4f8dd71e802a983fe51cdc71477515564c45")
+        self.r2_samples_write_access_key = _read_optional_str("R2_SAMPLES_WRITE_ACCESS_KEY")
+        self.r2_samples_write_secret_key = _read_optional_str("R2_SAMPLES_WRITE_SECRET_KEY")
         self.openai_api_key = _read_optional_str("OPENAI_API_KEY")
         self.min_video_size = _read_int("MIN_VIDEO_SIZE", 1_000_000)
         self.max_video_size = _read_int("MAX_VIDEO_SIZE", 200_000_000)
@@ -480,8 +517,17 @@ HIPPIUS_SAMPLES_READ_ACCESS_KEY = settings.hippius_samples_read_access_key
 HIPPIUS_SAMPLES_READ_SECRET_KEY = settings.hippius_samples_read_secret_key
 HIPPIUS_SAMPLES_WRITE_ACCESS_KEY = settings.hippius_samples_write_access_key
 HIPPIUS_SAMPLES_WRITE_SECRET_KEY = settings.hippius_samples_write_secret_key
-SOURCE_BUCKET = settings.source_bucket
-SAMPLES_BUCKET = settings.samples_bucket
+OBJECT_STORAGE_BACKEND = settings.object_storage_backend
+SOURCE_BUCKET = (
+    settings.r2_source_bucket
+    if settings.object_storage_backend == "r2"
+    else settings.source_bucket
+)
+SAMPLES_BUCKET = (
+    settings.r2_samples_bucket
+    if settings.object_storage_backend == "r2"
+    else settings.samples_bucket
+)
 OPENAI_API_KEY = settings.openai_api_key
 MIN_VIDEO_SIZE = settings.min_video_size
 MAX_VIDEO_SIZE = settings.max_video_size

@@ -1,11 +1,12 @@
 """
 Validator evaluator loop: poll GET /tasks/latest, download task from S3, run GPT-4o, POST results.
 
-Runs as the validator-side process. On startup, initializes evaluated task_id list from S3
-(list task_ids that have evaluation_results/{validator_hotkey}.json). Then in a loop:
+Runs as the validator-side process. On startup, initializes evaluated task_id list from object storage
+(S3-compatible: Hippius or Cloudflare R2 per OBJECT_STORAGE_BACKEND; lists task_ids that have
+evaluation_results/{validator_hotkey}.json). Then in a loop:
 - GET /tasks/latest
 - If task_id already evaluated, decrement task_id until unevaluated (max 100 in list)
-- Download task artifacts from S3 (metadata, first_frame, generated_videos per miner)
+- Download task artifacts (metadata, first_frame, generated_videos per miner)
 - For each miner: single-video benchmark evaluation, then POST evaluation to API
 - Add task_id to evaluated list
 """
@@ -18,7 +19,7 @@ from typing import Set
 
 from openai import AsyncOpenAI
 
-from leoma.bootstrap import SAMPLES_BUCKET
+from leoma.bootstrap import OBJECT_STORAGE_BACKEND, SAMPLES_BUCKET
 from leoma.bootstrap import emit_log as log, emit_header as log_header, log_exception
 from leoma.infra.storage_backend import (
     create_samples_read_client,
@@ -69,7 +70,14 @@ async def run_evaluator_loop() -> None:
         log("OPENAI_API_KEY required for evaluator", "error")
         return
     openai_client = AsyncOpenAI(api_key=openai_key)
-    s3_client = create_samples_read_client()
+    try:
+        s3_client = create_samples_read_client()
+    except ValueError as e:
+        log(
+            f"Cannot create samples read client (backend={OBJECT_STORAGE_BACKEND}): {e}",
+            "error",
+        )
+        return
     api_client = create_api_client_from_wallet(
         wallet_name=WALLET_NAME,
         hotkey_name=HOTKEY_NAME,
@@ -79,6 +87,10 @@ async def run_evaluator_loop() -> None:
     log_header("Validator Evaluator Starting")
     log(f"Validator hotkey: {validator_hotkey[:16]}...", "info")
     log(f"API: {API_URL}", "info")
+    log(
+        f"Samples read client: backend={OBJECT_STORAGE_BACKEND}, bucket={SAMPLES_BUCKET}",
+        "info",
+    )
 
     evaluated: Set[int] = set()
     try:
@@ -86,9 +98,15 @@ async def run_evaluator_loop() -> None:
             s3_client, SAMPLES_BUCKET, validator_hotkey, max_tasks=EVALUATED_LIST_MAX
         )
         evaluated = set(task_ids)
-        log(f"Initialized evaluated list: {len(evaluated)} task_ids from S3", "info")
+        log(
+            f"Initialized evaluated list: {len(evaluated)} task_ids from object storage ({OBJECT_STORAGE_BACKEND})",
+            "info",
+        )
     except Exception as e:
-        log(f"Could not load evaluated list from S3: {e}", "warn")
+        log(
+            f"Could not load evaluated list from object storage ({OBJECT_STORAGE_BACKEND}): {e}",
+            "warn",
+        )
 
     round_num = 0
     while True:

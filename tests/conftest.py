@@ -9,6 +9,10 @@ Provides:
 """
 
 import os
+
+# Production default is R2; tests and fixtures assume Hippius unless the suite sets this.
+os.environ.setdefault("OBJECT_STORAGE_BACKEND", "hippius")
+
 import uuid
 from datetime import datetime, timezone
 from typing import Any, AsyncGenerator, Dict, Optional
@@ -490,6 +494,7 @@ def sample_generation_info(generation_info: Dict[str, Any]) -> Dict[str, Any]:
 def test_env(monkeypatch: pytest.MonkeyPatch) -> Dict[str, str]:
     """Set up test environment variables."""
     env_vars = {
+        "OBJECT_STORAGE_BACKEND": "hippius",
         "POSTGRES_HOST": "localhost",
         "POSTGRES_PORT": "5433",
         "POSTGRES_USER": "test",

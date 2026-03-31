@@ -30,7 +30,7 @@ Leoma is a **Bittensor subnet** for **AI-generated video**:
 
 ## Workflow
 
-1. **Subnet owner** runs the **owner-sampler**: creates tasks (first frame + prompt from one-shot 5s clips in Hippius S3), calls miners via Chutes, uploads task artifacts to the samples bucket, and sets the latest task id on the API.
+1. **Subnet owner** runs the **owner-sampler**: creates tasks (first frame + prompt from one-shot 5s clips in object storage), calls miners via Chutes, uploads task artifacts to the samples bucket, and sets the latest task id on the API.
 2. **Validators** run the **evaluator** and **weight-setter**: poll the API for the latest task, download task data from S3, run GPT-4o evaluation, POST results to the Leoma API; each epoch, call **GET /weights** and set on-chain weights (winner-take-all).
 3. The **API** (subnet owner) computes rank (dominance rule) and exposes **GET /weights**. Validators use this to set weights on-chain.
 4. **Miners** register a Hugging Face model (naming: `leoma` prefix, hotkey suffix) and Chute endpoint via on-chain commit. They receive challenges; the best performer earns subnet alpha.
@@ -38,7 +38,7 @@ Leoma is a **Bittensor subnet** for **AI-generated video**:
 | Role | In Leoma |
 |------|----------|
 | **Miner** | Upload a TI2V model to Hugging Face (name: `leoma...` + your hotkey), deploy to Chutes, commit on-chain. Earn subnet alpha when your outputs win. |
-| **Validator** | Run evaluator + weight-setter (e.g. `leoma serve`). Requires API URL, Hippius S3 read (samples bucket), OpenAI API key, and Bittensor wallet. |
+| **Validator** | Run evaluator + weight-setter (e.g. `leoma serve`). Requires API URL, S3-compatible read access to the **samples** bucket (Hippius or Cloudflare R2 via `OBJECT_STORAGE_BACKEND`), OpenAI API key, and Bittensor wallet. |
 
 ---
 
@@ -50,7 +50,7 @@ Validators run the **evaluator** and the **weight-setter**. Task creation and mi
 
 - **Bittensor wallet** (coldkey + hotkey) registered as a validator on the Leoma subnet.
 - **Leoma API** URL (the deployed owner API).
-- **Hippius S3** access: **read-only** to the **samples** bucket (evaluator downloads task data from S3; evaluation results are submitted to the Leoma API with hotkey signature). Use [access keys](https://docs.hippius.com/storage/s3/integration) from the Hippius console.
+- **Object storage (S3-compatible):** **read-only** access to the **samples** bucket (evaluator downloads task data; evaluation results go to the Leoma API with hotkey signature). Default is **Cloudflare R2** (`R2_ENDPOINT` and `R2_SAMPLES_*` keys). Set `OBJECT_STORAGE_BACKEND=hippius` to use Hippius keys instead — see `env.example`.
 - **OpenAI API key** (for GPT-4o evaluation in the evaluator).
 - **Validator registration in API DB:** An admin must add your validator hotkey (and UID, stake) so the API includes you in stake-weighted scoring (e.g. `leoma db add-validator --uid <uid> --hotkey <ss58>`).
 
@@ -67,10 +67,9 @@ Set these in `.env` (copy from `env.example`):
 | `HOTKEY_NAME` | Bittensor hotkey name (e.g. `default`) |
 | `OPENAI_API_KEY` | OpenAI API key for GPT-4o (evaluator) |
 | `EPOCH_LEN` | Blocks per epoch (e.g. `180`); optional |
-| `HIPPIUS_ENDPOINT` | e.g. `s3.hippius.com` |
-| `HIPPIUS_REGION` | e.g. `decentralized` |
-| `HIPPIUS_SAMPLES_BUCKET` | Samples bucket (e.g. `samples`) |
-| `HIPPIUS_SAMPLES_READ_ACCESS_KEY` / `HIPPIUS_SAMPLES_READ_SECRET_KEY` | Read access to samples bucket (evaluator downloads tasks only; no write needed) |
+| `OBJECT_STORAGE_BACKEND` | `r2` (default) or `hippius` |
+| `R2_ENDPOINT`, `R2_REGION`, `R2_SAMPLES_BUCKET`, `R2_SAMPLES_READ_*` | Default backend: R2 S3 API URL (e.g. `https://<ACCOUNT_ID>.r2.cloudflarestorage.com`), region (often `auto`), bucket, and read keys for the evaluator |
+| `HIPPIUS_*` | When `OBJECT_STORAGE_BACKEND=hippius`: endpoint, region, bucket names, and keys (see `env.example`) |
 
 ### Quick start (Docker, recommended)
 
@@ -156,7 +155,7 @@ To run a **miner** on the Leoma subnet: upload your **Text-Image to Video (TI2V)
 
 ## Storage and API
 
-- **Storage (Hippius S3):** Source videos live in the **source bucket**; task artifacts (first frame, original clip, generated videos) and evaluation results live in the **samples bucket**. Validators need **read-only** access to the samples bucket. See the [Storage](https://docs.leoma.ai/storage) doc.
+- **Storage:** Source videos live in the **source bucket**; task artifacts and evaluation results live in the **samples bucket**. The owner chooses **Hippius** or **Cloudflare R2** with `OBJECT_STORAGE_BACKEND` and the matching env vars (`HIPPIUS_*` or `R2_*`). Validators need **read-only** access to the samples bucket. See `env.example` and the [Storage](https://docs.leoma.ai/storage) doc.
 - **API:** The Leoma API provides health, miners, samples, scores, tasks, weights, and blacklist endpoints. Validators use **GET /tasks/latest**, **POST /samples/batch**, and **GET /weights**. See the [API reference](https://docs.leoma.ai/api).
 
 ---
