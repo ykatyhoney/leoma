@@ -1,6 +1,6 @@
 [project]
 name = "leoma"
-version = "0.3.4"
+version = "0.3.5"
 description = "Image-Text-to-Video generation subnet"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -11,6 +11,7 @@ dependencies = [
     "huggingface-hub",
     "minio",
     "openai>=1.0.0,<2",
+    "google-genai>=0.3.0",
     "click",
     "pydantic>=2.0.0,<3",
     "yt-dlp",

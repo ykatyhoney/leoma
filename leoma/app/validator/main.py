@@ -2,7 +2,7 @@
 Validator service for Leoma.
 
 Runs two loops in one process:
-1. Evaluator: poll GET /tasks/latest, download task from object storage (R2 or Hippius), run GPT-4o per miner, POST results to API.
+1. Evaluator: poll GET /tasks/latest, download task from object storage (R2 or Hippius), run Gemini per miner, POST results to API.
 2. Weight-setter: at each epoch boundary, GET /weights from API, set top-ranked-only weights on-chain
    (weight 1.0 for winner_uid, 0 for others; if no top-ranked miner, UID 0 to burn alpha).
 """
@@ -17,6 +17,7 @@ from leoma.bootstrap import (
     NETUID,
     EPOCH_LEN,
     OBJECT_STORAGE_BACKEND,
+    GEMINI_API_KEY,
     OPENAI_API_KEY,
     WALLET_NAME,
     HOTKEY_NAME,
@@ -112,8 +113,8 @@ async def main() -> None:
     """Main entry point: run evaluator (background) + weight-setting loop."""
     log_header("Leoma Validator Starting (evaluator + weight-setter)")
 
-    if not OPENAI_API_KEY:
-        log("OPENAI_API_KEY environment variable required for evaluator", "error")
+    if not GEMINI_API_KEY and not OPENAI_API_KEY:
+        log("Evaluator requires GEMINI_API_KEY and/or OPENAI_API_KEY (fallback)", "error")
         return
 
     log(f"Using centralized API: {API_URL}", "info")

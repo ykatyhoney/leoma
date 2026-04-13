@@ -243,9 +243,9 @@ async def db_with_validators(
 
 @pytest.fixture
 def mock_openai_client(mocker):
-    """Create a mock OpenAI client for evaluation tests."""
+    """Create a mock OpenAI client for description generation tests (sampler side)."""
     from unittest.mock import AsyncMock
-    
+
     mock_client = mocker.MagicMock()
     mock_response = mocker.MagicMock()
     mock_response.choices = [
@@ -256,7 +256,20 @@ def mock_openai_client(mocker):
         )
     ]
     mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
-    
+
+    return mock_client
+
+
+@pytest.fixture
+def mock_gemini_client(mocker):
+    """Create a mock Gemini client for validator evaluation tests."""
+    from unittest.mock import AsyncMock
+
+    mock_client = mocker.MagicMock()
+    mock_response = mocker.MagicMock()
+    mock_response.text = '{"overall_score": 0}'
+    mock_client.aio.models.generate_content = AsyncMock(return_value=mock_response)
+
     return mock_client
 
 

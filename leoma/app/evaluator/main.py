@@ -1,5 +1,5 @@
 """
-Validator evaluator loop: poll GET /tasks/latest, download task from S3, run GPT-4o, POST results.
+Validator evaluator loop: poll GET /tasks/latest, download task from S3, run Gemini, POST results.
 
 Runs as the validator-side process. On startup, initializes evaluated task_id list from object storage
 (S3-compatible: Hippius or Cloudflare R2 per OBJECT_STORAGE_BACKEND; lists task_ids that have
@@ -17,9 +17,15 @@ import asyncio
 import tempfile
 from typing import Set
 
+from google import genai
 from openai import AsyncOpenAI
 
-from leoma.bootstrap import OBJECT_STORAGE_BACKEND, SAMPLES_BUCKET
+from leoma.bootstrap import (
+    GEMINI_API_KEY,
+    OBJECT_STORAGE_BACKEND,
+    OPENAI_API_KEY,
+    SAMPLES_BUCKET,
+)
 from leoma.bootstrap import emit_log as log, emit_header as log_header, log_exception
 from leoma.infra.storage_backend import (
     create_samples_read_client,
@@ -65,11 +71,19 @@ async def run_evaluator_loop() -> None:
     from leoma.infra.remote_api import create_api_client_from_wallet
     from leoma.bootstrap import WALLET_NAME, HOTKEY_NAME
 
-    openai_key = os.environ.get("OPENAI_API_KEY")
-    if not openai_key:
-        log("OPENAI_API_KEY required for evaluator", "error")
+    gemini_key = GEMINI_API_KEY or os.environ.get("GEMINI_API_KEY")
+    openai_key = OPENAI_API_KEY or os.environ.get("OPENAI_API_KEY")
+    if not gemini_key and not openai_key:
+        log("Evaluator requires GEMINI_API_KEY and/or OPENAI_API_KEY (fallback)", "error")
         return
-    openai_client = AsyncOpenAI(api_key=openai_key)
+    gemini_client = genai.Client(api_key=gemini_key) if gemini_key else None
+    openai_client = AsyncOpenAI(api_key=openai_key) if openai_key else None
+    if gemini_client and openai_client:
+        log("Evaluator LLM: Gemini primary, GPT-4o fallback", "info")
+    elif gemini_client:
+        log("Evaluator LLM: Gemini only (no GPT-4o fallback configured)", "info")
+    else:
+        log("Evaluator LLM: GPT-4o only (GEMINI_API_KEY not set)", "info")
     try:
         s3_client = create_samples_read_client()
     except ValueError as e:
@@ -179,10 +193,11 @@ async def run_evaluator_loop() -> None:
                     )
                     gen_frames_b64 = frames_to_base64(gen_frames)
                     comparison = await evaluate_generated_video_async(
-                        openai_client,
                         first_frame_b64,
                         gen_frames_b64,
                         description,
+                        gemini_client=gemini_client,
+                        openai_client=openai_client,
                         pass_threshold=EVALUATION_PASS_THRESHOLD,
                         critical_threshold=EVALUATION_CRITICAL_THRESHOLD,
                     )
