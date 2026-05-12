@@ -31,6 +31,8 @@ from leoma.bootstrap import (
     CHUTES_API_KEY,
     REQUEST_TIMEOUT,
     REQUIRED_VIDEO_HEIGHT,
+    REQUIRED_VIDEO_WIDTH,
+    VIDEO_RESOLUTION_TOLERANCE,
     WALLET_NAME,
     HOTKEY_NAME,
 )
@@ -70,6 +72,14 @@ DESCRIPTION_FRAME_FPS = float(os.environ.get("DESCRIPTION_FRAME_FPS", "3"))
 ONE_SHOT_SCENE_THRESHOLD = float(os.environ.get("ONE_SHOT_SCENE_THRESHOLD", "0.18"))
 ONE_SHOT_BOUNDARY_MARGIN = float(os.environ.get("ONE_SHOT_BOUNDARY_MARGIN", "0.15"))
 SAFE_CLIP_START_OFFSET_SECONDS = float(os.environ.get("SAFE_CLIP_START_OFFSET_SECONDS", "2.0"))
+
+
+def _is_resolution_acceptable(width: int, height: int) -> bool:
+    """Accept videos whose width and height are both within tolerance of the canonical 480p target."""
+    return (
+        abs(width - REQUIRED_VIDEO_WIDTH) <= VIDEO_RESOLUTION_TOLERANCE
+        and abs(height - REQUIRED_VIDEO_HEIGHT) <= VIDEO_RESOLUTION_TOLERANCE
+    )
 
 
 async def _get_valid_miners_via_api() -> list[Dict[str, Any]]:
@@ -415,11 +425,12 @@ async def run_owner_sampler_loop() -> None:
                 with open(p, "wb") as f:
                     f.write(video_bytes)
                 width, height = await get_video_resolution(p)
-                if height != REQUIRED_VIDEO_HEIGHT:
+                if not _is_resolution_acceptable(width, height):
                     log(
                         f"Miner {hotkey[:12]}...: dropping video, resolution "
-                        f"{width}x{height} (required height "
-                        f"{REQUIRED_VIDEO_HEIGHT}p)",
+                        f"{width}x{height} (required "
+                        f"{REQUIRED_VIDEO_WIDTH}x{REQUIRED_VIDEO_HEIGHT} "
+                        f"±{VIDEO_RESOLUTION_TOLERANCE}px)",
                         "warn",
                     )
                     _remove_file(p)
@@ -429,7 +440,8 @@ async def run_owner_sampler_loop() -> None:
             if not miner_paths:
                 log(
                     f"All miner videos rejected on resolution (required "
-                    f"{REQUIRED_VIDEO_HEIGHT}p); skipping upload",
+                    f"{REQUIRED_VIDEO_WIDTH}x{REQUIRED_VIDEO_HEIGHT} "
+                    f"±{VIDEO_RESOLUTION_TOLERANCE}px); skipping upload",
                     "warn",
                 )
                 await _sleep_until_next_round()

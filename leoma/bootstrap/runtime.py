@@ -474,7 +474,9 @@ class Settings:
         self.r2_samples_write_secret_key = _read_optional_str("R2_SAMPLES_WRITE_SECRET_KEY")
         self.openai_api_key = _read_optional_str("OPENAI_API_KEY")
         self.gemini_api_key = _read_optional_str("GEMINI_API_KEY")
+        self.required_video_width = _read_int("REQUIRED_VIDEO_WIDTH", 832)
         self.required_video_height = _read_int("REQUIRED_VIDEO_HEIGHT", 480)
+        self.video_resolution_tolerance = _read_int("VIDEO_RESOLUTION_TOLERANCE", 32)
         self.min_video_size = _read_int("MIN_VIDEO_SIZE", 1_000_000)
         self.max_video_size = _read_int("MAX_VIDEO_SIZE", 200_000_000)
         self.clip_duration = _read_int("CLIP_DURATION", 5)
@@ -531,7 +533,9 @@ SAMPLES_BUCKET = (
 )
 OPENAI_API_KEY = settings.openai_api_key
 GEMINI_API_KEY = settings.gemini_api_key
+REQUIRED_VIDEO_WIDTH = settings.required_video_width
 REQUIRED_VIDEO_HEIGHT = settings.required_video_height
+VIDEO_RESOLUTION_TOLERANCE = settings.video_resolution_tolerance
 MIN_VIDEO_SIZE = settings.min_video_size
 MAX_VIDEO_SIZE = settings.max_video_size
 CLIP_DURATION = settings.clip_duration
