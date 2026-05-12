@@ -113,6 +113,23 @@ async def get_video_duration(video_path: str) -> float:
         return 0.0
 
 
+async def get_video_resolution(video_path: str) -> tuple[int, int]:
+    """Probe the first video stream for (width, height). Returns (0, 0) on failure."""
+    result = await _run_process(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "csv=p=0:s=x", video_path,
+        ],
+        text=True,
+    )
+    try:
+        width_str, height_str = (result.stdout or "").strip().split("x", 1)
+        return int(width_str), int(height_str)
+    except (ValueError, AttributeError):
+        return 0, 0
+
+
 async def extract_clip(video_path: str, output_path: str, start_offset: float, duration: float) -> None:
     result = await _run_process(
         [

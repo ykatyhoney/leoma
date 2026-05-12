@@ -195,6 +195,43 @@ class TestGetVideoDuration:
         assert duration == 0.0
 
 
+class TestGetVideoResolution:
+    """Tests for get_video_resolution function."""
+
+    async def test_parses_widthxheight(self):
+        from leoma.infra.video_utils import get_video_resolution
+
+        mock_result = MagicMock()
+        mock_result.stdout = "854x480\n"
+
+        with patch("leoma.infra.video_utils.asyncio.to_thread", return_value=mock_result):
+            width, height = await get_video_resolution("/path/to/video.mp4")
+
+        assert (width, height) == (854, 480)
+
+    async def test_returns_zero_on_empty(self):
+        from leoma.infra.video_utils import get_video_resolution
+
+        mock_result = MagicMock()
+        mock_result.stdout = ""
+
+        with patch("leoma.infra.video_utils.asyncio.to_thread", return_value=mock_result):
+            width, height = await get_video_resolution("/path/to/video.mp4")
+
+        assert (width, height) == (0, 0)
+
+    async def test_returns_zero_on_malformed(self):
+        from leoma.infra.video_utils import get_video_resolution
+
+        mock_result = MagicMock()
+        mock_result.stdout = "not-a-resolution\n"
+
+        with patch("leoma.infra.video_utils.asyncio.to_thread", return_value=mock_result):
+            width, height = await get_video_resolution("/path/to/video.mp4")
+
+        assert (width, height) == (0, 0)
+
+
 class TestExtractClip:
     """Tests for extract_clip function."""
 

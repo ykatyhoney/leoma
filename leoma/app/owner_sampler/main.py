@@ -30,6 +30,7 @@ from leoma.bootstrap import (
     CLIP_DURATION,
     CHUTES_API_KEY,
     REQUEST_TIMEOUT,
+    REQUIRED_VIDEO_HEIGHT,
     WALLET_NAME,
     HOTKEY_NAME,
 )
@@ -49,6 +50,7 @@ from leoma.infra.video_utils import (
     frames_to_base64,
     extract_clip,
     extract_first_frame,
+    get_video_resolution,
 )
 from leoma.infra.judge import get_description_async
 from leoma.infra.chute_resolver import get_chute_info, build_chute_endpoint
@@ -412,7 +414,26 @@ async def run_owner_sampler_loop() -> None:
                 p = f"/tmp/miner_{safe}_{task_id}.mp4"
                 with open(p, "wb") as f:
                     f.write(video_bytes)
+                width, height = await get_video_resolution(p)
+                if height != REQUIRED_VIDEO_HEIGHT:
+                    log(
+                        f"Miner {hotkey[:12]}...: dropping video, resolution "
+                        f"{width}x{height} (required height "
+                        f"{REQUIRED_VIDEO_HEIGHT}p)",
+                        "warn",
+                    )
+                    _remove_file(p)
+                    continue
                 miner_paths[hotkey] = p
+
+            if not miner_paths:
+                log(
+                    f"All miner videos rejected on resolution (required "
+                    f"{REQUIRED_VIDEO_HEIGHT}p); skipping upload",
+                    "warn",
+                )
+                await _sleep_until_next_round()
+                continue
 
             metadata = {
                 "task_id": task_id,
@@ -434,8 +455,12 @@ async def run_owner_sampler_loop() -> None:
                     "description_frame_count": len(original_frames),
                     "description_frame_fps": DESCRIPTION_FRAME_FPS,
                 },
-                "miners": list(successful),
-                "miner_latencies_ms": miner_latencies_ms,
+                "miners": list(miner_paths.keys()),
+                "miner_latencies_ms": {
+                    hk: latency
+                    for hk, latency in miner_latencies_ms.items()
+                    if hk in miner_paths
+                },
             }
 
             await upload_task_artifacts(
@@ -449,7 +474,7 @@ async def run_owner_sampler_loop() -> None:
 
             await sampling_state_dao.set_latest_task_id(task_id)
             elapsed = time.time() - round_start
-            log(f"Task {task_id} uploaded; latest_task_id set ({len(successful)} miners, {elapsed:.1f}s)", "success")
+            log(f"Task {task_id} uploaded; latest_task_id set ({len(miner_paths)} miners, {elapsed:.1f}s)", "success")
 
         except Exception as e:
             log(f"Owner sampler error: {e}", "error")
