@@ -135,7 +135,7 @@ async def run_evaluator_loop() -> None:
             task_id = latest
             while task_id in evaluated and task_id >= 1:
                 task_id -= 1
-            if task_id < 1:
+            if task_id < 1 or task_id <= latest - EVALUATED_LIST_MAX:
                 log("All tasks up to latest already evaluated", "info")
                 await asyncio.sleep(EVALUATOR_POLL_INTERVAL)
                 continue
