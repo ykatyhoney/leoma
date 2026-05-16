@@ -234,7 +234,7 @@ wheels = [
 
 [[package]]
 name = "async-substrate-interface"
-version = "1.5.15"
+version = "1.6.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiosqlite" },
@@ -244,9 +244,9 @@ dependencies = [
     { name = "wheel" },
     { name = "xxhash" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/25/54/653d50a27dab6a7922f22d7932daeb66521b1e5c3d85ee5c652637180a6c/async_substrate_interface-1.5.15.tar.gz", hash = "sha256:1e093a873f3d768899b3b7574947f66ddd5b096580b2a3ea8ebd6d424e0e198e", size = 85682, upload-time = "2025-12-22T18:47:48.248Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/bb/48/b53f7aa0f4e63ea8f33378e0d6bafb457de3b40b6dd4e426286159438af5/async_substrate_interface-1.6.4.tar.gz", hash = "sha256:982fd9c7102176d509a5bc31a1cbee0ba6c6dff7629328a94b08cad155520aad", size = 93715, upload-time = "2026-04-02T17:48:51.916Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/68/e0/b713b16aa29868d48058ca2b88c6cf316f6dc4a788dbd850d6d859fbb84b/async_substrate_interface-1.5.15-py3-none-any.whl", hash = "sha256:230d50a6977dbd73e57ca90f97552d7ca6a0244a2dfb57860643ebeeb952d8af", size = 88980, upload-time = "2025-12-22T18:47:47.083Z" },
+    { url = "https://files.pythonhosted.org/packages/de/f0/bc336a092bfbece8379d28571452d3a46936a87c75603cbdd2b09fe13be8/async_substrate_interface-1.6.4-py3-none-any.whl", hash = "sha256:7f127f5fc2a66cfd0b9bd232809f5af7ef36f545679d35b7fb71b476887dafd4", size = 97176, upload-time = "2026-04-02T17:48:50.287Z" },
 ]
 
 [[package]]
@@ -1176,6 +1176,45 @@ wheels = [
 ]
 
 [[package]]
+name = "google-auth"
+version = "2.52.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cryptography" },
+    { name = "pyasn1-modules" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/d4/f8/80d2493cbedece1c623dc3e3cb1883300871af0dcdae254409522985ac23/google_auth-2.52.0.tar.gz", hash = "sha256:01f30e1a9e3638698d89464f5e603ce29d18e1c0e63ec31ac570aba4e164aaf5", size = 335027, upload-time = "2026-05-07T19:45:24.033Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ee/fc/2cdc74252746f547f81ff3f02d4d4234a3f411b5de5b61af97e633a060b9/google_auth-2.52.0-py3-none-any.whl", hash = "sha256:aee92803ba0ff93a70a3b8a35c7b4797837751cd6380b63ff38372b98f3ed627", size = 245614, upload-time = "2026-05-07T19:45:21.914Z" },
+]
+
+[package.optional-dependencies]
+requests = [
+    { name = "requests" },
+]
+
+[[package]]
+name = "google-genai"
+version = "2.3.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio" },
+    { name = "distro" },
+    { name = "google-auth", extra = ["requests"] },
+    { name = "httpx" },
+    { name = "pydantic" },
+    { name = "requests" },
+    { name = "sniffio" },
+    { name = "tenacity" },
+    { name = "typing-extensions" },
+    { name = "websockets" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/02/8e/dfa4b34dd4c0baffccf6466fc68d6d35011662d43e7d79accb902320db74/google_genai-2.3.0.tar.gz", hash = "sha256:e877c750a4ccacdd9928fc3aa8ca8820ce85cade0ca51bd83feceacf5959b579", size = 546930, upload-time = "2026-05-15T06:22:36.264Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b4/6e/aa6b30b09f58b946750fc4089c5248fbd3576f746e0e818d88633559dc84/google_genai-2.3.0-py3-none-any.whl", hash = "sha256:89d3c71c9f5f5b931b405b88a5837aea2bd4d27ed90323b9599f5760bbb91d92", size = 805484, upload-time = "2026-05-15T06:22:34.247Z" },
+]
+
+[[package]]
 name = "graval"
 version = "0.2.6"
 source = { registry = "https://pypi.org/simple" }
@@ -1513,15 +1552,17 @@ wheels = [
 
 [[package]]
 name = "leoma"
-version = "0.1.0"
+version = "0.3.7"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
+    { name = "async-substrate-interface" },
     { name = "asyncpg" },
     { name = "bittensor" },
     { name = "chutes" },
     { name = "click" },
     { name = "fastapi" },
+    { name = "google-genai" },
     { name = "huggingface-hub" },
     { name = "minio" },
     { name = "openai" },
@@ -1546,11 +1587,13 @@ test = [
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.9.0,<4" },
     { name = "aiosqlite", marker = "extra == 'test'", specifier = ">=0.19.0" },
+    { name = "async-substrate-interface", specifier = "==1.6.4" },
     { name = "asyncpg", specifier = ">=0.29.0,<0.30" },
     { name = "bittensor", specifier = "==9.12.2" },
     { name = "chutes", specifier = ">=0.4.8" },
     { name = "click" },
     { name = "fastapi", specifier = ">=0.109.0,<0.116.0" },
+    { name = "google-genai", specifier = "==2.3.0" },
     { name = "huggingface-hub" },
     { name = "minio" },
     { name = "openai", specifier = ">=1.0.0,<2" },
@@ -2319,6 +2362,27 @@ wheels = [
 ]
 
 [[package]]
+name = "pyasn1"
+version = "0.6.3"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/5c/5f/6583902b6f79b399c9c40674ac384fd9cd77805f9e6205075f828ef11fb2/pyasn1-0.6.3.tar.gz", hash = "sha256:697a8ecd6d98891189184ca1fa05d1bb00e2f84b5977c481452050549c8a72cf", size = 148685, upload-time = "2026-03-17T01:06:53.382Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/5d/a0/7d793dce3fa811fe047d6ae2431c672364b462850c6235ae306c0efd025f/pyasn1-0.6.3-py3-none-any.whl", hash = "sha256:a80184d120f0864a52a073acc6fc642847d0be408e7c7252f31390c0f4eadcde", size = 83997, upload-time = "2026-03-17T01:06:52.036Z" },
+]
+
+[[package]]
+name = "pyasn1-modules"
+version = "0.4.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pyasn1" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e9/e6/78ebbb10a8c8e4b61a59249394a4a594c1a7af95593dc933a349c8d00964/pyasn1_modules-0.4.2.tar.gz", hash = "sha256:677091de870a80aae844b1ca6134f54652fa2c8c5a52aa396440ac3106e941e6", size = 307892, upload-time = "2025-03-28T02:41:22.17Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/47/8d/d529b5d697919ba8c11ad626e835d4039be708a35b0d22de83a269a6682c/pyasn1_modules-0.4.2-py3-none-any.whl", hash = "sha256:29253a9207ce32b64c3ac6600edc75368f98473906e8fd1043bd6b5b1de2c14a", size = 181259, upload-time = "2025-03-28T02:41:19.028Z" },
+]
+
+[[package]]
 name = "pycares"
 version = "5.0.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2988,6 +3052,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/c5/3f/e1483635a892b84727187cf8ba8477a20e4036361202650a0bdb93eacf8b/substrate_interface-1.8.1.tar.gz", hash = "sha256:821be590fa4f3d9bc731b4c370341b57cd98ef3419c81289cd369bdeefc008de", size = 1455960, upload-time = "2026-01-20T15:26:28.371Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c7/2e/d6e2bb34473bfc8b6e915a21ee1a5dbf67c57dff8abea407e4e46cee5d83/substrate_interface-1.8.1-py3-none-any.whl", hash = "sha256:07737b0dc86fb8962ec09c3518577556534f9ffa58ef1164fc70ffe8a5c54837", size = 1461481, upload-time = "2026-01-20T15:26:26.663Z" },
+]
+
+[[package]]
+name = "tenacity"
+version = "9.1.4"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/47/c6/ee486fd809e357697ee8a44d3d69222b344920433d3b6666ccd9b374630c/tenacity-9.1.4.tar.gz", hash = "sha256:adb31d4c263f2bd041081ab33b498309a57c77f9acf2db65aadf0898179cf93a", size = 49413, upload-time = "2026-02-07T10:45:33.841Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d7/c1/eb8f9debc45d3b7918a32ab756658a0904732f75e555402972246b0b8e71/tenacity-9.1.4-py3-none-any.whl", hash = "sha256:6095a360c919085f28c6527de529e76a06ad89b23659fa881ae0649b867a9d55", size = 28926, upload-time = "2026-02-07T10:45:32.24Z" },
 ]
 
 [[package]]

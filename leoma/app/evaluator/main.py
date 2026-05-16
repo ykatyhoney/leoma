@@ -18,12 +18,10 @@ import tempfile
 from typing import Set
 
 from google import genai
-from openai import AsyncOpenAI
 
 from leoma.bootstrap import (
     GEMINI_API_KEY,
     OBJECT_STORAGE_BACKEND,
-    OPENAI_API_KEY,
     SAMPLES_BUCKET,
 )
 from leoma.bootstrap import emit_log as log, emit_header as log_header, log_exception
@@ -32,14 +30,12 @@ from leoma.infra.storage_backend import (
     list_evaluated_task_ids,
     download_task_artifacts,
 )
-from leoma.infra.video_utils import extract_frames, frames_to_base64
+from leoma.infra.video_utils import frames_to_base64
 from leoma.infra.judge import evaluate_generated_video_async
 
 EVALUATOR_POLL_INTERVAL = int(os.environ.get("EVALUATOR_POLL_INTERVAL", "60"))
 EVALUATED_LIST_MAX = 100
 API_URL = os.environ.get("API_URL", "https://api.leoma.ai")
-EVALUATION_MAX_FRAMES = int(os.environ.get("EVALUATION_MAX_FRAMES", "12"))
-EVALUATION_FRAME_FPS = float(os.environ.get("EVALUATION_FRAME_FPS", "3"))
 EVALUATION_PASS_THRESHOLD = int(os.environ.get("EVALUATION_PASS_THRESHOLD", "75"))
 EVALUATION_CRITICAL_THRESHOLD = int(os.environ.get("EVALUATION_CRITICAL_THRESHOLD", "50"))
 
@@ -72,18 +68,11 @@ async def run_evaluator_loop() -> None:
     from leoma.bootstrap import WALLET_NAME, HOTKEY_NAME
 
     gemini_key = GEMINI_API_KEY or os.environ.get("GEMINI_API_KEY")
-    openai_key = OPENAI_API_KEY or os.environ.get("OPENAI_API_KEY")
-    if not gemini_key and not openai_key:
-        log("Evaluator requires GEMINI_API_KEY and/or OPENAI_API_KEY (fallback)", "error")
+    if not gemini_key:
+        log("Evaluator requires GEMINI_API_KEY", "error")
         return
-    gemini_client = genai.Client(api_key=gemini_key) if gemini_key else None
-    openai_client = AsyncOpenAI(api_key=openai_key) if openai_key else None
-    if gemini_client and openai_client:
-        log("Evaluator LLM: Gemini primary, GPT-4o fallback", "info")
-    elif gemini_client:
-        log("Evaluator LLM: Gemini only (no GPT-4o fallback configured)", "info")
-    else:
-        log("Evaluator LLM: GPT-4o only (GEMINI_API_KEY not set)", "info")
+    gemini_client = genai.Client(api_key=gemini_key)
+    log("Evaluator LLM: Gemini only (full-video evaluation)", "info")
     try:
         s3_client = create_samples_read_client()
     except ValueError as e:
@@ -182,22 +171,13 @@ async def run_evaluator_loop() -> None:
             samples_payload: list = []
             eval_entries: list = []
             for miner_hotkey, gen_video_path in generated_videos.items():
-                gen_frames_dir = os.path.join(dest_dir, f"gen_frames_{miner_hotkey[:8]}")
                 try:
                     latency_ms = miner_latencies_ms.get(miner_hotkey)
-                    gen_frames = await extract_frames(
-                        gen_video_path,
-                        gen_frames_dir,
-                        max_frames=EVALUATION_MAX_FRAMES,
-                        fps=EVALUATION_FRAME_FPS,
-                    )
-                    gen_frames_b64 = frames_to_base64(gen_frames)
                     comparison = await evaluate_generated_video_async(
                         first_frame_b64,
-                        gen_frames_b64,
+                        gen_video_path,
                         description,
                         gemini_client=gemini_client,
-                        openai_client=openai_client,
                         pass_threshold=EVALUATION_PASS_THRESHOLD,
                         critical_threshold=EVALUATION_CRITICAL_THRESHOLD,
                     )
@@ -248,9 +228,6 @@ async def run_evaluator_loop() -> None:
                     log(f"Miner {miner_hotkey[:12]}...: {'PASSED' if passed else 'FAILED'}", "info")
                 except Exception as e:
                     log(f"Miner {miner_hotkey[:12]}... evaluation failed: {e}", "error")
-                finally:
-                    if os.path.exists(gen_frames_dir):
-                        _remove_directory(gen_frames_dir)
 
             if samples_payload:
                 signature = api_client.sign_evaluation_payload(eval_entries)

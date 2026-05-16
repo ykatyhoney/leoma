@@ -5,6 +5,7 @@ generated-video scoring (Gemini primary + GPT-4o fallback, validator side).
 import asyncio
 import base64
 import json
+import os
 from typing import Any, Dict, List
 from leoma.bootstrap import emit_log as log
 from openai import AsyncOpenAI
@@ -14,6 +15,17 @@ from google.genai import types as genai_types
 GEMINI_EVAL_MODEL = "gemini-3.1-flash-lite-preview"
 GEMINI_EVAL_MAX_ATTEMPTS = 3
 GEMINI_EVAL_RETRY_SLEEP_S = 300
+
+GEMINI_EVAL_VIDEO_FPS = float(os.environ.get("EVALUATION_VIDEO_FPS", "16"))
+GEMINI_EVAL_MEDIA_RESOLUTION = os.environ.get(
+    "EVALUATION_MEDIA_RESOLUTION", "high"
+).strip().lower()
+
+_MEDIA_RESOLUTION_MAP = {
+    "low": genai_types.MediaResolution.MEDIA_RESOLUTION_LOW,
+    "medium": genai_types.MediaResolution.MEDIA_RESOLUTION_MEDIUM,
+    "high": genai_types.MediaResolution.MEDIA_RESOLUTION_HIGH,
+}
 
 DESCRIPTION_PROMPT = """You are writing a benchmark prompt for first-frame-conditioned video generation.
 
@@ -162,7 +174,7 @@ def _build_eval_instructions(prompt: str) -> str:
 Given:
 1) A conditioning first frame
 2) The benchmark generation prompt
-3) Sequential frames from a generated video
+3) The full generated video
 
 Benchmark prompt:
 "{prompt}"
@@ -211,19 +223,29 @@ EVAL_SYSTEM_MSG = (
 )
 
 
+def _video_to_gemini_part(video_path: str) -> genai_types.Part:
+    """Inline the full generated video, with explicit fps so Gemini samples it
+    densely instead of its 1 fps default."""
+    with open(video_path, "rb") as f:
+        data = f.read()
+    return genai_types.Part(
+        inline_data=genai_types.Blob(data=data, mime_type="video/mp4"),
+        video_metadata=genai_types.VideoMetadata(fps=GEMINI_EVAL_VIDEO_FPS),
+    )
+
+
 async def _evaluate_via_gemini(
     gemini_client: genai.Client,
     first_frame: List[Dict[str, Any]],
-    generated_frames: List[Dict[str, Any]],
+    generated_video_path: str,
     prompt: str,
 ) -> str:
     first_frame_parts = [_frame_dict_to_gemini_part(f) for f in first_frame]
-    gen_frame_parts = [_frame_dict_to_gemini_part(f) for f in generated_frames]
 
     contents: List[Any] = [_build_eval_instructions(prompt), "CONDITIONING FIRST FRAME:"]
     contents.extend(first_frame_parts)
-    contents.append("GENERATED VIDEO FRAMES (chronological):")
-    contents.extend(gen_frame_parts)
+    contents.append("GENERATED VIDEO:")
+    contents.append(_video_to_gemini_part(generated_video_path))
 
     response = await gemini_client.aio.models.generate_content(
         model=GEMINI_EVAL_MODEL,
@@ -233,79 +255,48 @@ async def _evaluate_via_gemini(
             temperature=0.1,
             max_output_tokens=450,
             response_mime_type="application/json",
+            media_resolution=_MEDIA_RESOLUTION_MAP.get(
+                GEMINI_EVAL_MEDIA_RESOLUTION,
+                genai_types.MediaResolution.MEDIA_RESOLUTION_HIGH,
+            ),
         ),
     )
     return response.text or ""
 
 
-async def _evaluate_via_openai(
-    openai_client: AsyncOpenAI,
-    first_frame: List[Dict[str, Any]],
-    generated_frames: List[Dict[str, Any]],
-    prompt: str,
-) -> str:
-    content = [
-        {"type": "text", "text": _build_eval_instructions(prompt)},
-        {"type": "text", "text": "CONDITIONING FIRST FRAME:"},
-    ] + first_frame + [
-        {"type": "text", "text": "GENERATED VIDEO FRAMES (chronological):"},
-    ] + generated_frames
-
-    response = await openai_client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {"role": "system", "content": EVAL_SYSTEM_MSG},
-            {"role": "user", "content": content},
-        ],
-        max_tokens=450,
-    )
-    return response.choices[0].message.content or ""
-
-
 async def evaluate_generated_video_async(
     first_frame: List[Dict[str, Any]],
-    generated_frames: List[Dict[str, Any]],
+    generated_video_path: str,
     prompt: str,
     *,
     gemini_client: genai.Client | None = None,
-    openai_client: AsyncOpenAI | None = None,
     pass_threshold: int = 70,
     critical_threshold: int = 50,
 ) -> Dict[str, Any]:
-    if gemini_client is None and openai_client is None:
-        raise ValueError("evaluate_generated_video_async requires gemini_client or openai_client")
+    if gemini_client is None:
+        raise ValueError("evaluate_generated_video_async requires gemini_client")
 
     raw: str | None = None
-    if gemini_client is not None:
-        last_error: Exception | None = None
-        for attempt in range(1, GEMINI_EVAL_MAX_ATTEMPTS + 1):
-            try:
-                raw = await _evaluate_via_gemini(
-                    gemini_client, first_frame, generated_frames, prompt
-                )
-                break
-            except Exception as e:
-                last_error = e
-                log(
-                    f"Gemini evaluation attempt {attempt}/{GEMINI_EVAL_MAX_ATTEMPTS} "
-                    f"failed: {e}",
-                    "warn",
-                )
-                if attempt < GEMINI_EVAL_MAX_ATTEMPTS:
-                    await asyncio.sleep(GEMINI_EVAL_RETRY_SLEEP_S)
-
-        if raw is None:
-            if openai_client is None:
-                assert last_error is not None
-                raise last_error
+    last_error: Exception | None = None
+    for attempt in range(1, GEMINI_EVAL_MAX_ATTEMPTS + 1):
+        try:
+            raw = await _evaluate_via_gemini(
+                gemini_client, first_frame, generated_video_path, prompt
+            )
+            break
+        except Exception as e:
+            last_error = e
             log(
-                f"Gemini evaluation failed after {GEMINI_EVAL_MAX_ATTEMPTS} attempts; "
-                "falling back to GPT-4o",
+                f"Gemini evaluation attempt {attempt}/{GEMINI_EVAL_MAX_ATTEMPTS} "
+                f"failed: {e}",
                 "warn",
             )
+            if attempt < GEMINI_EVAL_MAX_ATTEMPTS:
+                await asyncio.sleep(GEMINI_EVAL_RETRY_SLEEP_S)
 
     if raw is None:
-        raw = await _evaluate_via_openai(openai_client, first_frame, generated_frames, prompt)
+        assert last_error is not None
+        raise last_error
 
     text = _strip_json_fence(raw)
     try:

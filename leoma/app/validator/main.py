@@ -18,7 +18,6 @@ from leoma.bootstrap import (
     EPOCH_LEN,
     OBJECT_STORAGE_BACKEND,
     GEMINI_API_KEY,
-    OPENAI_API_KEY,
     WALLET_NAME,
     HOTKEY_NAME,
     NETWORK,
@@ -113,8 +112,8 @@ async def main() -> None:
     """Main entry point: run evaluator (background) + weight-setting loop."""
     log_header("Leoma Validator Starting (evaluator + weight-setter)")
 
-    if not GEMINI_API_KEY and not OPENAI_API_KEY:
-        log("Evaluator requires GEMINI_API_KEY and/or OPENAI_API_KEY (fallback)", "error")
+    if not GEMINI_API_KEY:
+        log("Evaluator requires GEMINI_API_KEY", "error")
         return
 
     log(f"Using centralized API: {API_URL}", "info")

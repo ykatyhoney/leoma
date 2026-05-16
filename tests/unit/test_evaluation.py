@@ -9,6 +9,16 @@ import base64
 import json
 from unittest.mock import MagicMock
 
+import pytest
+
+
+@pytest.fixture
+def fake_video(tmp_path):
+    """A real on-disk file so _video_to_gemini_part can read it (Gemini is mocked)."""
+    path = tmp_path / "gen.mp4"
+    path.write_bytes(b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom")
+    return str(path)
+
 # A tiny valid JPEG-shaped byte string, base64-encoded so _frame_dict_to_gemini_part
 # can decode it without raising.
 _FAKE_JPEG_B64 = base64.b64encode(b"\xff\xd8\xff\xd9").decode("ascii")
@@ -117,9 +127,9 @@ class TestCalculatePassRate:
 
 
 class TestEvaluateGeneratedVideoAsync:
-    """Tests for single-video benchmark evaluation (Gemini primary, GPT-4o fallback)."""
+    """Tests for single-video benchmark evaluation (Gemini only, full video input)."""
 
-    async def test_evaluate_generated_video_passes(self, mock_gemini_client):
+    async def test_evaluate_generated_video_passes(self, mock_gemini_client, fake_video):
         """High aspect scores should pass benchmark threshold (Gemini path)."""
         from leoma.infra.judge import evaluate_generated_video_async
 
@@ -144,7 +154,7 @@ class TestEvaluateGeneratedVideoAsync:
 
         result = await evaluate_generated_video_async(
             first_frame=[_FAKE_FRAME],
-            generated_frames=[_FAKE_FRAME],
+            generated_video_path=fake_video,
             prompt="A person jogging in a city park at sunrise",
             gemini_client=mock_gemini_client,
         )
@@ -153,7 +163,9 @@ class TestEvaluateGeneratedVideoAsync:
         assert result["overall_score"] == 86
         assert result["confidence"] == 89
 
-    async def test_evaluate_generated_video_fails_on_critical_floor(self, mock_gemini_client):
+    async def test_evaluate_generated_video_fails_on_critical_floor(
+        self, mock_gemini_client, fake_video
+    ):
         """Low critical aspect should fail even with decent overall score."""
         from leoma.infra.judge import evaluate_generated_video_async
 
@@ -178,7 +190,7 @@ class TestEvaluateGeneratedVideoAsync:
 
         result = await evaluate_generated_video_async(
             first_frame=[],
-            generated_frames=[],
+            generated_video_path=fake_video,
             prompt="Test prompt",
             gemini_client=mock_gemini_client,
         )
@@ -186,7 +198,9 @@ class TestEvaluateGeneratedVideoAsync:
         assert result["passed"] is False
         assert result["overall_score"] == 78
 
-    async def test_evaluate_generated_video_handles_parse_error(self, mock_gemini_client):
+    async def test_evaluate_generated_video_handles_parse_error(
+        self, mock_gemini_client, fake_video
+    ):
         """Invalid JSON should return fail-safe output."""
         from leoma.infra.judge import evaluate_generated_video_async
 
@@ -196,7 +210,7 @@ class TestEvaluateGeneratedVideoAsync:
 
         result = await evaluate_generated_video_async(
             first_frame=[],
-            generated_frames=[],
+            generated_video_path=fake_video,
             prompt="Test prompt",
             gemini_client=mock_gemini_client,
         )
@@ -205,90 +219,10 @@ class TestEvaluateGeneratedVideoAsync:
         assert result["overall_score"] == 0
         assert "Parse error" in result["reasoning"]
 
-    async def test_evaluate_generated_video_openai_only(self, mock_openai_client):
-        """When no Gemini client is provided, evaluation runs via GPT-4o."""
-        from leoma.infra.judge import evaluate_generated_video_async
-
-        response_json = {
-            "overall_score": 81,
-            "confidence": 77,
-            "aspect_scores": {
-                "first_frame_fidelity": 80,
-                "prompt_adherence": 82,
-                "motion_quality": 79,
-                "temporal_consistency": 83,
-                "visual_quality": 80,
-                "camera_composition": 78,
-            },
-            "major_issues": [],
-            "strengths": ["coherent motion"],
-            "reasoning": "Solid overall quality.",
-        }
-        mock_openai_client.chat.completions.create.return_value = MagicMock(
-            choices=[MagicMock(message=MagicMock(content=json.dumps(response_json)))]
-        )
-
-        result = await evaluate_generated_video_async(
-            first_frame=[_FAKE_FRAME],
-            generated_frames=[_FAKE_FRAME],
-            prompt="Test prompt",
-            openai_client=mock_openai_client,
-        )
-
-        assert result["passed"] is True
-        assert result["overall_score"] == 81
-        mock_openai_client.chat.completions.create.assert_called_once()
-
-    async def test_evaluate_generated_video_falls_back_to_openai_on_gemini_error(
-        self, mocker, mock_gemini_client, mock_openai_client
-    ):
-        """Gemini is retried 3 times with 5-minute sleeps before GPT-4o fallback kicks in."""
-        from unittest.mock import AsyncMock
-
-        from leoma.infra import judge
-        from leoma.infra.judge import evaluate_generated_video_async
-
-        sleep_mock = mocker.patch.object(judge.asyncio, "sleep", new_callable=AsyncMock)
-        mock_gemini_client.aio.models.generate_content.side_effect = RuntimeError("Gemini down")
-
-        response_json = {
-            "overall_score": 74,
-            "confidence": 70,
-            "aspect_scores": {
-                "first_frame_fidelity": 72,
-                "prompt_adherence": 76,
-                "motion_quality": 70,
-                "temporal_consistency": 78,
-                "visual_quality": 74,
-                "camera_composition": 70,
-            },
-            "major_issues": [],
-            "strengths": [],
-            "reasoning": "Fallback evaluation via GPT-4o.",
-        }
-        mock_openai_client.chat.completions.create.return_value = MagicMock(
-            choices=[MagicMock(message=MagicMock(content=json.dumps(response_json)))]
-        )
-
-        result = await evaluate_generated_video_async(
-            first_frame=[_FAKE_FRAME],
-            generated_frames=[_FAKE_FRAME],
-            prompt="Test prompt",
-            gemini_client=mock_gemini_client,
-            openai_client=mock_openai_client,
-        )
-
-        assert result["passed"] is True
-        assert result["overall_score"] == 74
-        assert mock_gemini_client.aio.models.generate_content.call_count == 3
-        assert sleep_mock.await_count == 2
-        sleep_mock.assert_awaited_with(300)
-        mock_openai_client.chat.completions.create.assert_called_once()
-
     async def test_evaluate_generated_video_retries_then_succeeds_on_gemini(
-        self, mocker, mock_gemini_client
+        self, mocker, mock_gemini_client, fake_video
     ):
-        """A transient Gemini failure on attempt 1 should succeed on attempt 2 without fallback."""
+        """A transient Gemini failure on attempt 1 should succeed on attempt 2."""
         from unittest.mock import AsyncMock
 
         from leoma.infra import judge
@@ -303,7 +237,7 @@ class TestEvaluateGeneratedVideoAsync:
 
         result = await evaluate_generated_video_async(
             first_frame=[_FAKE_FRAME],
-            generated_frames=[_FAKE_FRAME],
+            generated_video_path=fake_video,
             prompt="Test prompt",
             gemini_client=mock_gemini_client,
         )
@@ -312,36 +246,36 @@ class TestEvaluateGeneratedVideoAsync:
         assert mock_gemini_client.aio.models.generate_content.call_count == 2
         assert sleep_mock.await_count == 1
 
-    async def test_evaluate_generated_video_reraises_when_no_fallback(
-        self, mocker, mock_gemini_client
+    async def test_evaluate_generated_video_propagates_after_retries(
+        self, mocker, mock_gemini_client, fake_video
     ):
-        """Without an openai_client, all 3 Gemini failures should propagate the last error."""
-        import pytest
+        """All 3 Gemini failures should propagate the last error (no fallback)."""
         from unittest.mock import AsyncMock
 
         from leoma.infra import judge
         from leoma.infra.judge import evaluate_generated_video_async
 
-        mocker.patch.object(judge.asyncio, "sleep", new_callable=AsyncMock)
+        sleep_mock = mocker.patch.object(judge.asyncio, "sleep", new_callable=AsyncMock)
         mock_gemini_client.aio.models.generate_content.side_effect = RuntimeError("Gemini down")
 
         with pytest.raises(RuntimeError, match="Gemini down"):
             await evaluate_generated_video_async(
                 first_frame=[_FAKE_FRAME],
-                generated_frames=[_FAKE_FRAME],
+                generated_video_path=fake_video,
                 prompt="Test prompt",
                 gemini_client=mock_gemini_client,
             )
         assert mock_gemini_client.aio.models.generate_content.call_count == 3
+        assert sleep_mock.await_count == 2
+        sleep_mock.assert_awaited_with(300)
 
-    async def test_evaluate_generated_video_requires_a_client(self):
-        """Calling without either client should raise ValueError."""
-        import pytest
+    async def test_evaluate_generated_video_requires_gemini_client(self):
+        """Calling without a gemini_client should raise ValueError."""
         from leoma.infra.judge import evaluate_generated_video_async
 
         with pytest.raises(ValueError):
             await evaluate_generated_video_async(
                 first_frame=[],
-                generated_frames=[],
+                generated_video_path="/nonexistent.mp4",
                 prompt="Test prompt",
             )
