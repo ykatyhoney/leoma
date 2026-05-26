@@ -1,6 +1,6 @@
 """
-Evaluation: benchmark prompt generation (GPT-4o, sampler side) and
-generated-video scoring (Gemini primary + GPT-4o fallback, validator side).
+Evaluation: benchmark prompt generation (Gemini, full-clip, sampler side) and
+generated-video scoring (Gemini, full-video, validator side).
 """
 import asyncio
 import base64
@@ -8,7 +8,6 @@ import json
 import os
 from typing import Any, Dict, List
 from leoma.bootstrap import emit_log as log
-from openai import AsyncOpenAI
 from google import genai
 from google.genai import types as genai_types
 
@@ -21,27 +20,42 @@ GEMINI_EVAL_MEDIA_RESOLUTION = os.environ.get(
     "EVALUATION_MEDIA_RESOLUTION", "high"
 ).strip().lower()
 
+# Benchmark-prompt (description) generation. Reads the full 5s clip as video
+# (not sparse frames) so the temporal action sequence is captured accurately.
+# Defaults to full Gemini Flash (not Flash-Lite) for description fidelity; the
+# call runs once per sampling round, so the extra cost is negligible.
+GEMINI_DESCRIPTION_MODEL = os.environ.get("DESCRIPTION_MODEL", "gemini-3.1-flash-preview")
+GEMINI_DESCRIPTION_MAX_ATTEMPTS = int(os.environ.get("DESCRIPTION_MAX_ATTEMPTS", "3"))
+GEMINI_DESCRIPTION_RETRY_SLEEP_S = int(os.environ.get("DESCRIPTION_RETRY_SLEEP_S", "10"))
+GEMINI_DESCRIPTION_VIDEO_FPS = float(os.environ.get("DESCRIPTION_VIDEO_FPS", "16"))
+GEMINI_DESCRIPTION_MEDIA_RESOLUTION = os.environ.get(
+    "DESCRIPTION_MEDIA_RESOLUTION", "high"
+).strip().lower()
+
 _MEDIA_RESOLUTION_MAP = {
     "low": genai_types.MediaResolution.MEDIA_RESOLUTION_LOW,
     "medium": genai_types.MediaResolution.MEDIA_RESOLUTION_MEDIUM,
     "high": genai_types.MediaResolution.MEDIA_RESOLUTION_HIGH,
 }
 
-DESCRIPTION_PROMPT = """You are writing a benchmark prompt for first-frame-conditioned video generation.
+DESCRIPTION_PROMPT = """You are writing a single benchmark prompt for first-frame-conditioned video generation.
 
-Use the provided sequential frames from a 5-second one-shot clip.
-Write a single high-precision prompt that includes:
-- Main subject identity, appearance, and spatial layout
-- Scene/environment details and background elements
-- Temporal action sequence across the clip
-- Camera behavior (static, pan, tilt, dolly, zoom) and framing
-- Lighting, color, texture, and mood
-- Consistency constraints (what must remain stable over time)
+You are given the COMPLETE 5-second one-shot source clip as video. The model that will use
+this prompt also receives the first frame, so it already sees appearance, scene, and lighting
+— your job is to specify what the first frame CANNOT convey: how things move over time.
+
+Watch the whole clip and describe ONLY what is actually visible. Be faithful and precise —
+never invent actions or objects that are not present. Prioritize, in order:
+1. The temporal action sequence as it unfolds across the clip — what moves, how, when, and in
+   what direction. This is the most important part; get the motion right.
+2. Camera behavior across the clip (static, pan, tilt, dolly, zoom, handheld) and framing.
+3. A brief anchor of the main subject and setting — one short clause, since the first frame
+   already shows appearance and background. Do not catalog textures, palette, or mood.
 
 Output requirements:
-- Plain text only (no bullets, no markdown)
-- 70-130 words
-- Concrete and specific wording suitable for benchmark generation
+- Plain text only (no bullets, no markdown, no preamble, no quotes)
+- One coherent paragraph, 50-90 words
+- Concrete, specific, motion-first wording grounded in the clip
 """
 
 ASPECT_KEYS = (
@@ -149,14 +163,60 @@ def _parse_generated_eval_error(raw_text: str) -> Dict[str, Any]:
     }
 
 
-async def get_description_async(openai_client: AsyncOpenAI, frames: List[Dict[str, Any]]) -> str:
-    content = [{"type": "text", "text": DESCRIPTION_PROMPT}] + frames
-    response = await openai_client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": content}],
-        max_tokens=220,
+async def get_description_async(
+    gemini_client: genai.Client,
+    clip_video_path: str,
+    *,
+    fps: float = GEMINI_DESCRIPTION_VIDEO_FPS,
+) -> str:
+    """Generate the benchmark prompt by having Gemini watch the full 5s clip.
+
+    Reads the whole clip as video (sampled at `fps`) rather than a handful of
+    frames, so the temporal action sequence is captured accurately. This same
+    text is sent to miners to generate against and is later used to score
+    prompt_adherence, so its fidelity directly drives evaluation accuracy.
+    """
+    if gemini_client is None:
+        raise ValueError("get_description_async requires gemini_client")
+
+    contents: List[Any] = [
+        DESCRIPTION_PROMPT,
+        "SOURCE CLIP (full 5-second one-shot video):",
+        _video_to_gemini_part(clip_video_path, fps=fps),
+    ]
+    config = genai_types.GenerateContentConfig(
+        temperature=0.2,
+        max_output_tokens=400,
+        media_resolution=_MEDIA_RESOLUTION_MAP.get(
+            GEMINI_DESCRIPTION_MEDIA_RESOLUTION,
+            genai_types.MediaResolution.MEDIA_RESOLUTION_HIGH,
+        ),
     )
-    return response.choices[0].message.content.strip()
+
+    last_error: Exception | None = None
+    for attempt in range(1, GEMINI_DESCRIPTION_MAX_ATTEMPTS + 1):
+        try:
+            response = await gemini_client.aio.models.generate_content(
+                model=GEMINI_DESCRIPTION_MODEL,
+                contents=contents,
+                config=config,
+            )
+            text = (response.text or "").strip()
+            if text:
+                return text
+            last_error = ValueError("empty description from Gemini")
+        except Exception as e:
+            last_error = e
+            log(
+                f"Description attempt {attempt}/{GEMINI_DESCRIPTION_MAX_ATTEMPTS} "
+                f"failed: {e}",
+                "warn",
+            )
+        if attempt < GEMINI_DESCRIPTION_MAX_ATTEMPTS:
+            await asyncio.sleep(GEMINI_DESCRIPTION_RETRY_SLEEP_S)
+
+    assert last_error is not None
+    raise last_error
 
 
 def _frame_dict_to_gemini_part(frame: Dict[str, Any]) -> genai_types.Part:
@@ -223,14 +283,16 @@ EVAL_SYSTEM_MSG = (
 )
 
 
-def _video_to_gemini_part(video_path: str) -> genai_types.Part:
-    """Inline the full generated video, with explicit fps so Gemini samples it
-    densely instead of its 1 fps default."""
+def _video_to_gemini_part(
+    video_path: str, fps: float = GEMINI_EVAL_VIDEO_FPS
+) -> genai_types.Part:
+    """Inline a full video, with explicit fps so Gemini samples it densely
+    instead of its 1 fps default."""
     with open(video_path, "rb") as f:
         data = f.read()
     return genai_types.Part(
         inline_data=genai_types.Blob(data=data, mime_type="video/mp4"),
-        video_metadata=genai_types.VideoMetadata(fps=GEMINI_EVAL_VIDEO_FPS),
+        video_metadata=genai_types.VideoMetadata(fps=fps),
     )
 
 

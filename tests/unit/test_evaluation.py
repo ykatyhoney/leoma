@@ -1,7 +1,7 @@
 """
 Unit tests for evaluation utilities.
 
-Tests description generation (GPT-4o, sampler side) and
+Tests description generation (Gemini full-clip, sampler side) and
 generated-video scoring (Gemini, validator side) prompt building and response parsing.
 """
 
@@ -34,59 +34,61 @@ def _pass_rate(passed_count: int, total: int) -> float:
 
 
 class TestGetDescriptionAsync:
-    """Tests for get_description_async function."""
+    """Tests for get_description_async function (Gemini, full-clip video)."""
 
-    async def test_get_description_returns_text(self, mock_openai_client):
+    async def test_get_description_returns_text(self, mock_gemini_client, fake_video):
         """Test that get_description_async returns description text."""
         from leoma.infra.judge import get_description_async
 
-        mock_openai_client.chat.completions.create.return_value = MagicMock(
-            choices=[MagicMock(message=MagicMock(content="A skateboarder crossing a quiet plaza."))]
+        mock_gemini_client.aio.models.generate_content.return_value = MagicMock(
+            text="A skateboarder crossing a quiet plaza."
         )
 
-        frames = [{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,abc123"}}]
-        result = await get_description_async(mock_openai_client, frames)
+        result = await get_description_async(mock_gemini_client, fake_video)
 
         assert result == "A skateboarder crossing a quiet plaza."
 
-    async def test_get_description_strips_whitespace(self, mock_openai_client):
+    async def test_get_description_strips_whitespace(self, mock_gemini_client, fake_video):
         """Test that description is stripped of whitespace."""
         from leoma.infra.judge import get_description_async
 
-        mock_openai_client.chat.completions.create.return_value = MagicMock(
-            choices=[MagicMock(message=MagicMock(content="  Trimmed text  \n"))]
+        mock_gemini_client.aio.models.generate_content.return_value = MagicMock(
+            text="  Trimmed text  \n"
         )
 
-        frames = []
-        result = await get_description_async(mock_openai_client, frames)
+        result = await get_description_async(mock_gemini_client, fake_video)
 
         assert result == "Trimmed text"
 
-    async def test_get_description_builds_correct_prompt(self, mock_openai_client):
-        """Test that the prompt is correctly constructed."""
+    async def test_get_description_uses_full_clip_video(self, mock_gemini_client, fake_video):
+        """The full clip is sent as a video part to the configured Gemini model."""
+        from leoma.infra import judge
         from leoma.infra.judge import get_description_async
 
-        mock_openai_client.chat.completions.create.return_value = MagicMock(
-            choices=[MagicMock(message=MagicMock(content="Description"))]
+        mock_gemini_client.aio.models.generate_content.return_value = MagicMock(
+            text="Description"
         )
 
-        frames = [
-            {"type": "image_url", "image_url": {"url": "frame1"}},
-            {"type": "image_url", "image_url": {"url": "frame2"}},
-        ]
+        await get_description_async(mock_gemini_client, fake_video)
 
-        await get_description_async(mock_openai_client, frames)
+        mock_gemini_client.aio.models.generate_content.assert_called_once()
+        call_kwargs = mock_gemini_client.aio.models.generate_content.call_args.kwargs
 
-        # Verify the API was called
-        mock_openai_client.chat.completions.create.assert_called_once()
-        call_kwargs = mock_openai_client.chat.completions.create.call_args.kwargs
+        assert call_kwargs["model"] == judge.GEMINI_DESCRIPTION_MODEL
 
-        assert call_kwargs["model"] == "gpt-4o"
-        assert call_kwargs["max_tokens"] == 220
+        # Contents = prompt text + label + a single video part (the full clip).
+        contents = call_kwargs["contents"]
+        assert judge.DESCRIPTION_PROMPT in contents
+        video_parts = [c for c in contents if hasattr(c, "inline_data") and c.inline_data]
+        assert len(video_parts) == 1
+        assert video_parts[0].inline_data.mime_type == "video/mp4"
 
-        # Content should include text prompt + frames
-        content = call_kwargs["messages"][0]["content"]
-        assert len(content) == 3  # 1 text + 2 frames
+    async def test_get_description_requires_gemini_client(self):
+        """Calling without a gemini_client should raise ValueError."""
+        from leoma.infra.judge import get_description_async
+
+        with pytest.raises(ValueError):
+            await get_description_async(None, "clip.mp4")
 
 
 class TestCalculatePassRate:
