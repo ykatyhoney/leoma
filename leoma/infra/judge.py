@@ -11,7 +11,7 @@ from leoma.bootstrap import emit_log as log
 from google import genai
 from google.genai import types as genai_types
 
-GEMINI_EVAL_MODEL = "gemini-3.1-flash-lite-preview"
+GEMINI_EVAL_MODEL = "gemini-3.1-flash-lite"
 GEMINI_EVAL_MAX_ATTEMPTS = 3
 GEMINI_EVAL_RETRY_SLEEP_S = 300
 
@@ -24,7 +24,7 @@ GEMINI_EVAL_MEDIA_RESOLUTION = os.environ.get(
 # (not sparse frames) so the temporal action sequence is captured accurately.
 # Defaults to full Gemini Flash (not Flash-Lite) for description fidelity; the
 # call runs once per sampling round, so the extra cost is negligible.
-GEMINI_DESCRIPTION_MODEL = os.environ.get("DESCRIPTION_MODEL", "gemini-3.1-flash-preview")
+GEMINI_DESCRIPTION_MODEL = os.environ.get("DESCRIPTION_MODEL", "gemini-3.1-flash-lite")
 GEMINI_DESCRIPTION_MAX_ATTEMPTS = int(os.environ.get("DESCRIPTION_MAX_ATTEMPTS", "3"))
 GEMINI_DESCRIPTION_RETRY_SLEEP_S = int(os.environ.get("DESCRIPTION_RETRY_SLEEP_S", "10"))
 GEMINI_DESCRIPTION_VIDEO_FPS = float(os.environ.get("DESCRIPTION_VIDEO_FPS", "16"))

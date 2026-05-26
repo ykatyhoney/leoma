@@ -6,7 +6,7 @@ VideoSource, prompt/generation params and info.
 
 from pydantic import BaseModel
 
-DEFAULT_PROMPT_MODEL = "gemini-3.1-flash-preview"
+DEFAULT_PROMPT_MODEL = "gemini-3.1-flash-lite"
 DEFAULT_GENERATION_FPS = 16
 DEFAULT_GENERATION_FRAMES = 81
 DEFAULT_GENERATION_RESOLUTION = "480p"
