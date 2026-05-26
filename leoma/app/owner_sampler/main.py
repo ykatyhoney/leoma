@@ -4,7 +4,7 @@ Owner sampler: creates tasks, calls miners, uploads results to S3.
 Runs as a separate process (not inside FastAPI). Every 30 minutes:
 - Allocates next task_id from DB
 - Gets valid miners from API
-- Finds a source video with a valid one-shot 5s segment, extracts clip and first frame, gets GPT-4o description
+- Finds a source video with a valid one-shot 5s segment, extracts clip and first frame, gets a Gemini full-clip description
 - Calls each miner via Chutes, collects generated videos
 - Uploads to S3: task_id/generated_videos/{miner_hotkey}.mp4, task_id/original_clip.mp4, etc.
 - Updates latest_sampled_task_id so validators can poll GET /tasks/latest
@@ -20,7 +20,7 @@ from typing import Dict, Any
 
 import aiohttp
 from minio import Minio
-from openai import AsyncOpenAI
+from google import genai
 
 from leoma.bootstrap import (
     SOURCE_BUCKET,
@@ -33,6 +33,7 @@ from leoma.bootstrap import (
     REQUIRED_VIDEO_HEIGHT,
     REQUIRED_VIDEO_WIDTH,
     VIDEO_RESOLUTION_TOLERANCE,
+    GEMINI_API_KEY,
     WALLET_NAME,
     HOTKEY_NAME,
 )
@@ -48,13 +49,11 @@ from leoma.infra.storage_backend import (
 from leoma.infra.video_utils import (
     OneShotClipSelection,
     choose_one_shot_clip_start,
-    extract_frames,
-    frames_to_base64,
     extract_clip,
     extract_first_frame,
     get_video_resolution,
 )
-from leoma.infra.judge import get_description_async
+from leoma.infra.judge import get_description_async, GEMINI_DESCRIPTION_MODEL
 from leoma.infra.chute_resolver import get_chute_info, build_chute_endpoint
 
 # Interval between sampling rounds (seconds)
@@ -67,8 +66,6 @@ MAX_VIDEO_HISTORY = int(os.environ.get("MAX_VIDEO_HISTORY", "100"))
 
 # Concurrency
 MAX_CONCURRENT_MINERS = int(os.environ.get("MAX_CONCURRENT_MINERS", "40"))
-DESCRIPTION_MAX_FRAMES = int(os.environ.get("DESCRIPTION_MAX_FRAMES", "12"))
-DESCRIPTION_FRAME_FPS = float(os.environ.get("DESCRIPTION_FRAME_FPS", "3"))
 ONE_SHOT_SCENE_THRESHOLD = float(os.environ.get("ONE_SHOT_SCENE_THRESHOLD", "0.18"))
 ONE_SHOT_BOUNDARY_MARGIN = float(os.environ.get("ONE_SHOT_BOUNDARY_MARGIN", "0.15"))
 SAFE_CLIP_START_OFFSET_SECONDS = float(os.environ.get("SAFE_CLIP_START_OFFSET_SECONDS", "2.0"))
@@ -324,10 +321,10 @@ async def run_owner_sampler_loop() -> None:
     samples_client = create_samples_write_client()
     await ensure_bucket_exists(samples_client, SAMPLES_BUCKET)
 
-    openai_key = os.environ.get("OPENAI_API_KEY")
-    if not openai_key:
-        log("OPENAI_API_KEY not set; description generation will fail", "warn")
-    openai_client = AsyncOpenAI(api_key=openai_key) if openai_key else None
+    gemini_key = GEMINI_API_KEY or os.environ.get("GEMINI_API_KEY")
+    if not gemini_key:
+        log("GEMINI_API_KEY not set; description generation will fail", "warn")
+    gemini_client = genai.Client(api_key=gemini_key) if gemini_key else None
 
     log_header("Owner Sampler Starting")
     log(f"Sampling interval: {OWNER_SAMPLING_INTERVAL}s", "info")
@@ -382,23 +379,12 @@ async def run_owner_sampler_loop() -> None:
             await extract_clip(video_path, clip_path, start_offset, CLIP_DURATION)
             await extract_first_frame(clip_path, frame_path, start_offset=0)
 
-            if not openai_client:
-                log("Skipping round: no OpenAI client", "warn")
+            if not gemini_client:
+                log("Skipping round: no Gemini client", "warn")
                 await _sleep_until_next_round()
                 continue
 
-            original_frames = await extract_frames(
-                clip_path,
-                original_frames_dir,
-                max_frames=DESCRIPTION_MAX_FRAMES,
-                fps=DESCRIPTION_FRAME_FPS,
-            )
-            if len(original_frames) < 5:
-                log("Not enough frames, skipping", "warn")
-                continue
-
-            original_frames_b64 = frames_to_base64(original_frames)
-            description = await get_description_async(openai_client, original_frames_b64)
+            description = await get_description_async(gemini_client, clip_path)
             log(f"Description: {description[:80]}...", "info")
 
             with open(frame_path, "rb") as f:
@@ -462,10 +448,9 @@ async def run_owner_sampler_loop() -> None:
                     "scene_detection_threshold": ONE_SHOT_SCENE_THRESHOLD,
                 },
                 "prompt": {
-                    "model": "gpt-4o",
+                    "model": GEMINI_DESCRIPTION_MODEL,
                     "text": description,
-                    "description_frame_count": len(original_frames),
-                    "description_frame_fps": DESCRIPTION_FRAME_FPS,
+                    "description_source": "full_clip_video",
                 },
                 "miners": list(miner_paths.keys()),
                 "miner_latencies_ms": {
