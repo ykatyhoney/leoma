@@ -8,19 +8,7 @@ from pydantic import BaseModel, Field
 
 
 class EvaluationResult(BaseModel):
-    """
-    Evaluation result.
-
-    Attributes
-    ----------
-    passed : bool
-    confidence : int
-        Between 0 and 100.
-    reasoning : str
-    original_artifacts : List[str]
-    generated_artifacts : List[str]
-    presentation_order : str
-    """
+    """Evaluation result for a single comparison."""
 
     passed: bool
     confidence: int = Field(ge=0, le=100)

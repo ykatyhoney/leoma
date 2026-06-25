@@ -1,8 +1,4 @@
-"""
-Source and generation metadata.
-
-VideoSource, prompt/generation params and info.
-"""
+"""Source and generation metadata."""
 
 from pydantic import BaseModel
 
@@ -13,7 +9,7 @@ DEFAULT_GENERATION_RESOLUTION = "480p"
 
 
 class VideoSource(BaseModel):
-    """Source video metadata: bucket, key, durations."""
+    """Source video metadata."""
 
     bucket: str
     key: str
@@ -23,14 +19,14 @@ class VideoSource(BaseModel):
 
 
 class PromptInfo(BaseModel):
-    """Generated prompt metadata: model, text."""
+    """Generated prompt metadata."""
 
     model: str = DEFAULT_PROMPT_MODEL
     text: str
 
 
 class GenerationParams(BaseModel):
-    """Video generation parameters: fps, frames, resolution, fast."""
+    """Video generation parameters."""
 
     fps: int = DEFAULT_GENERATION_FPS
     frames: int = DEFAULT_GENERATION_FRAMES
@@ -39,7 +35,7 @@ class GenerationParams(BaseModel):
 
 
 class GenerationInfo(BaseModel):
-    """Generation run metadata: model, endpoint, parameters."""
+    """Generation run metadata."""
 
     model: str
     endpoint: str

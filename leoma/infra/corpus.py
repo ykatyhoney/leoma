@@ -101,14 +101,7 @@ def _new_batch_results(total: int) -> Dict[str, Any]:
 
 
 async def get_video_info(url: str) -> Optional[Dict[str, Any]]:
-    """Get video metadata from YouTube URL using yt-dlp.
-    
-    Args:
-        url: YouTube video URL
-        
-    Returns:
-        Video metadata dict or None if failed
-    """
+    """Get video metadata from a YouTube URL using yt-dlp (None if failed)."""
     try:
         cmd = [
             "yt-dlp",
@@ -127,34 +120,24 @@ async def get_video_info(url: str) -> Optional[Dict[str, Any]]:
 
 
 def validate_video_metadata(info: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
-    """Validate video metadata meets corpus requirements.
-    
-    Args:
-        info: Video metadata from yt-dlp
-        
-    Returns:
-        Tuple of (is_valid, error_reason)
-    """
+    """Validate yt-dlp video metadata meets corpus requirements. Returns (is_valid, error_reason)."""
     duration = info.get("duration", 0)
     if duration < CORPUS_MIN_DURATION:
         return False, f"too_short:{duration}s<{CORPUS_MIN_DURATION}s"
     if duration > CORPUS_MAX_DURATION:
         return False, f"too_long:{duration}s>{CORPUS_MAX_DURATION}s"
-    
-    # Check if video has suitable formats
+
     formats = info.get("formats", [])
     has_video = any(f.get("vcodec", "none") != "none" for f in formats)
     if not has_video:
         return False, "no_video_stream"
-    
-    # Check age restriction
+
     if info.get("age_limit", 0) > 0:
         return False, "age_restricted"
-    
-    # Check if live stream
+
     if info.get("is_live", False):
         return False, "live_stream"
-    
+
     return True, None
 
 
@@ -163,15 +146,9 @@ async def download_video(
     output_dir: str,
     filename: Optional[str] = None,
 ) -> Optional[str]:
-    """Download video from YouTube using yt-dlp.
-    
-    Args:
-        url: YouTube video URL
-        output_dir: Directory to save the video
-        filename: Optional filename (without extension)
-        
-    Returns:
-        Path to downloaded video or None if failed
+    """Download a YouTube video using yt-dlp into output_dir. Returns the path or None if failed.
+
+    ``filename`` is an optional name without extension.
     """
     if filename is None:
         filename = "%(id)s"
@@ -217,14 +194,7 @@ def _check_ffprobe_available() -> bool:
 
 
 async def validate_downloaded_video(video_path: str) -> Tuple[bool, Optional[str]]:
-    """Validate downloaded video file.
-    
-    Args:
-        video_path: Path to video file
-        
-    Returns:
-        Tuple of (is_valid, error_reason)
-    """
+    """Validate a downloaded video file. Returns (is_valid, error_reason)."""
     if not os.path.exists(video_path):
         return False, "file_not_found"
     
@@ -240,7 +210,6 @@ async def validate_downloaded_video(video_path: str) -> Tuple[bool, Optional[str
             return True, None
         return False, "invalid_extension"
     
-    # Verify with ffprobe if available
     try:
         cmd = [
             "ffprobe",
@@ -256,14 +225,12 @@ async def validate_downloaded_video(video_path: str) -> Tuple[bool, Optional[str
             return True, None
         
         probe = json.loads(result.stdout)
-        
-        # Check for video stream
+
         streams = probe.get("streams", [])
         has_video = any(s.get("codec_type") == "video" for s in streams)
         if not has_video:
             return False, "no_video_stream"
-        
-        # Check duration
+
         duration = float(probe.get("format", {}).get("duration", 0))
         if duration < CORPUS_MIN_DURATION:
             return False, f"too_short:{duration:.1f}s"
@@ -282,20 +249,10 @@ async def upload_to_corpus(
     video_id: str,
     metadata: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
-    """Upload video to the corpus bucket.
-    
-    Args:
-        minio_client: Minio client instance
-        video_path: Path to local video file
-        video_id: Unique video identifier
-        metadata: Optional metadata to store
-        
-    Returns:
-        Object key in bucket or None if failed
-    """
+    """Upload a video to the corpus bucket. Returns the object key or None if failed."""
     await ensure_bucket_exists(minio_client, SOURCE_BUCKET)
-    
-    # Generate object key with date prefix for organization
+
+    # Date-prefixed object key for organization.
     date_prefix = datetime.now().strftime("%Y/%m")
     object_key = f"{date_prefix}/{video_id}.mp4"
     
@@ -310,8 +267,7 @@ async def upload_to_corpus(
         
         filesize_mb = os.path.getsize(video_path) / (1024 * 1024)
         log(f"Uploaded: s3://{SOURCE_BUCKET}/{object_key} ({filesize_mb:.1f} MB)", "success")
-        
-        # Upload metadata if provided
+
         if metadata:
             metadata_key = f"{date_prefix}/{video_id}.json"
             metadata_path = f"/tmp/{video_id}_metadata.json"
@@ -338,48 +294,34 @@ async def ingest_youtube_video(
     minio_client: Minio,
     url: str,
 ) -> Tuple[bool, Optional[str], Optional[str]]:
-    """Ingest a single YouTube video into the corpus.
-    
-    Args:
-        minio_client: Minio client instance
-        url: YouTube video URL
-        
-    Returns:
-        Tuple of (success, object_key, error_reason)
-    """
-    # Get video info
+    """Ingest a single YouTube video into the corpus. Returns (success, object_key, error_reason)."""
     log(f"Fetching info: {url}", "info")
     info = await get_video_info(url)
     if not info:
         return False, None, "info_fetch_failed"
-    
+
     video_id = info.get("id", "unknown")
     title = info.get("title", "Unknown")[:50]
     duration = info.get("duration", 0)
-    
+
     log(f"Video: {title} ({duration}s)", "info")
-    
-    # Validate metadata
+
     is_valid, reason = validate_video_metadata(info)
     if not is_valid:
         return False, None, reason
-    
-    # Download video
+
     with tempfile.TemporaryDirectory() as tmpdir:
         log(f"Downloading: {video_id}", "info")
         video_path = await download_video(url, tmpdir, video_id)
         if not video_path:
             return False, None, "download_failed"
-        
-        # Validate downloaded file
+
         is_valid, reason = await validate_downloaded_video(video_path)
         if not is_valid:
             return False, None, reason
-        
-        # Prepare metadata
+
         metadata = _build_ingest_metadata(info, url, video_id)
-        
-        # Upload to corpus
+
         object_key = await upload_to_corpus(minio_client, video_path, video_id, metadata)
         if not object_key:
             return False, None, "upload_failed"
@@ -392,16 +334,7 @@ async def ingest_youtube_batch(
     urls: List[str],
     max_concurrent: int = 2,
 ) -> Dict[str, Any]:
-    """Ingest multiple YouTube videos into the corpus.
-    
-    Args:
-        minio_client: Minio client instance
-        urls: List of YouTube video URLs
-        max_concurrent: Maximum concurrent downloads
-        
-    Returns:
-        Summary dict with success/failure counts
-    """
+    """Ingest multiple YouTube videos concurrently. Returns a success/failure summary dict."""
     results = _new_batch_results(total=len(urls))
     
     semaphore = asyncio.Semaphore(max_concurrent)
@@ -446,15 +379,7 @@ async def search_youtube(
     query: str,
     max_results: int = 10,
 ) -> List[Dict[str, Any]]:
-    """Search YouTube for videos matching a query.
-    
-    Args:
-        query: Search query string
-        max_results: Maximum number of results to return
-        
-    Returns:
-        List of video metadata dicts
-    """
+    """Search YouTube for videos matching a query. Returns a list of metadata dicts."""
     try:
         cmd = [
             "yt-dlp",
@@ -480,24 +405,14 @@ async def discover_random_videos(
     videos_per_query: int = 5,
     total_limit: int = 50,
 ) -> List[str]:
-    """Discover random YouTube video URLs using search queries.
-    
-    Args:
-        queries: List of search queries (uses DEFAULT_SEARCH_QUERIES if None)
-        videos_per_query: Number of videos to fetch per query
-        total_limit: Maximum total videos to return
-        
-    Returns:
-        List of YouTube video URLs
-    """
+    """Discover random YouTube video URLs via search queries (defaults to DEFAULT_SEARCH_QUERIES)."""
     import random
-    
+
     if queries is None:
         queries = DEFAULT_SEARCH_QUERIES.copy()
-    
-    # Shuffle queries for randomness
+
     random.shuffle(queries)
-    
+
     all_urls = []
     seen_ids = set()
     
@@ -516,7 +431,6 @@ async def discover_random_videos(
             if not video_id or video_id in seen_ids:
                 continue
             
-            # Basic filtering
             duration = video.get("duration")
             if duration and (duration < CORPUS_MIN_DURATION or duration > CORPUS_MAX_DURATION):
                 continue
@@ -537,22 +451,10 @@ async def expand_corpus_random(
     queries: Optional[List[str]] = None,
     max_concurrent: int = 2,
 ) -> Dict[str, Any]:
-    """Expand the corpus with random YouTube videos.
-    
-    Searches YouTube using diverse queries and ingests suitable videos.
-    
-    Args:
-        minio_client: Minio client instance
-        count: Number of videos to add
-        queries: Optional custom search queries
-        max_concurrent: Maximum concurrent downloads
-        
-    Returns:
-        Summary dict with results
-    """
+    """Expand the corpus by searching diverse queries and ingesting suitable videos."""
     log(f"Discovering {count} random videos...", "info")
-    
-    # Discover more URLs than needed (some will fail validation)
+
+    # Discover more URLs than needed (some will fail validation).
     urls = await discover_random_videos(
         queries=queries,
         videos_per_query=max(3, count // 5),
@@ -563,10 +465,9 @@ async def expand_corpus_random(
         result = _new_batch_results(total=0)
         result["errors"].append({"error": "no_videos_discovered"})
         return result
-    
-    # Limit to requested count
+
     urls = urls[:count]
-    
+
     log(f"Ingesting {len(urls)} videos...", "info")
     return await ingest_youtube_batch(minio_client, urls, max_concurrent)
 
