@@ -214,21 +214,38 @@ class SampleStore:
             val = r.scalar_one_or_none()
             return int(val) if val is not None else None
 
-    async def get_distinct_task_samplers(self) -> List[tuple]:
-        """Distinct ``(task_id, validator_hotkey)`` pairs, ascending by task_id (for ledger backfill).
-
-        Self-evaluation means each task_id has exactly one sampler/evaluator, so this maps each
-        produced task to the validator that produced it.
+    async def get_recent_task_window(self, n: int, margin: int) -> tuple[List[int], List[str]]:
+        """The settled dashboard window: the last ``n`` distinct task_ids (dropping the newest
+        ``margin``), ascending, plus the distinct validators that sampled them. Derived from the
+        dual-reported samples — informational only (validators set weights from their own window).
         """
+        async with get_session() as session:
+            q = (
+                select(distinct(ValidatorSample.task_id))
+                .where(ValidatorSample.task_id.isnot(None))
+                .order_by(ValidatorSample.task_id.desc())
+            )
+            all_ids = [int(t) for t in (await session.execute(q)).scalars().all() if t is not None]
+            window = sorted(all_ids[max(0, margin): max(0, margin) + max(0, n)])
+            if not window:
+                return [], []
+            aq = select(distinct(ValidatorSample.validator_hotkey)).where(
+                ValidatorSample.task_id.in_(window)
+            )
+            active = sorted(str(h) for h in (await session.execute(aq)).scalars().all() if h)
+        return window, active
+
+    async def get_latest_task(self) -> Optional[tuple]:
+        """The most-recent produced ``(task_id, sampler_hotkey)`` (None if nothing sampled yet)."""
         async with get_session() as session:
             q = (
                 select(ValidatorSample.task_id, ValidatorSample.validator_hotkey)
                 .where(ValidatorSample.task_id.isnot(None))
-                .distinct()
-                .order_by(ValidatorSample.task_id.asc())
+                .order_by(ValidatorSample.task_id.desc())
+                .limit(1)
             )
-            r = await session.execute(q)
-            return [(int(tid), hk) for tid, hk in r.all() if tid is not None]
+            row = (await session.execute(q)).first()
+        return (int(row[0]), row[1]) if row else None
 
     async def get_samples_in_task_window(self, task_ids: List[int]) -> List[ValidatorSample]:
         if not task_ids:

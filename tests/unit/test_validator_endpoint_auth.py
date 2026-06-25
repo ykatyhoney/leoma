@@ -22,11 +22,6 @@ HK = "5C62W7ELLAAfjCQeBU3me9nTXXqjVwN4kQY8w8gM9nJ8K4pL"  # arbitrary ss58 path p
 
 # (method, path) for every endpoint that performs/exposes a VALIDATOR operation.
 VALIDATOR_OP_ENDPOINTS = [
-    ("GET", "/tasks/latest"),            # sampling coordination (was unauthenticated — now gated)
-    ("GET", "/tasks/window"),
-    ("POST", "/tasks/announce"),
-    ("POST", "/tasks/claim"),
-    ("GET", "/rotation"),
     ("POST", "/miners/report"),
     ("GET", "/miners/valid"),
     ("GET", "/miners/all"),

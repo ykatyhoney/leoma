@@ -9,6 +9,7 @@ from leoma.delivery.http.routes.rotation import current_scoring_window
 from leoma.infra.chute_status import probe_hot_chutes
 from leoma.infra.db.stores import (
     ParticipantStore,
+    SampleStore,
     SamplingStateStore,
     ValidatorStore,
 )
@@ -18,6 +19,7 @@ router = APIRouter()
 valid_miners_dao = ParticipantStore()
 validators_dao = ValidatorStore()
 sampling_state_dao = SamplingStateStore()
+validator_samples_dao = SampleStore()
 
 
 @router.get("", response_model=OverviewResponse)
@@ -30,8 +32,9 @@ async def get_overview() -> OverviewResponse:
 
     validators = await validators_dao.get_all_validators()
     interval = await sampling_state_dao.get_rotation_interval(SAMPLING_ROTATION_INTERVAL)
-    latest_task_id = await sampling_state_dao.get_latest_task_id()
-    current_sampler = await sampling_state_dao.get_latest_task_sampler()
+    latest = await validator_samples_dao.get_latest_task()
+    latest_task_id = latest[0] if latest else None
+    current_sampler = latest[1] if latest else None
 
     window = await current_scoring_window()
     window_start = window[0] if window else None

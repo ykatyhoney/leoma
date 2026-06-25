@@ -384,3 +384,43 @@ class TestEvaluationStoreTaskKeying:
         
         # All should have same task_id
         assert all(s.task_id == task_id for s in validator_samples)
+
+
+class TestSampleDerivedWindow:
+    """The dashboard's scoring window + latest task now come straight from validator_samples."""
+
+    async def _seed(self, store, test_hotkeys):
+        # (task_id -> sampler) across three validators; one validator samples two tasks.
+        v0, v1, v2 = test_hotkeys[0], test_hotkeys[1], test_hotkeys[2]
+        miner = test_hotkeys[3]
+        for task_id, sampler in [(10, v0), (11, v1), (12, v2), (13, v0), (14, v1)]:
+            await store.save_sample(
+                validator_hotkey=sampler, task_id=task_id, miner_hotkey=miner,
+                s3_bucket="b", s3_prefix=f"tasks/{task_id}", passed=True,
+            )
+        return v0, v1, v2
+
+    async def test_get_recent_task_window_drops_margin_and_caps_n(
+        self, evaluation_store: EvaluationStore, test_hotkeys: list[str]
+    ):
+        v0, v1, v2 = await self._seed(evaluation_store, test_hotkeys)
+        # distinct ids desc [14,13,12,11,10] -> drop newest 1 -> [13,12,11,10] -> take 3 -> [11,12,13]
+        window, active = await evaluation_store.get_recent_task_window(n=3, margin=1)
+        assert window == [11, 12, 13]
+        assert active == sorted({v0, v1, v2})  # samplers of 11(v1),12(v2),13(v0)
+
+    async def test_get_recent_task_window_empty(
+        self, evaluation_store: EvaluationStore
+    ):
+        assert await evaluation_store.get_recent_task_window(n=5, margin=0) == ([], [])
+
+    async def test_get_latest_task(
+        self, evaluation_store: EvaluationStore, test_hotkeys: list[str]
+    ):
+        _, v1, _ = await self._seed(evaluation_store, test_hotkeys)
+        assert await evaluation_store.get_latest_task() == (14, v1)
+
+    async def test_get_latest_task_none_when_empty(
+        self, evaluation_store: EvaluationStore
+    ):
+        assert await evaluation_store.get_latest_task() is None

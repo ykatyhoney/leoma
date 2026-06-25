@@ -149,47 +149,6 @@ class APIClient:
         data = await self._request("GET", f"/miners/{hotkey}")
         return self._miner_from_payload(data)
 
-    async def get_latest_task_id(self) -> Optional[int]:
-        try:
-            data = await self._request("GET", "/tasks/latest", require_auth=True)
-            return data.get("task_id")
-        except ValueError:
-            return None
-
-    async def get_latest_task(self) -> Optional[Dict[str, Any]]:
-        """Latest sampled task: {task_id, sampler_hotkey} (None if nothing sampled yet). Permissioned."""
-        try:
-            return await self._request("GET", "/tasks/latest", require_auth=True)
-        except ValueError:
-            return None
-
-    async def get_rotation(self) -> Dict[str, Any]:
-        """Current rotation schedule (permissioned). Returns interval, validators, sampler_hotkey, is_your_turn."""
-        return await self._request("GET", "/rotation", require_auth=True)
-
-    async def get_task_window(self, as_of_block: Optional[int] = None) -> Dict[str, Any]:
-        """Settled scoring window (permissioned): the last N *produced* tasks at ``as_of_block``.
-
-        Returns ``{as_of_block, window: [{task_seq, rotation_id, sampler_hotkey}], active_validators}``.
-        Pass the shared epoch-boundary block as ``as_of_block`` so every validator computes the same
-        window. Omit it to get the window at the owner-api's current block.
-        """
-        path = "/tasks/window" if as_of_block is None else f"/tasks/window?as_of_block={int(as_of_block)}"
-        return await self._request("GET", path, require_auth=True)
-
-    async def announce_task(self, task_id: int) -> Dict[str, Any]:
-        """Announce a sampled task (permissioned). The server attributes it to this hotkey."""
-        return await self._request("POST", "/tasks/announce", data={"task_id": task_id}, require_auth=True)
-
-    async def claim_task(self, rotation_id: int) -> Dict[str, Any]:
-        """Lease this sampling turn before producing it (permissioned, failover coordination).
-
-        Returns ``{granted, holder, rotation_id, ...}``. Only sample when ``granted`` is true.
-        """
-        return await self._request(
-            "POST", "/tasks/claim", data={"rotation_id": rotation_id}, require_auth=True
-        )
-
     async def report_miners(self, miners: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Report this validator's miner-validation results (permissioned). Replaces prior report."""
         return await self._request("POST", "/miners/report", data={"miners": miners}, require_auth=True)

@@ -131,30 +131,6 @@ def db_init():
     _run_async(run())
 
 
-@db.command("backfill-ledger")
-def db_backfill_ledger():
-    """Seed the produced-task ledger from historical validator_samples (idempotent).
-
-    The owner-api also runs this automatically on startup when the ledger is empty; this command
-    forces a full reconciliation pass (still skips rotation_ids already present). Useful after
-    importing samples or to verify the backfill out-of-band.
-    """
-    from leoma.bootstrap import emit_log as log, emit_header as log_header
-    from leoma.infra.db.pool import init_database, close_database
-    from leoma.infra.ledger_backfill import backfill_produced_task_ledger
-
-    async def run():
-        log_header("Produced-task ledger backfill")
-        await init_database()
-        try:
-            inserted = await backfill_produced_task_ledger(only_if_empty=False)
-            log(f"Backfill complete: {inserted} new produced-task rows", "success")
-        finally:
-            await close_database()
-
-    _run_async(run())
-
-
 @db.command("add-validator")
 @click.option("--uid", type=int, required=True, help="Validator UID (integer, used as primary key).")
 @click.option("--hotkey", type=str, required=True, help="Validator SS58 hotkey (e.g. 5Fpo...).")
@@ -369,6 +345,57 @@ def validator_remove(hotkey: str):
             log(f"Removed validator {hotkey[:16]}... from allowlist", "success")
         finally:
             await client.close()
+
+    _run_async(run())
+
+
+@validator.command("publish")
+@click.option("--interval", type=int, default=None,
+              help="Rotation interval in blocks (default SAMPLING_ROTATION_INTERVAL).")
+def validator_publish(interval):
+    """Anchor the current allowlist ON-CHAIN so validators read it without the owner-api.
+
+    Writes allowlist/v1.json to the source bucket and commits its sha256 on-chain from the
+    subnet-owner wallet (WALLET_NAME/HOTKEY_NAME must be the subnet owner). Validators verify the
+    file against the on-chain hash and compute rotation + the scoring window locally. Re-run after
+    `leoma validator add/remove` to push changes.
+    """
+    import bittensor as bt
+    from leoma.bootstrap import (
+        emit_log as log, WALLET_NAME, HOTKEY_NAME, NETWORK, NETUID,
+        SOURCE_BUCKET, SAMPLING_ROTATION_INTERVAL,
+    )
+
+    async def run():
+        from leoma.infra.remote_api import APIClient
+        from leoma.infra.storage_backend import create_source_write_client
+        from leoma.infra.onchain_allowlist import publish_allowlist
+
+        client = APIClient(api_url=_api_url())
+        try:
+            validators = await client.get_validators()
+        finally:
+            await client.close()
+        hotkeys = [v["hotkey"] for v in validators if v.get("hotkey")]
+        if not hotkeys:
+            log("No validators in the allowlist; add some first (leoma validator add ...)", "error")
+            return
+
+        eff_interval = interval or SAMPLING_ROTATION_INTERVAL
+        wallet = bt.Wallet(name=WALLET_NAME, hotkey=HOTKEY_NAME)
+        subtensor = bt.AsyncSubtensor(network=NETWORK)
+        write_client = create_source_write_client()
+        try:
+            digest = await publish_allowlist(
+                subtensor, wallet, NETUID, write_client, SOURCE_BUCKET, hotkeys, eff_interval
+            )
+            log(
+                f"Published allowlist on-chain: {len(hotkeys)} validators, "
+                f"interval={eff_interval}, digest={digest[:16]}…",
+                "success",
+            )
+        finally:
+            await subtensor.close()
 
     _run_async(run())
 

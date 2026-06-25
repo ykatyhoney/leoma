@@ -1,58 +1,80 @@
 """
 Local per-validator-average aggregation → on-chain winner (decentralized weight setting).
 
-Self-evaluation model: each task is sampled AND evaluated by exactly one validator (its sampler),
-so a peer's bucket holds exactly that peer's own verdicts at ``{task_id}/evaluation_results/<hotkey>.json``.
-At each epoch every validator reads ALL permissioned validators' verdicts for the scoring window,
-gives each validator equal weight (mean of per-validator pass-rates), and ranks miners by dominance.
+Each task is sampled AND evaluated by exactly one validator (its sampler), whose bucket holds its
+verdicts at ``{task_id}/evaluation_results/<hotkey>.json``. At each epoch every validator:
 
-Bucket reads are BOUNDED to the window (direct ``get_object`` per (peer, task_id)) rather than a
-full-bucket list, so cost is O(window × peers), independent of how large the buckets grow. Each
-peer's verdict file signature is verified against that peer's hotkey before it is trusted.
+  1. reads the on-chain-anchored validator allowlist (no owner-api),
+  2. derives the settled scoring window itself from peer-bucket producedness + the shared epoch block,
+  3. reads each window task's verdict from its canonical sampler, gives every validator equal weight
+     (mean of per-validator pass-rates), and ranks miners by dominance.
+
+The whole path is owner-api-independent: the allowlist comes from the chain, the window from the
+buckets validators already read. Every validator computes the identical window — and winner — over
+immutable, signed verdict files.
 """
 import os
 import json
 import hashlib
 import asyncio
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from substrateinterface import Keypair
 
-from leoma.bootstrap import emit_log as log, log_exception
+from leoma.bootstrap import emit_log as log, log_exception, NETUID, SOURCE_BUCKET
 from leoma.app.validator.last_winner import load_last_winner, save_last_winner
+from leoma.app.validator.window_local import resolve_canonical_samplers, derive_window
 from leoma.infra.aggregate import aggregate_per_validator_average, Verdicts
+from leoma.infra.onchain_allowlist import read_allowlist
 from leoma.infra.scorer_constants import required_distinct_validators
 from leoma.infra.peer_registry import PeerBucket, load_peers
-from leoma.infra.storage_backend import create_peer_read_client
+from leoma.infra.storage_backend import (
+    create_peer_read_client,
+    create_source_read_client,
+    list_evaluated_task_ids,
+)
 
 # Dominance margin (kept identical to the dashboard scorer default).
 DOMINANCE_THRESHOLD = float(os.environ.get("DOMINANCE_THRESHOLD", "0.05"))
 # Bound concurrent bucket reads.
 _READ_CONCURRENCY = int(os.environ.get("AGGREGATION_READ_CONCURRENCY", "16"))
-# Retry the scoring-window fetch before giving up, so a brief owner-api restart at the epoch
-# boundary doesn't cost an epoch. Total wait ≈ (ATTEMPTS-1) * BACKOFF; epoch processing has slack.
-_WINDOW_FETCH_ATTEMPTS = int(os.environ.get("WINDOW_FETCH_ATTEMPTS", "5"))
-_WINDOW_FETCH_BACKOFF = float(os.environ.get("WINDOW_FETCH_BACKOFF_SECONDS", "10"))
+# Recent rotations to list per peer bucket when discovering producedness (window is anchored after).
+_DISCOVERY_MAX_TASKS = int(os.environ.get("WINDOW_DISCOVERY_MAX_TASKS", "500"))
 
 
-async def _fetch_window_with_retry(api_client, epoch_block: int):
-    """Fetch the scoring window, retrying with backoff. Returns the response, or None if the
-    owner-api stays unreachable across all attempts."""
-    last_err: Optional[Exception] = None
-    for attempt in range(1, _WINDOW_FETCH_ATTEMPTS + 1):
+async def _discover_produced(
+    peers: Dict[str, PeerBucket], validators: List[str]
+) -> Tuple[Dict[str, Set[int]], Dict[str, object]]:
+    """List each validator's bucket to find the rotations it published verdicts for.
+
+    Returns ``(produced_by_peer, read_clients)`` — the reusable read clients are handed back so the
+    verdict-file reads don't have to recreate them.
+    """
+    produced: Dict[str, Set[int]] = {}
+    clients: Dict[str, object] = {}
+    sem = asyncio.Semaphore(_READ_CONCURRENCY)
+
+    async def one(hotkey: str) -> None:
+        peer = peers.get(hotkey)
+        if peer is None:
+            return
         try:
-            return await api_client.get_task_window(as_of_block=epoch_block)
-        except Exception as e:  # owner-api down / transient — retry
-            last_err = e
-            if attempt < _WINDOW_FETCH_ATTEMPTS:
-                log(
-                    f"Scoring-window fetch failed (attempt {attempt}/{_WINDOW_FETCH_ATTEMPTS}): {e}; "
-                    f"retrying in {_WINDOW_FETCH_BACKOFF:.0f}s",
-                    "warn",
+            client = create_peer_read_client(peer)
+        except Exception as ex:
+            log(f"Cannot create read client for peer {hotkey[:12]}...: {ex}", "warn")
+            return
+        clients[hotkey] = client
+        async with sem:
+            try:
+                rids = await list_evaluated_task_ids(
+                    client, peer.bucket, hotkey, _DISCOVERY_MAX_TASKS
                 )
-                await asyncio.sleep(_WINDOW_FETCH_BACKOFF)
-    log(f"Owner-api unreachable for scoring window after {_WINDOW_FETCH_ATTEMPTS} attempts: {last_err}", "error")
-    return None
+            except Exception:
+                rids = []
+        produced[hotkey] = set(rids)
+
+    await asyncio.gather(*(one(hk) for hk in validators))
+    return produced, clients
 
 
 def _verify(peer_hotkey: str, wrapper: dict) -> bool:
@@ -102,78 +124,66 @@ async def _fetch_one(client, peer: PeerBucket, task_id: int, verdicts: Verdicts,
             verdicts[(peer.hotkey, task_id, miner_hotkey)] = bool(entry.get("passed"))
 
 
-async def compute_local_winner(api_client, epoch_block: int) -> Tuple[int, Optional[str]]:
+async def compute_local_winner(
+    subtensor,
+    epoch_block: int,
+    *,
+    source_read_client=None,
+    get_all_miners=None,
+) -> Tuple[int, Optional[str]]:
     """Aggregate peer verdicts (per-validator average) into a winner. Returns (winner_uid, winner_hotkey).
 
-    The scoring window is the owner-api's production-based ledger window, anchored to ``epoch_block``
-    (the shared consensus block) so every validator that runs this epoch computes the identical window
-    over fully settled, immutable verdict files — and skipped rotation turns never dilute it. Because
-    the ledger tells us which validator sampled each task, we read ONLY that sampler's verdict file per
-    task (O(window)), not every peer's (O(window × peers)). Returns (0, None) when there is nothing to
-    score (no peers, no settled window, or no eligible miner), so the caller burns alpha on UID 0.
+    Owner-api-independent: the validator set comes from the on-chain-anchored allowlist, and the
+    settled window is derived locally from peer-bucket producedness anchored to ``epoch_block`` (the
+    shared consensus block) — so every validator computes the identical window over immutable, signed
+    verdict files. Returns (0, None) when there is nothing to score (no peers, no settled window, or
+    no eligible miner), so the caller burns alpha on UID 0.
 
-    If the owner-api is unreachable (after retries), we repeat the last winner this validator computed
-    instead of burning the epoch — every validator's last winner is the same deterministic value, so
-    they stay aligned through the outage. Burns only if there is no cached winner yet.
+    If the chain / allowlist is unreachable, repeat the last winner this validator computed instead of
+    burning the epoch — every validator's last winner is the same deterministic value, so they stay
+    aligned through the outage. Burns only if there is no cached winner yet.
     """
     peers = load_peers()
     if not peers:
         log("PEER_VALIDATORS not configured; cannot aggregate locally", "error")
         return 0, None
 
-    win = await _fetch_window_with_retry(api_client, epoch_block)
-    if win is None:
+    # The owner-managed validator set, anchored + verified on-chain (not from the owner-api).
+    snap = await read_allowlist(
+        subtensor, NETUID, source_read_client or create_source_read_client(), SOURCE_BUCKET
+    )
+    if snap is None:
         fallback = load_last_winner()
         if fallback:
             log(
-                f"Owner-api down; repeating last winner uid={fallback[0]} "
+                f"Allowlist/chain unreachable; repeating last winner uid={fallback[0]} "
                 f"hotkey={fallback[1][:12]}... to avoid burning this epoch",
                 "warn",
             )
             return fallback
-        log("Owner-api down and no last winner cached; burning this epoch (UID 0)", "warn")
+        log("Allowlist/chain unreachable and no last winner cached; burning this epoch (UID 0)", "warn")
         return 0, None
-    window_entries = win.get("window") or []
-    if not window_entries:
-        log("No settled scoring window yet (ledger empty / subnet too young)", "info")
-        return 0, None
+    validators, interval = snap.validators, snap.interval
 
-    active_validators = win.get("active_validators") or sorted(
-        {e["sampler_hotkey"] for e in window_entries}
-    )
+    # Derive the window ourselves: who produced which rotation (from buckets) + the shared epoch block.
+    produced_by_peer, clients = await _discover_produced(peers, validators)
+    canonical = resolve_canonical_samplers(produced_by_peer, validators)
+    window, active_validators = derive_window(canonical, epoch_block, interval)
+    if not window:
+        log("No settled scoring window yet (no produced tasks / subnet too young)", "info")
+        return 0, None
     min_distinct = required_distinct_validators(len(active_validators))
-
-    # Peer-ring drift: window samplers we have no read creds for contribute no verdicts (to everyone
-    # equally) — warn so the operator can reconcile PEER_VALIDATORS with the allowlist.
-    missing = set(active_validators) - set(peers.keys())
-    if missing:
-        log(
-            "Window samplers missing from PEER_VALIDATORS (their verdicts can't be read): "
-            f"{sorted(h[:12] for h in missing)}",
-            "warn",
-        )
-
-    window: list = [int(e["rotation_id"]) for e in window_entries]
 
     verdicts: Verdicts = {}
     sem = asyncio.Semaphore(_READ_CONCURRENCY)
-    # Read only the sampler's own verdict file for each produced task (O(window)).
-    clients: Dict[str, object] = {}
+    # Read only the canonical sampler's own verdict file for each produced task (O(window)).
     tasks = []
-    for e in window_entries:
-        rotation_id = int(e["rotation_id"])
-        sampler = e["sampler_hotkey"]
+    for rotation_id in window:
+        sampler = canonical[rotation_id]
         peer = peers.get(sampler)
-        if peer is None:
-            continue  # no read creds for this sampler (warned above)
         client = clients.get(sampler)
-        if client is None:
-            try:
-                client = create_peer_read_client(peer)
-            except Exception as ex:
-                log(f"Cannot create read client for peer {sampler[:12]}...: {ex}", "warn")
-                continue
-            clients[sampler] = client
+        if peer is None or client is None:
+            continue
         tasks.append(_fetch_one(client, peer, rotation_id, verdicts, sem))
     try:
         await asyncio.gather(*tasks)
@@ -184,18 +194,21 @@ async def compute_local_winner(api_client, epoch_block: int) -> Tuple[int, Optio
         log("No verdicts found across peer buckets for the window", "info")
         return 0, None
 
-    # uid/block come from THIS validator's local chain read (no owner-api dependency); fall back
-    # to the API's consensus table only until the first local validation has run.
+    # uid/block come from THIS validator's local chain read (no owner-api dependency); fall back to a
+    # caller-provided resolver only until the first local validation has run.
     from leoma.app.validator import miner_validation
 
-    snap = miner_validation.current_snapshot()
-    if snap and snap.uid_by_hotkey:
-        uid_by_hotkey = snap.uid_by_hotkey
-        block_by_hotkey = snap.block_by_hotkey
-    else:
-        miners = await api_client.get_all_miners()
+    snap_m = miner_validation.current_snapshot()
+    if snap_m and snap_m.uid_by_hotkey:
+        uid_by_hotkey = snap_m.uid_by_hotkey
+        block_by_hotkey = snap_m.block_by_hotkey
+    elif get_all_miners is not None:
+        miners = await get_all_miners()
         uid_by_hotkey = {m.hotkey: m.uid for m in miners}
         block_by_hotkey = {m.hotkey: (m.block or None) for m in miners}
+    else:
+        log("No local miner snapshot for uid mapping; burning this epoch (UID 0)", "warn")
+        return 0, None
 
     # Eligibility is implicit via sampling: only sampled (locally-validated) miners have verdicts,
     # and the completeness gate requires broad sampling — so no explicit valid-miner filter here.

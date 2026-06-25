@@ -69,29 +69,6 @@ class SamplingState(Base):
     updated_at: Mapped[datetime] = _utc_timestamp_column(with_onupdate=True)
 
 
-class ProducedTask(Base):
-    """Authoritative, gap-free scoring ledger of tasks that were actually produced.
-
-    The block-derived ``rotation_id`` (== ``block // interval``) decides *whose turn* it is to
-    sample and is the bucket key for verdicts; it has gaps whenever a turn is skipped. ``task_seq``
-    is a monotonic, gap-free counter the owner-api assigns on the *first* announce for a rotation_id,
-    so the scoring window ("last N produced tasks") never depends on skipped turns. ``block`` is the
-    block at announce, used to anchor the window to a consensus block (``block <= as_of_block``).
-    """
-    __tablename__ = "produced_tasks"
-
-    task_seq: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    rotation_id: Mapped[int] = mapped_column(Integer, unique=True, nullable=False)
-    sampler_hotkey: Mapped[str] = mapped_column(String(64), nullable=False)
-    block: Mapped[int] = mapped_column(Integer, nullable=False)
-    created_at: Mapped[datetime] = _utc_timestamp_column()
-
-    __table_args__ = (
-        Index("idx_produced_tasks_rotation_id", "rotation_id"),
-        Index("idx_produced_tasks_block", "block"),
-    )
-
-
 class ValidatorSample(Base):
     """Sample submitted by a validator (evaluation result)."""
     __tablename__ = "validator_samples"

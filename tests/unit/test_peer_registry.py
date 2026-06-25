@@ -77,7 +77,7 @@ class TestRotationSampler:
     """Sampler assignment is deterministic across the sorted permissioned set."""
 
     def test_compute_sampler_round_robin(self):
-        from leoma.delivery.http.routes.rotation import compute_sampler
+        from leoma.infra.rotation_math import compute_sampler
 
         validators = ["5A", "5B", "5C"]
         assert compute_sampler(validators, 0) == "5A"
@@ -87,6 +87,6 @@ class TestRotationSampler:
         # task_id == rotation_index, so consecutive windows rotate evenly.
 
     def test_compute_sampler_empty(self):
-        from leoma.delivery.http.routes.rotation import compute_sampler
+        from leoma.infra.rotation_math import compute_sampler
 
         assert compute_sampler([], 5) is None
