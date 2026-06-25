@@ -30,12 +30,15 @@ async def get_weights() -> WeightsResponse:
     
     rows = await miner_rank_dao.get_all_ordered_by_rank()
     winner_hotkey = await miner_rank_dao.get_winner_hotkey()
-    
+
     log(f"Weights endpoint: {len(rows)} rows in miner_ranks, winner_hotkey={winner_hotkey[:12] if winner_hotkey else 'None'}...", "info")
-    
+
+    # Batch-load miners once (avoid a per-row N+1).
+    miner_by_hotkey = {m.miner_hotkey: m for m in await valid_miners_dao.get_all_miners()}
+
     winner_uid = 0
     if winner_hotkey:
-        miner = await valid_miners_dao.get_miner_by_hotkey(winner_hotkey)
+        miner = miner_by_hotkey.get(winner_hotkey)
         if miner and miner.is_valid:
             winner_uid = miner.uid
             log(f"Found winner: hotkey={winner_hotkey[:12]}..., uid={winner_uid}", "info")
@@ -46,7 +49,7 @@ async def get_weights() -> WeightsResponse:
 
     miners: List[MinerWeightEntry] = []
     for r in rows:
-        miner = await valid_miners_dao.get_miner_by_hotkey(r.miner_hotkey)
+        miner = miner_by_hotkey.get(r.miner_hotkey)
         uid = miner.uid if miner else 0
         weight = 1.0 if r.rank == 1 and winner_uid and uid == winner_uid else 0.0
         miners.append(

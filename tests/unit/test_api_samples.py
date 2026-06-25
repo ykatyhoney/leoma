@@ -478,8 +478,9 @@ class TestGetMinerEvaluations:
         assert evaluation_data["task_id"] == stored_evaluation.task_id
         assert evaluation_data["miner_hotkey"] == stored_evaluation.miner_hotkey
         assert evaluation_data["prompt"] == stored_evaluation.prompt
-        assert evaluation_data["s3_bucket"] == stored_evaluation.s3_bucket
-        assert evaluation_data["s3_prefix"] == stored_evaluation.s3_prefix
+        # s3_bucket/s3_prefix are intentionally NOT exposed in the API response (operational/infra).
+        assert "s3_bucket" not in evaluation_data
+        assert "s3_prefix" not in evaluation_data
         assert evaluation_data["passed"] == stored_evaluation.passed
         assert evaluation_data["confidence"] == stored_evaluation.confidence
         assert evaluation_data["reasoning"] == stored_evaluation.reasoning

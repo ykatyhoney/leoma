@@ -1,7 +1,4 @@
-"""Weight setting service for Leoma.
-
-Provides validator service entry points.
-"""
+"""Validator service entry points (sampler + self-evaluator + weight-setter)."""
 
 from leoma.app.validator.main import main, main_sync, run_epoch, step
 

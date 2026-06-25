@@ -46,11 +46,13 @@ def api():
 
 @cli.command()
 def serve():
-    """Start the validator (evaluator + weight setter).
-    
-    Runs the complete Leoma validator in one process: evaluator loop (poll tasks,
-    GPT-4o evaluation, POST results) and weight-setting loop (GET /weights, set on-chain).
-    Task creation and miner calls are done by the owner-sampler (subnet owner), not validators.
+    """Start the validator (sampler + evaluator + weight setter).
+
+    Runs the complete decentralized Leoma validator in one process:
+    - sampler loop: on this validator's rotation turn, sample miners and publish to its own bucket
+    - evaluator loop: download the latest task from the sampler's bucket, Gemini-evaluate, publish results
+    - weight-setting loop: aggregate all peers' results equally and set on-chain weights
+    Requires R2_OWN_BUCKET, PEER_VALIDATORS, source-bucket read creds, CHUTES_API_KEY, GEMINI_API_KEY.
     """
     from leoma.app.validator.main import main
     _run_async(main())
@@ -64,26 +66,16 @@ def servers():
     """
 
 
-@servers.command("owner-sampler")
-def start_owner_sampler():
-    """Start the owner sampler (separate process).
-    
-    Every 30 minutes: allocates task_id, gets valid miners from API,
-    picks video, calls miners via Chutes, uploads to S3 and sets latest_task_id.
-    """
-    from leoma.app.owner_sampler.main import run_owner_sampler_loop
-    _run_async(run_owner_sampler_loop())
+@servers.command("sampler")
+def start_sampler():
+    """Start the validator sampler + self-evaluator (separate process).
 
-
-@servers.command("evaluator")
-def start_evaluator():
-    """Start the validator evaluator (separate process).
-    
-    Polls GET /tasks/latest, downloads task from S3, runs GPT-4o per miner,
-    POSTs evaluation results to API. Initializes evaluated list from S3 on startup.
+    On this validator's rotation turn (GET /rotation): samples valid miners, uploads the task
+    artifacts to its own bucket (R2_OWN_BUCKET), self-evaluates them (no cross-validation),
+    publishes verdicts to its bucket, dual-reports to the dashboard, and announces the task.
     """
-    from leoma.app.evaluator.main import run_evaluator_loop
-    _run_async(run_evaluator_loop())
+    from leoma.app.sampler.loop import run_sampler_loop
+    _run_async(run_sampler_loop())
 
 
 @servers.command("validator")
@@ -112,7 +104,6 @@ def start_validator():
     _run_async(run_validator())
 
 
-# Database commands
 @cli.group()
 def db():
     """Database management commands.
@@ -137,6 +128,30 @@ def db_init():
         await close_database()
         log("Database initialization complete", "success")
     
+    _run_async(run())
+
+
+@db.command("backfill-ledger")
+def db_backfill_ledger():
+    """Seed the produced-task ledger from historical validator_samples (idempotent).
+
+    The owner-api also runs this automatically on startup when the ledger is empty; this command
+    forces a full reconciliation pass (still skips rotation_ids already present). Useful after
+    importing samples or to verify the backfill out-of-band.
+    """
+    from leoma.bootstrap import emit_log as log, emit_header as log_header
+    from leoma.infra.db.pool import init_database, close_database
+    from leoma.infra.ledger_backfill import backfill_produced_task_ledger
+
+    async def run():
+        log_header("Produced-task ledger backfill")
+        await init_database()
+        try:
+            inserted = await backfill_produced_task_ledger(only_if_empty=False)
+            log(f"Backfill complete: {inserted} new produced-task rows", "success")
+        finally:
+            await close_database()
+
     _run_async(run())
 
 
@@ -187,7 +202,6 @@ def db_list_validators():
     _run_async(run())
 
 
-# Blacklist commands
 @cli.group()
 def blacklist():
     """Blacklist management commands (via API)."""
@@ -270,10 +284,95 @@ def blacklist_remove(hotkey: str):
             log(f"Removed {hotkey} from blacklist", "success")
         finally:
             await client.close()
-    
+
     _run_async(run())
 
-# Corpus management commands
+
+@cli.group()
+def validator():
+    """Owner-managed validator allowlist (via API).
+
+    Validators are added/removed explicitly by the owner — there is no stake-based auto-admission.
+    A validator must be on this allowlist to authenticate, sample on its rotation turns, and set
+    weights.
+    """
+
+
+@validator.command("list")
+def validator_list():
+    """Show registered validators (uid, hotkey, stake)."""
+    from leoma.bootstrap import emit_log as log, emit_header as log_header
+
+    async def run():
+        log_header("Registered validators")
+        from leoma.infra.remote_api import APIClient
+
+        client = APIClient(api_url=_api_url())
+        try:
+            validators = await client.get_validators()
+            if not validators:
+                log("No validators registered. Use: leoma validator add <hotkey> --uid N", "info")
+                return
+            for v in validators:
+                log(f"  uid={v.get('uid')}  {v.get('hotkey', '')[:20]}...  stake={v.get('stake')}", "info")
+            log(f"Total: {len(validators)} validators", "info")
+        finally:
+            await client.close()
+
+    _run_async(run())
+
+
+@validator.command("add")
+@click.argument("hotkey")
+@click.option("--uid", type=int, default=None, help="Validator UID. Auto-resolved from the metagraph if omitted.")
+@click.option("--stake", type=float, default=None, help="Informational stake. Auto-resolved from the metagraph if omitted.")
+def validator_add(hotkey: str, uid, stake):
+    """Add a validator to the allowlist (requires admin wallet).
+
+    UID and stake are looked up from the metagraph by hotkey when not given.
+    """
+    from leoma.bootstrap import emit_log as log, WALLET_NAME, HOTKEY_NAME
+
+    async def run():
+        from leoma.infra.remote_api import create_api_client_from_wallet
+
+        client = create_api_client_from_wallet(
+            wallet_name=WALLET_NAME, hotkey_name=HOTKEY_NAME, api_url=_api_url()
+        )
+        try:
+            result = await client.register_validator(hotkey=hotkey.strip(), uid=uid, stake=stake)
+            log(
+                f"Added validator uid={result.get('uid')} {hotkey[:16]}... "
+                f"(stake={result.get('stake')}) to allowlist",
+                "success",
+            )
+        finally:
+            await client.close()
+
+    _run_async(run())
+
+
+@validator.command("remove")
+@click.argument("hotkey")
+def validator_remove(hotkey: str):
+    """Remove a validator from the allowlist (requires admin wallet)."""
+    from leoma.bootstrap import emit_log as log, WALLET_NAME, HOTKEY_NAME
+
+    async def run():
+        from leoma.infra.remote_api import create_api_client_from_wallet
+
+        client = create_api_client_from_wallet(
+            wallet_name=WALLET_NAME, hotkey_name=HOTKEY_NAME, api_url=_api_url()
+        )
+        try:
+            await client.remove_validator(hotkey.strip())
+            log(f"Removed validator {hotkey[:16]}... from allowlist", "success")
+        finally:
+            await client.close()
+
+    _run_async(run())
+
+
 @cli.group()
 def corpus():
     """Video corpus management commands.
@@ -365,7 +464,6 @@ def get_rank():
     _run_async(run())
 
 
-# Miner commands
 @cli.group()
 def miner():
     """Miner management commands.

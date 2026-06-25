@@ -17,15 +17,18 @@ from leoma.bootstrap import emit_log, emit_header, logger as leoma_logger
 from leoma.infra.db.pool import init_database, close_database, create_tables
 from leoma.delivery.http.routes import (
     miners_router,
+    overview_router,
+    rotation_router,
     samples_router,
     scores_router,
     blacklist_router,
     health_router,
     tasks_router,
+    validators_router,
     weights_router,
 )
 from leoma.delivery.http.tasks import (
-    MinerValidationTask,
+    MinerConsensusTask,
     ScoreCalculationTask,
     ValidatorSyncTask,
 )
@@ -43,7 +46,7 @@ async def _create_tables_if_needed() -> None:
 
 
 def _start_background_tasks() -> None:
-    miner_task = MinerValidationTask()
+    miner_task = MinerConsensusTask()
     score_task = ScoreCalculationTask()
     validator_sync_task = ValidatorSyncTask()
     _background_tasks.append(asyncio.create_task(miner_task.run()))
@@ -66,6 +69,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     await init_database()
     emit_log("Database initialized", "success")
     await _create_tables_if_needed()
+    # Seed the produced-task scoring ledger from historical samples if it's empty (idempotent),
+    # so the scoring window isn't blank on a fresh deploy until live announces accrue.
+    try:
+        from leoma.infra.ledger_backfill import backfill_produced_task_ledger
+
+        await backfill_produced_task_ledger(only_if_empty=True)
+    except Exception as e:
+        emit_log(f"Produced-task ledger backfill skipped: {e}", "warn")
     _start_background_tasks()
     emit_log("Background tasks started", "success")
     yield
@@ -154,6 +165,9 @@ app.include_router(scores_router, prefix="/scores", tags=["Scores"])
 app.include_router(blacklist_router, prefix="/blacklist", tags=["Blacklist"])
 app.include_router(tasks_router, prefix="/tasks", tags=["Tasks"])
 app.include_router(weights_router, prefix="/weights", tags=["Weights"])
+app.include_router(rotation_router, prefix="/rotation", tags=["Rotation"])
+app.include_router(validators_router, prefix="/validators", tags=["Validators"])
+app.include_router(overview_router, prefix="/overview", tags=["Overview"])
 
 
 def main() -> None:

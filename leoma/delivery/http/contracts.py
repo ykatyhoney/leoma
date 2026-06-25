@@ -19,8 +19,6 @@ def validate_ss58_hotkey(value: str) -> str:
     return value
 
 
-# Request Models
-
 class ORMResponseModel(BaseModel):
     """Base response model configured for ORM attribute loading."""
 
@@ -66,8 +64,6 @@ class BlacklistEntry(BaseModel):
     def validate_hotkey(cls, v: str) -> str:
         return validate_ss58_hotkey(v)
 
-
-# Response Models
 
 class ValidatorInfo(ORMResponseModel):
     """Response model for validator information."""
@@ -132,7 +128,7 @@ class MinerWeightEntry(BaseModel):
 class WeightsResponse(BaseModel):
     """Response for validators: top-ranked UID (winner_uid) and per-miner scores/weights."""
     winner_uid: int
-    miners: List[MinerWeightEntry] = []  # each miner hotkey, uid, pass_rate, weight (1.0 or 0)
+    miners: List[MinerWeightEntry] = []
 
 
 class MinerRankEntry(BaseModel):
@@ -159,8 +155,6 @@ class SampleResponse(ORMResponseModel):
     validator_hotkey: str
     miner_hotkey: str
     prompt: Optional[str] = None
-    s3_bucket: str
-    s3_prefix: str
     passed: bool
     confidence: Optional[int] = None
     reasoning: Optional[str] = None
@@ -191,8 +185,6 @@ class ErrorResponse(BaseModel):
     error: str
     detail: Optional[str] = None
 
-
-# Scores Response Models
 
 class ValidatorScoreDetail(BaseModel):
     """Score detail from a single validator."""
@@ -267,6 +259,8 @@ class MinerTaskEntry(BaseModel):
     """One task entry for miner task list."""
     task_id: int
     passed: bool
+    validator_hotkey: Optional[str] = None
+    overall_score: Optional[int] = None  # 0-100, None if not recorded
     latency_ms: Optional[int] = None
     updated: Optional[datetime] = None
 
@@ -276,13 +270,12 @@ class TaskDetailMinerEntry(BaseModel):
 
     miner_hotkey: str
     passed: bool
-    validator_count: int
     latency_ms: Optional[int] = None
     updated: Optional[datetime] = None
 
 
 class TaskDetailResponse(BaseModel):
-    """Task-level detail response with aggregated miner results."""
+    """Task-level detail response with one entry per miner."""
 
     task_id: int
     description: Optional[str] = None
@@ -292,15 +285,14 @@ class TaskDetailResponse(BaseModel):
     first_frame_url: Optional[str] = None
     original_clip_url: Optional[str] = None
     miner_count: int
-    validator_count: int
+    sampler_hotkey: Optional[str] = None  # validator that sampled this task
     miners: List[TaskDetailMinerEntry]
 
 
 class TaskMinerValidatorResult(BaseModel):
-    """One validator's evaluation for a task/miner."""
+    """A validator's evaluation for a task/miner."""
     validator_hotkey: str
     passed: bool
-    stake: Optional[float] = None
     evaluated_at: Optional[datetime] = None
     confidence: Optional[int] = None
     reasoning: Optional[str] = None
@@ -324,3 +316,105 @@ class TaskMinerDetailResponse(BaseModel):
     validators: List[TaskMinerValidatorResult]
     final_passed: bool
     latency_ms: Optional[int] = None
+
+
+# ── Decentralized dashboard (active miners, validators, overview) ──
+
+class ActiveMinerEntry(BaseModel):
+    """A miner shown on the active leaderboard (valid + chute hot)."""
+    uid: int
+    hotkey: str
+    model_name: Optional[str] = None
+    model_revision: Optional[str] = None
+    chute_slug: Optional[str] = None
+    block: Optional[int] = None
+    active: bool                       # valid + chute currently hot
+    eligible: bool                     # completeness >= threshold over the scoring window
+    rank: Optional[int] = None
+    weight: float = 0.0                # 1.0 for rank-1 winner, else 0
+    score: float = 0.0                 # per-validator-average pass rate
+    tasks_passed: int = 0
+    tasks_evaluated: int = 0
+    validators_evaluating: int = 0
+    last_evaluated_at: Optional[str] = None
+    avg_latency_ms: Optional[int] = None
+    # Each validator's own pass-rate for this miner (the values the equal-weight score averages),
+    # for the per-row consensus/spread viz. Ascending.
+    validator_scores: List[float] = []
+
+
+class ValidatorCard(BaseModel):
+    """Per-validator dashboard card (identity, liveness, rotation participation).
+
+    Public-facing: the R2 bucket name is omitted (operational/infra) and liveness is coarsened to a
+    boolean ``online`` rather than an exact ``last_seen_at`` timestamp.
+    """
+    uid: int
+    hotkey: str
+    stake: float                       # informational only — NOT used for weighting (equal weight)
+    permissioned: bool                 # in the rotation/sampling allowlist
+    online: bool = False               # seen within the liveness window (coarse, not an exact time)
+    last_sampled_task_id: Optional[int] = None
+    last_sampled_at: Optional[str] = None
+    tasks_sampled: int = 0             # tasks sampled+evaluated in the window
+    expected_turns: int = 0            # rotation turns assigned in the window
+    participation_rate: float = 0.0    # tasks_sampled / expected_turns
+    evaluations: int = 0
+    avg_latency_ms: Optional[int] = None
+
+
+class ValidatorRegistration(BaseModel):
+    """Admin request to add a validator to the owner-managed allowlist.
+
+    ``uid`` and ``stake`` are auto-resolved from the metagraph (by hotkey) when omitted.
+    """
+    hotkey: str = Field(..., min_length=1, max_length=48, description="Validator SS58 hotkey.")
+    uid: Optional[int] = Field(None, ge=0, description="Validator UID; auto-resolved from the metagraph if omitted.")
+    stake: Optional[float] = Field(None, ge=0, description="Informational stake; auto-resolved from the metagraph if omitted.")
+
+
+class ValidatorMinerScore(BaseModel):
+    miner_hotkey: str
+    pass_rate: float
+    total_samples: int
+    total_passed: int
+
+
+class ValidatorDetailResponse(ValidatorCard):
+    """Validator card + the per-miner pass rates this validator recorded."""
+    miner_scores: List[ValidatorMinerScore] = []
+
+
+class OverviewResponse(BaseModel):
+    """Network snapshot for the dashboard header."""
+    active_miners: int
+    valid_miners: int
+    total_miners: int
+    total_validators: int
+    permissioned_validators: int
+    rotation_interval: int
+    current_sampler: Optional[str] = None
+    latest_task_id: Optional[int] = None
+    window_start: Optional[int] = None
+    window_end: Optional[int] = None
+
+
+# ── Decentralized miner validation (validators report; owner-api tallies consensus) ──
+
+class MinerReportEntry(BaseModel):
+    """One miner's validation result as judged by a single validator."""
+    uid: int
+    miner_hotkey: str = Field(..., max_length=64)
+    model_name: Optional[str] = None
+    model_revision: Optional[str] = None
+    model_hash: Optional[str] = None
+    chute_id: Optional[str] = None
+    chute_slug: Optional[str] = None
+    block: Optional[int] = None
+    is_valid: bool = False
+    invalid_reason: Optional[str] = None
+
+
+class MinerReportSubmission(BaseModel):
+    """A validator's full miner-validation report (replaces its previous report)."""
+    miners: List[MinerReportEntry]

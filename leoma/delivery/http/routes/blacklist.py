@@ -1,8 +1,4 @@
-"""
-Blacklist routes for Leoma API.
-
-Provides endpoints for managing blacklisted miners.
-"""
+"""Blacklist routes for Leoma API: manage blacklisted miners."""
 
 from typing import Annotated, Any, List
 
@@ -30,13 +26,7 @@ def _to_blacklist_response(entry: Any) -> BlacklistResponse:
 
 @router.get("", response_model=List[BlacklistResponse])
 async def get_blacklist() -> List[BlacklistResponse]:
-    """Get all blacklisted miners.
-    
-    This endpoint is public (no authentication required).
-    
-    Returns:
-        List of blacklisted miners
-    """
+    """Get all blacklisted miners. Public (no authentication required)."""
     entries = await blacklist_dao.get_all()
     
     return [_to_blacklist_response(entry) for entry in entries]
@@ -44,13 +34,7 @@ async def get_blacklist() -> List[BlacklistResponse]:
 
 @router.get("/miners", response_model=List[str])
 async def get_blacklisted_miners() -> List[str]:
-    """Get list of blacklisted miner hotkeys.
-    
-    This endpoint is public (no authentication required).
-    
-    Returns:
-        List of blacklisted miner hotkeys
-    """
+    """Get list of blacklisted miner hotkeys. Public (no authentication required)."""
     return await blacklist_dao.get_hotkeys()
 
 
@@ -58,19 +42,7 @@ async def get_blacklisted_miners() -> List[str]:
 async def get_blacklist_entry(
     hotkey: str,
 ) -> BlacklistResponse:
-    """Get blacklist entry for a specific miner.
-    
-    This endpoint is public (no authentication required).
-    
-    Args:
-        hotkey: Miner's SS58 hotkey
-        
-    Returns:
-        Blacklist entry details
-        
-    Raises:
-        HTTPException: If miner not blacklisted
-    """
+    """Get blacklist entry for a specific miner. Public (no authentication required)."""
     hotkey = validate_hotkey(hotkey)
     entry = await blacklist_dao.get(hotkey)
     
@@ -85,16 +57,7 @@ async def add_to_blacklist(
     entry: BlacklistEntry,
     admin_hotkey: Annotated[str, Depends(verify_admin_signature)],
 ) -> BlacklistResponse:
-    """Add a miner to the blacklist.
-    
-    Requires admin signature authentication.
-    
-    Args:
-        entry: Blacklist entry data
-        
-    Returns:
-        Created blacklist entry
-    """
+    """Add a miner to the blacklist. Requires admin signature authentication."""
     result = await blacklist_dao.add(
         hotkey=entry.hotkey,
         reason=entry.reason,
@@ -109,19 +72,7 @@ async def remove_from_blacklist(
     hotkey: str,
     admin_hotkey: Annotated[str, Depends(verify_admin_signature)],
 ) -> dict:
-    """Remove a miner from the blacklist.
-    
-    Requires admin signature authentication.
-    
-    Args:
-        hotkey: Miner's SS58 hotkey
-        
-    Returns:
-        Confirmation message
-        
-    Raises:
-        HTTPException: If miner not found
-    """
+    """Remove a miner from the blacklist. Requires admin signature authentication."""
     hotkey = validate_hotkey(hotkey)
     removed = await blacklist_dao.remove(hotkey)
     

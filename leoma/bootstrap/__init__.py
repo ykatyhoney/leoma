@@ -1,11 +1,8 @@
 # Bootstrap: runtime config and logging.
 
 from leoma.bootstrap.runtime import (
-    # Core logger
     logger,
     log_exception,
-    
-    # New logging functions
     emit_log,
     emit_header,
     emit_section,
@@ -16,23 +13,13 @@ from leoma.bootstrap.runtime import (
     log_error,
     log_critical,
     log_start,
-    
-    # Log context
     set_log_context,
     clear_log_context,
     get_log_context,
-    
-    # Timing
     LogTimer,
     timed,
-    
-    # Log levels
     LogLevel,
-    
-    # Legacy
     USED_VIDEOS,
-    
-    # Settings
     CHUTES_API_KEY,
     CHUTES_API_URL,
     CLIP_DURATION,
@@ -46,10 +33,6 @@ from leoma.bootstrap.runtime import (
     HF_TOKEN,
     HIPPIUS_ENDPOINT,
     HIPPIUS_REGION,
-    HIPPIUS_SAMPLES_READ_ACCESS_KEY,
-    HIPPIUS_SAMPLES_READ_SECRET_KEY,
-    HIPPIUS_SAMPLES_WRITE_ACCESS_KEY,
-    HIPPIUS_SAMPLES_WRITE_SECRET_KEY,
     HIPPIUS_VIDEOS_READ_ACCESS_KEY,
     HIPPIUS_VIDEOS_READ_SECRET_KEY,
     HIPPIUS_VIDEOS_WRITE_ACCESS_KEY,
@@ -64,6 +47,8 @@ from leoma.bootstrap.runtime import (
     REQUIRED_VIDEO_WIDTH,
     VIDEO_RESOLUTION_TOLERANCE,
     VALIDATOR_SYNC_INTERVAL,
+    SAMPLING_ROTATION_INTERVAL,
+    R2_OWN_BUCKET,
     MODEL_HASH_CACHE_TTL,
     NETUID,
     NETWORK,
@@ -76,14 +61,12 @@ from leoma.bootstrap.runtime import (
     POSTGRES_PORT,
     POSTGRES_USER,
     REQUEST_TIMEOUT,
-    SAMPLES_BUCKET,
     SOURCE_BUCKET,
     WALLET_NAME,
     settings,
 )
 
 __all__ = [
-    # Settings
     "settings",
     "USED_VIDEOS",
     "CHUTES_API_KEY",
@@ -99,10 +82,6 @@ __all__ = [
     "HF_TOKEN",
     "HIPPIUS_ENDPOINT",
     "HIPPIUS_REGION",
-    "HIPPIUS_SAMPLES_READ_ACCESS_KEY",
-    "HIPPIUS_SAMPLES_READ_SECRET_KEY",
-    "HIPPIUS_SAMPLES_WRITE_ACCESS_KEY",
-    "HIPPIUS_SAMPLES_WRITE_SECRET_KEY",
     "HIPPIUS_VIDEOS_READ_ACCESS_KEY",
     "HIPPIUS_VIDEOS_READ_SECRET_KEY",
     "HIPPIUS_VIDEOS_WRITE_ACCESS_KEY",
@@ -117,6 +96,8 @@ __all__ = [
     "REQUIRED_VIDEO_WIDTH",
     "VIDEO_RESOLUTION_TOLERANCE",
     "VALIDATOR_SYNC_INTERVAL",
+    "SAMPLING_ROTATION_INTERVAL",
+    "R2_OWN_BUCKET",
     "MODEL_HASH_CACHE_TTL",
     "NETUID",
     "NETWORK",
@@ -129,15 +110,10 @@ __all__ = [
     "POSTGRES_PORT",
     "POSTGRES_USER",
     "REQUEST_TIMEOUT",
-    "SAMPLES_BUCKET",
     "SOURCE_BUCKET",
     "WALLET_NAME",
-    
-    # Core logging
     "logger",
     "log_exception",
-    
-    # New logging functions
     "emit_log",
     "emit_header",
     "emit_section",
@@ -148,16 +124,10 @@ __all__ = [
     "log_error",
     "log_critical",
     "log_start",
-    
-    # Log context
     "set_log_context",
     "clear_log_context",
     "get_log_context",
-    
-    # Timing
     "LogTimer",
     "timed",
-    
-    # Log levels
     "LogLevel",
 ]

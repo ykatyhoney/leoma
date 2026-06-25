@@ -8,7 +8,6 @@ from sqlalchemy import Integer
 from leoma.bootstrap import emit_log
 from leoma.infra.db.pool import get_session
 from leoma.infra.db.tables import ValidatorSample
-from leoma.infra.stake_voting import stake_weighted_pass
 
 
 def _now_utc() -> datetime:
@@ -215,6 +214,22 @@ class SampleStore:
             val = r.scalar_one_or_none()
             return int(val) if val is not None else None
 
+    async def get_distinct_task_samplers(self) -> List[tuple]:
+        """Distinct ``(task_id, validator_hotkey)`` pairs, ascending by task_id (for ledger backfill).
+
+        Self-evaluation means each task_id has exactly one sampler/evaluator, so this maps each
+        produced task to the validator that produced it.
+        """
+        async with get_session() as session:
+            q = (
+                select(ValidatorSample.task_id, ValidatorSample.validator_hotkey)
+                .where(ValidatorSample.task_id.isnot(None))
+                .distinct()
+                .order_by(ValidatorSample.task_id.asc())
+            )
+            r = await session.execute(q)
+            return [(int(tid), hk) for tid, hk in r.all() if tid is not None]
+
     async def get_samples_in_task_window(self, task_ids: List[int]) -> List[ValidatorSample]:
         if not task_ids:
             return []
@@ -278,20 +293,14 @@ class SampleStore:
 
     async def get_miner_sampling_stats_by_hotkeys(
         self,
-        stake_by_validator: Dict[str, float],
         miner_hotkeys: Collection[str],
         task_ids: Optional[Collection[int]] = None,
     ) -> Dict[str, Dict[str, int]]:
-        """Per-miner distinct task counts (sampling count) and stake-weighted pass counts.
+        """Per-miner distinct task counts and pass counts.
 
-        ``total_tasks`` = number of distinct ``task_id`` values the miner was evaluated on
-        (one per sampled task, not sum of per-validator evaluation rows).
-
-        ``passed_tasks`` = among those tasks, how many pass stake-weighted voting across validators.
-
-        If ``task_ids`` is set (see ``scoring_window_task_ids`` in ``leoma.infra.scorer_constants``),
-        only samples whose ``task_id`` is in that set are counted — pass rate is then
-        ``passed_tasks / total_tasks`` **within that window**, matching the stake-weighted scorer.
+        ``total_tasks`` = distinct ``task_id`` values the miner was evaluated on; ``passed_tasks`` =
+        how many the sampler passed (most-recent row wins per task). If ``task_ids`` is set, only
+        samples whose ``task_id`` is in that set are counted (pass rate is within that window).
         """
         keys = frozenset(miner_hotkeys)
         if not keys:
@@ -309,17 +318,18 @@ class SampleStore:
             r = await session.execute(q)
             samples = list(r.scalars().all())
 
-        # (miner_hotkey, task_id) -> [(passed, stake), ...]
-        groups: Dict[tuple[str, int], List[tuple[bool, float]]] = {}
+        # (miner_hotkey, task_id) -> (passed, evaluated_at) of the latest sample.
+        latest: Dict[tuple[str, int], tuple[bool, Any]] = {}
         for s in samples:
             key = (s.miner_hotkey, s.task_id)
-            stake = float(stake_by_validator.get(s.validator_hotkey, 0.0))
-            groups.setdefault(key, []).append((bool(s.passed), stake))
+            cur = latest.get(key)
+            if cur is None or (s.evaluated_at is not None and (cur[1] is None or s.evaluated_at >= cur[1])):
+                latest[key] = (bool(s.passed), s.evaluated_at)
 
         out: Dict[str, Dict[str, int]] = {}
-        for (miner_hotkey, _tid), pairs in groups.items():
+        for (miner_hotkey, _tid), (passed, _ts) in latest.items():
             bucket = out.setdefault(miner_hotkey, {"total_tasks": 0, "passed_tasks": 0})
             bucket["total_tasks"] += 1
-            if stake_weighted_pass(pairs):
+            if passed:
                 bucket["passed_tasks"] += 1
         return out

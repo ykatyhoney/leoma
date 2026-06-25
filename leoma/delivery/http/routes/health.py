@@ -38,11 +38,7 @@ def update_last_sync(sync_time: datetime) -> None:
 
 @router.get("/health", response_model=HealthResponse)
 async def health_check() -> HealthResponse:
-    """Check API health status.
-    
-    Returns:
-        Health status including database and metagraph sync state
-    """
+    """Check API health status, including database and metagraph sync state."""
     db_healthy = await _is_database_healthy()
     
     return HealthResponse(

@@ -6,13 +6,15 @@
 # Run:
 #   docker compose -f docker-compose.api.yml up -d
 #
-# Required in .env:
-#   POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB (or DATABASE_URL)
-#   NETWORK, NETUID (for metagraph / validator sync and miner validation)
-#   ADMIN_HOTKEYS (optional, comma-separated for blacklist admin)
-#   OBJECT_STORAGE_BACKEND=r2 (default) or hippius; then R2_* or HIPPIUS_* credentials
-#   Samples bucket read/write for presigned URLs and evaluation result uploads
+# Configure via .env (see env.owner-api.example). Key vars:
+#   POSTGRES_USER/PASSWORD/DB (or DATABASE_URL)   — database (required)
+#   NETWORK, NETUID                               — current block + validator stake refresh
+#   ADMIN_HOTKEYS (comma-separated)               — REQUIRED to add validators (leoma validator add ...)
+#   PEER_VALIDATORS (optional)                    — read creds to presign dashboard task media
+#   CHUTES_API_KEY (optional)                     — richer "active miner" chute probing
 #   For production: set LEOMA_ENV=production and use a strong POSTGRES_PASSWORD or DATABASE_URL
+#
+# Validators are owner-managed in the DB (leoma validator add/remove/list), NOT an env var.
 
 services:
   postgres:
@@ -50,32 +52,17 @@ services:
       NETUID: ${NETUID:-99}
       API_HOST: 0.0.0.0
       API_PORT: 8000
+      # REQUIRED — admin hotkeys that can add/remove validators and manage the blacklist.
+      ADMIN_HOTKEYS: ${ADMIN_HOTKEYS:-}
+      SAMPLING_ROTATION_INTERVAL: ${SAMPLING_ROTATION_INTERVAL:-100}
+      # Background-task cadences (seconds).
       MINER_VALIDATION_INTERVAL: ${MINER_VALIDATION_INTERVAL:-300}
       SCORE_CALCULATION_INTERVAL: ${SCORE_CALCULATION_INTERVAL:-300}
       VALIDATOR_SYNC_INTERVAL: ${VALIDATOR_SYNC_INTERVAL:-600}
-      ADMIN_HOTKEYS: ${ADMIN_HOTKEYS:-}
       CORS_ORIGINS: ${CORS_ORIGINS:-}
-      OBJECT_STORAGE_BACKEND: ${OBJECT_STORAGE_BACKEND:-r2}
-      HIPPIUS_ENDPOINT: ${HIPPIUS_ENDPOINT:-s3.hippius.com}
-      HIPPIUS_REGION: ${HIPPIUS_REGION:-decentralized}
-      HIPPIUS_SAMPLES_BUCKET: ${HIPPIUS_SAMPLES_BUCKET:-samples}
-      HIPPIUS_SAMPLES_READ_ACCESS_KEY: ${HIPPIUS_SAMPLES_READ_ACCESS_KEY}
-      HIPPIUS_SAMPLES_READ_SECRET_KEY: ${HIPPIUS_SAMPLES_READ_SECRET_KEY}
-      HIPPIUS_SAMPLES_WRITE_ACCESS_KEY: ${HIPPIUS_SAMPLES_WRITE_ACCESS_KEY}
-      HIPPIUS_SAMPLES_WRITE_SECRET_KEY: ${HIPPIUS_SAMPLES_WRITE_SECRET_KEY}
-      R2_ENDPOINT: ${R2_ENDPOINT:-}
-      R2_REGION: ${R2_REGION:-auto}
-      R2_SOURCE_BUCKET: ${R2_SOURCE_BUCKET:-videos}
-      R2_SAMPLES_BUCKET: ${R2_SAMPLES_BUCKET:-samples}
-      R2_VIDEOS_READ_ACCESS_KEY: ${R2_VIDEOS_READ_ACCESS_KEY:-}
-      R2_VIDEOS_READ_SECRET_KEY: ${R2_VIDEOS_READ_SECRET_KEY:-}
-      R2_VIDEOS_WRITE_ACCESS_KEY: ${R2_VIDEOS_WRITE_ACCESS_KEY:-}
-      R2_VIDEOS_WRITE_SECRET_KEY: ${R2_VIDEOS_WRITE_SECRET_KEY:-}
-      R2_SAMPLES_READ_ACCESS_KEY: ${R2_SAMPLES_READ_ACCESS_KEY:-}
-      R2_SAMPLES_READ_SECRET_KEY: ${R2_SAMPLES_READ_SECRET_KEY:-}
-      R2_SAMPLES_WRITE_ACCESS_KEY: ${R2_SAMPLES_WRITE_ACCESS_KEY:-}
-      R2_SAMPLES_WRITE_SECRET_KEY: ${R2_SAMPLES_WRITE_SECRET_KEY:-}
-      HF_TOKEN: ${HF_TOKEN:-}
+      # Optional: peer read creds so the dashboard can presign task media from each sampler's bucket.
+      PEER_VALIDATORS: ${PEER_VALIDATORS:-}
+      # Optional: lets the "active miner" filter read private chute info (probe works without it).
       CHUTES_API_KEY: ${CHUTES_API_KEY:-}
     ports:
       - "${API_BIND_ADDRESS:-127.0.0.1}:${API_PORT:-8000}:8000"

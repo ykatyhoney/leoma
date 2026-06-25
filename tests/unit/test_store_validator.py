@@ -385,3 +385,26 @@ class TestValidatorStoreDeleteValidatorsExceptUids:
         assert deleted == 0
         all_v = await validator_store.get_all_validators()
         assert len(all_v) == 1
+
+
+class TestValidatorStoreDeleteByHotkey:
+    """Tests for delete_validator_by_hotkey (owner-managed removal)."""
+
+    async def test_delete_validator_by_hotkey(
+        self,
+        validator_store: ValidatorStore,
+        test_hotkeys: list[str],
+    ):
+        await validator_store.save_validator(uid=0, hotkey=test_hotkeys[0], stake=1.0)
+        await validator_store.save_validator(uid=1, hotkey=test_hotkeys[1], stake=2.0)
+
+        assert await validator_store.delete_validator_by_hotkey(test_hotkeys[0]) is True
+        remaining = await validator_store.get_all_validators()
+        assert [v.hotkey for v in remaining] == [test_hotkeys[1]]
+
+    async def test_delete_validator_by_hotkey_absent_returns_false(
+        self,
+        validator_store: ValidatorStore,
+        test_hotkeys: list[str],
+    ):
+        assert await validator_store.delete_validator_by_hotkey(test_hotkeys[0]) is False

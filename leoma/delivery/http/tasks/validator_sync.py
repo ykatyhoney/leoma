@@ -1,13 +1,13 @@
 """
-Validator sync background task.
+Validator stake-refresh background task.
 
-Syncs validators from the metagraph: any hotkey with stake >= MIN_VALIDATOR_STAKE
-is automatically added to the validator list and can participate in evaluation
-and setting weights. Sync runs on a configurable interval (default 10 minutes).
+The validator allowlist is OWNER-MANAGED (added/removed via `leoma validator ...`), not derived
+from stake. This task only *refreshes* the stake of already-registered validators from the
+metagraph so the dashboard stays accurate — it never adds or removes validators. Runs on a
+configurable interval (default 10 minutes).
 """
 
 import asyncio
-from datetime import datetime, timezone
 
 import bittensor as bt
 
@@ -15,7 +15,6 @@ from leoma.bootstrap import (
     emit_log as log,
     emit_header as log_header,
     log_exception,
-    MIN_VALIDATOR_STAKE,
     NETUID,
     NETWORK,
     VALIDATOR_SYNC_INTERVAL,
@@ -39,60 +38,48 @@ def _get_stake(meta, uid: int) -> float:
 
 
 class ValidatorSyncTask:
-    """Background task that syncs validators from metagraph by stake."""
+    """Background task that refreshes registered validators' stake from the metagraph.
+
+    Membership is owner-managed (CLI); this task never adds or removes validators.
+    """
 
     def __init__(self):
         self.validator_store = ValidatorStore()
         self._running = False
 
     async def run(self) -> None:
-        """Run the validator sync loop."""
         self._running = True
-        log(
-            f"Validator sync task starting (interval={VALIDATOR_SYNC_INTERVAL}s, min_stake={MIN_VALIDATOR_STAKE})",
-            "start",
-        )
+        log(f"Validator stake-refresh task starting (interval={VALIDATOR_SYNC_INTERVAL}s)", "start")
         await asyncio.sleep(5)
         while self._running:
             try:
-                await self._sync_validators()
+                await self._refresh_stakes()
             except Exception as e:
-                log(f"Validator sync error: {e}", "error")
-                log_exception("Validator sync error", e)
+                log(f"Validator stake-refresh error: {e}", "error")
+                log_exception("Validator stake-refresh error", e)
             await asyncio.sleep(VALIDATOR_SYNC_INTERVAL)
 
     def stop(self) -> None:
-        """Stop the task."""
         self._running = False
 
-    async def _sync_validators(self) -> None:
-        """Sync validator list from metagraph: add/update those with stake >= MIN_VALIDATOR_STAKE."""
-        log_header("Validator Sync (metagraph)")
+    async def _refresh_stakes(self) -> None:
+        """Update each registered validator's stake from the metagraph; never adds or removes."""
+        registered = await self.validator_store.get_all_validators()
+        if not registered:
+            return
+        log_header("Validator stake refresh (metagraph)")
         subtensor = bt.AsyncSubtensor(network=NETWORK)
         try:
             meta = await subtensor.metagraph(NETUID)
             hotkeys = getattr(meta, "hotkeys", []) or []
-            if not hotkeys:
-                log("No hotkeys in metagraph", "warn")
-                return
-            synced_uids: set[int] = set()
-            for uid in range(len(hotkeys)):
-                hotkey = hotkeys[uid]
-                if not hotkey or not isinstance(hotkey, str):
-                    continue
-                stake = _get_stake(meta, uid)
-                if stake < MIN_VALIDATOR_STAKE:
-                    continue
-                await self.validator_store.save_validator(
-                    uid=uid,
-                    hotkey=hotkey,
-                    stake=stake,
-                )
-                synced_uids.add(uid)
-            deleted = await self.validator_store.delete_validators_except_uids(synced_uids)
-            log(
-                f"Synced {len(synced_uids)} validators (stake >= {MIN_VALIDATOR_STAKE}), removed {deleted} stale",
-                "success",
-            )
+            uid_by_hotkey = {hk: uid for uid, hk in enumerate(hotkeys) if isinstance(hk, str)}
+            updated = 0
+            for v in registered:
+                uid = uid_by_hotkey.get(v.hotkey)
+                if uid is None:
+                    continue  # registered validator not in the metagraph — leave its stake as-is
+                await self.validator_store.update_stake(v.hotkey, _get_stake(meta, uid))
+                updated += 1
+            log(f"Refreshed stake for {updated}/{len(registered)} registered validators", "success")
         finally:
             await subtensor.close()

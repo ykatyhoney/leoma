@@ -82,12 +82,7 @@ def validate_commit_count(
 ) -> Tuple[bool, Optional[str]]:
     """Validate that a hotkey has not exceeded the maximum allowed commits.
 
-    Args:
-        commit_history_len: Number of historical commits for this hotkey.
-        max_commits: Maximum allowed commits per hotkey (default: 2).
-
-    Returns:
-        (is_valid, error_reason): is_valid is False if commit_history_len > max_commits.
+    Returns (is_valid, error_reason); is_valid is False when commit_history_len > max_commits.
     """
     if commit_history_len > max_commits:
         return False, f"max_commits_exceeded_{max_commits}"

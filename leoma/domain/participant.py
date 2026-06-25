@@ -10,17 +10,7 @@ from leoma.domain.comparison import EvaluationResult
 
 
 class MinerCommitment(BaseModel):
-    """
-    Miner chain commitment payload.
-
-    Attributes
-    ----------
-    hotkey : str
-    model_name : str
-    model_revision : str
-    chute_id : str
-    commit_block : int
-    """
+    """Miner chain commitment payload."""
 
     hotkey: str
     model_name: str
@@ -30,23 +20,7 @@ class MinerCommitment(BaseModel):
 
 
 class MinerInfo(BaseModel):
-    """
-    Validated miner with status.
-
-    Attributes
-    ----------
-    uid : int
-    hotkey : str
-    model_name : str
-    model_revision : str
-    chute_id : str
-    chute_slug : str
-    block : int
-    is_valid : bool
-    invalid_reason : Optional[str]
-    model_hash : str
-    chute_status : str
-    """
+    """Validated miner with status."""
 
     uid: int
     hotkey: str
@@ -62,16 +36,7 @@ class MinerInfo(BaseModel):
 
 
 class MinerResult(BaseModel):
-    """
-    Single miner result for one sample.
-
-    Attributes
-    ----------
-    hotkey : str
-    slug : str
-    video_filename : str
-    evaluation : EvaluationResult
-    """
+    """Single miner result for one sample."""
 
     hotkey: str
     slug: str
@@ -80,16 +45,7 @@ class MinerResult(BaseModel):
 
 
 class MinerScore(BaseModel):
-    """
-    Aggregated miner score.
-
-    Attributes
-    ----------
-    passed_count : int
-    total : int
-    pass_rate : float
-    slug : str
-    """
+    """Aggregated miner score."""
 
     passed_count: int = 0
     total: int = 0

@@ -1,10 +1,4 @@
-"""
-Miner command implementations for Leoma.
-
-Provides async functions for:
-- push_command: Deploy I2V model to Chutes
-- commit_command: Commit model info to blockchain
-"""
+"""Miner command implementations: push (deploy I2V model to Chutes) and commit (model info on-chain)."""
 
 from __future__ import annotations
 
@@ -60,15 +54,7 @@ def _commit_payload(model_name: str, model_revision: str, chute_id: str) -> str:
 
 
 async def get_chute_info(chute_id: str, api_key: str) -> Optional[Dict[str, Any]]:
-    """Get chute info from Chutes API.
-    
-    Args:
-        chute_id: Chute deployment ID
-        api_key: Chutes API key
-        
-    Returns:
-        Chute info dict or None if failed
-    """
+    """Get chute info from Chutes API, or None if the request fails."""
     url = f"{_CHUTES_API_BASE}/chutes/{chute_id}"
     
     try:
@@ -89,15 +75,7 @@ async def get_chute_info(chute_id: str, api_key: str) -> Optional[Dict[str, Any]
 
 
 async def get_latest_chute_id(model_name: str, api_key: str) -> Optional[str]:
-    """Get latest chute ID for a repository.
-    
-    Args:
-        model_name: HuggingFace repository name
-        api_key: Chutes API key
-    
-    Returns:
-        Chute ID or None if not found
-    """
+    """Get latest chute ID for a HuggingFace repository, or None if not found."""
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
@@ -114,8 +92,7 @@ async def get_latest_chute_id(model_name: str, api_key: str) -> Optional[str]:
     chutes = data.get("items", data) if isinstance(data, dict) else data
     if not isinstance(chutes, list):
         return None
-    
-    # Find chute matching the model_name
+
     for chute in reversed(chutes):
         if any(chute.get(k) == model_name for k in ("tagline", "readme", "name")):
             return chute.get("chute_id")
@@ -128,17 +105,7 @@ async def push_command(
     chutes_api_key: Optional[str] = None,
     chute_user: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Deploy I2V model to Chutes.
-    
-    Args:
-        model_name: HuggingFace repository ID (e.g., "user/model-name")
-        model_revision: HuggingFace commit SHA
-        chutes_api_key: Chutes API key (optional, from env if not provided)
-        chute_user: Chutes username (optional, from env if not provided)
-        
-    Returns:
-        Result dict with success status and chute_id
-    """
+    """Deploy I2V model to Chutes. Returns a result dict with success status and chute_id."""
     chutes_api_key = chutes_api_key or CHUTES_API_KEY
     chute_user = chute_user
     
@@ -151,8 +118,7 @@ async def push_command(
         return {"success": False, "error": "CHUTE_USER not configured"}
     
     log(f"Building Chute config for model_name={model_name} model_revision={model_revision}", "info")
-    
-    # Generate Chute configuration for I2V model
+
     chutes_config = textwrap.dedent(f'''
 import os
 import uuid
@@ -292,8 +258,7 @@ async def generate(self, args: I2VArgs):
     tmp_file = Path("tmp_chute.py")
     tmp_file.write_text(chutes_config)
     log(f"Wrote Chute config to {tmp_file}", "info")
-    
-    # Deploy to Chutes
+
     cmd = ["chutes", "deploy", f"{tmp_file.stem}:chute", "--accept-fee"]
     env = {**os.environ, "CHUTES_API_KEY": chutes_api_key}
     
@@ -327,8 +292,7 @@ async def generate(self, args: I2VArgs):
         
         tmp_file.unlink(missing_ok=True)
         log("Chute deployment successful", "success")
-        
-        # Get chute info
+
         chute_id = await get_latest_chute_id(model_name, api_key=chutes_api_key)
         log(f"Chute ID: {chute_id}", "info")
         
@@ -357,18 +321,7 @@ async def commit_command(
     coldkey: Optional[str] = None,
     hotkey: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Commit model info to blockchain.
-    
-    Args:
-        model_name: HuggingFace repository ID
-        model_revision: HuggingFace commit SHA
-        chute_id: Chutes deployment ID
-        coldkey: Wallet coldkey name (optional, from env if not provided)
-        hotkey: Wallet hotkey name (optional, from env if not provided)
-        
-    Returns:
-        Result dict with success status
-    """
+    """Commit model info to the blockchain. Returns a result dict with success status."""
     import bittensor as bt
     
     cold = coldkey or WALLET_NAME

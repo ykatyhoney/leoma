@@ -100,3 +100,9 @@ class ValidatorStore:
             stmt = delete(Validator).where(Validator.uid.not_in(uids))
             r = await session.execute(stmt)
             return r.rowcount or 0
+
+    async def delete_validator_by_hotkey(self, hotkey: str) -> bool:
+        """Remove a validator from the owner-managed allowlist by hotkey. Returns True if removed."""
+        async with get_session() as session:
+            r = await session.execute(delete(Validator).where(Validator.hotkey == hotkey))
+            return (r.rowcount or 0) > 0

@@ -1,8 +1,4 @@
-"""
-SQLAlchemy ORM models for Leoma database.
-
-Defines the database schema using SQLAlchemy 2.0 declarative style.
-"""
+"""SQLAlchemy ORM models for the Leoma database schema."""
 
 from datetime import datetime
 from typing import Optional
@@ -71,6 +67,29 @@ class SamplingState(Base):
     key: Mapped[str] = mapped_column(String(255), primary_key=True)
     value: Mapped[str] = mapped_column(Text, nullable=False)
     updated_at: Mapped[datetime] = _utc_timestamp_column(with_onupdate=True)
+
+
+class ProducedTask(Base):
+    """Authoritative, gap-free scoring ledger of tasks that were actually produced.
+
+    The block-derived ``rotation_id`` (== ``block // interval``) decides *whose turn* it is to
+    sample and is the bucket key for verdicts; it has gaps whenever a turn is skipped. ``task_seq``
+    is a monotonic, gap-free counter the owner-api assigns on the *first* announce for a rotation_id,
+    so the scoring window ("last N produced tasks") never depends on skipped turns. ``block`` is the
+    block at announce, used to anchor the window to a consensus block (``block <= as_of_block``).
+    """
+    __tablename__ = "produced_tasks"
+
+    task_seq: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    rotation_id: Mapped[int] = mapped_column(Integer, unique=True, nullable=False)
+    sampler_hotkey: Mapped[str] = mapped_column(String(64), nullable=False)
+    block: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = _utc_timestamp_column()
+
+    __table_args__ = (
+        Index("idx_produced_tasks_rotation_id", "rotation_id"),
+        Index("idx_produced_tasks_block", "block"),
+    )
 
 
 class ValidatorSample(Base):
@@ -167,6 +186,33 @@ class MinerRank(Base):
     updated_at: Mapped[datetime] = _utc_timestamp_column(with_onupdate=True)
 
     __table_args__ = (Index("idx_miner_ranks_rank", "rank"),)
+
+
+class ValidatorMinerReport(Base):
+    """A validator's reported validation result for one miner (decentralized validation).
+
+    Each permissioned validator validates miners itself and reports the result here; the
+    owner-api tallies a majority consensus into ``valid_miners`` for the dashboard.
+    """
+    __tablename__ = "validator_miner_reports"
+
+    validator_hotkey: Mapped[str] = mapped_column(String(64), primary_key=True)
+    miner_hotkey: Mapped[str] = mapped_column(String(64), primary_key=True)
+    uid: Mapped[int] = mapped_column(Integer, nullable=False)
+    block: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    model_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    model_revision: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    model_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    chute_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    chute_slug: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    is_valid: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    invalid_reason: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    reported_at: Mapped[datetime] = _utc_timestamp_column(with_onupdate=True)
+
+    __table_args__ = (
+        Index("idx_miner_reports_validator", "validator_hotkey"),
+        Index("idx_miner_reports_miner", "miner_hotkey"),
+    )
 
 
 class MinerTaskRank(Base):
