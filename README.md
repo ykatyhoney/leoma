@@ -30,29 +30,35 @@ Leoma is a **Bittensor subnet** for **AI-generated video**:
 
 ## Workflow
 
-1. **Subnet owner** runs the **owner-sampler**: creates tasks (first frame + prompt from one-shot 5s clips in object storage), calls miners via Chutes, uploads task artifacts to the samples bucket, and sets the latest task id on the API.
-2. **Validators** run the **evaluator** and **weight-setter**: poll the API for the latest task, download task data from S3, run GPT-4o evaluation, POST results to the Leoma API; each epoch, call **GET /weights** and set on-chain weights (winner-take-all).
-3. The **API** (subnet owner) computes rank (dominance rule) and exposes **GET /weights**. Validators use this to set weights on-chain.
-4. **Miners** register a Hugging Face model (naming: `leoma` prefix, hotkey suffix) and Chute endpoint via on-chain commit. They receive challenges; the best performer earns subnet alpha.
+Task generation and score aggregation are **fully decentralized** — every permissioned validator runs its own sampler and aggregates scores locally. The owner-api is only a thin coordinator (rotation clock + permissioned allowlist + dashboard).
+
+1. **Rotation:** the owner-api `GET /rotation` is the authoritative clock. Sampling rotates across the permissioned-validator allowlist every `SAMPLING_ROTATION_INTERVAL` blocks (default 100 ≈ 20 min); only one validator samples per window, so miners never get concurrent requests. `task_id = current_block // interval`.
+2. **Validation (every validator):** each validator independently reads the chain (commitments + metagraph) and validates each miner — commit rules (model named `leoma…<hotkey>`), HuggingFace model hash, Chute hot, duplicate-model detection — then reports the result to the owner-api (`POST /miners/report`). The owner-api tallies a **majority consensus** into `valid_miners` for the dashboard; it no longer validates miners itself.
+3. **Sampler + self-evaluator (each validator on its turn):** samples its **locally-validated** miners — picks a one-shot 5s clip + first frame from the source bucket, describes it with Gemini, calls each miner's Chute, uploads the task artifacts to its **own** R2 bucket, then **evaluates its own task** (no cross-validation) and publishes `evaluation_results/<hotkey>.json` to its bucket + dual-reports to the API for the dashboard, and announces it (`POST /tasks/announce`).
+4. **Weight-setter (every validator):** each epoch reads all peers' verdicts from their buckets (read keys shared peer-to-peer via `PEER_VALIDATORS`) and aggregates them with **per-validator-average equal weight** — each validator's own pass-rate per miner, then the mean across validators (no validator counts more for sampling more) — ranks miners (dominance rule), and sets winner-take-all weights on-chain.
+5. **Miners** register a Hugging Face model (naming: `leoma` prefix, hotkey suffix) and Chute endpoint via on-chain commit. They receive challenges; the best performer earns subnet alpha.
 
 | Role | In Leoma |
 |------|----------|
 | **Miner** | Upload a TI2V model to Hugging Face (name: `leoma...` + your hotkey), deploy to Chutes, commit on-chain. Earn subnet alpha when your outputs win. |
-| **Validator** | Run evaluator + weight-setter (e.g. `leoma serve`). Requires API URL, S3-compatible read access to the **samples** bucket (Hippius or Cloudflare R2 via `OBJECT_STORAGE_BACKEND`), OpenAI API key, and Bittensor wallet. |
+| **Validator** | Run miner-validation + sampler (self-evaluating) + weight-setter (e.g. `leoma serve`). Requires API URL, an **own R2 bucket** (write) + **peer bucket** read keys, source-bucket read keys, Chutes + Gemini API keys (+ optional `HF_TOKEN` for gated models), and a Bittensor wallet. Must be on the owner's permissioned allowlist. |
 
 ---
 
 ## Validator setup
 
-Validators run the **evaluator** and the **weight-setter**. Task creation and miner calls are done by the subnet owner (owner-sampler), not validators.
+Validators run the **sampler** (which self-evaluates its own tasks) and the **weight-setter** in one process (`leoma serve`). Task generation and score aggregation are decentralized — each validator samples on its turn and aggregates peers' results locally.
 
 ### Prerequisites
 
 - **Bittensor wallet** (coldkey + hotkey) registered as a validator on the Leoma subnet.
-- **Leoma API** URL (the deployed owner API).
-- **Object storage (S3-compatible):** **read-only** access to the **samples** bucket (evaluator downloads task data; evaluation results go to the Leoma API with hotkey signature). Default is **Cloudflare R2** (`R2_ENDPOINT` and `R2_SAMPLES_*` keys). Set `OBJECT_STORAGE_BACKEND=hippius` to use Hippius keys instead — see `env.example`.
-- **OpenAI API key** (for GPT-4o evaluation in the evaluator).
-- **Validator registration in API DB:** An admin must add your validator hotkey (and UID, stake) so the API includes you in stake-weighted scoring (e.g. `leoma db add-validator --uid <uid> --hotkey <ss58>`).
+- **Leoma API** URL (the deployed owner-api coordinator).
+- **Permissioned allowlist:** the subnet owner must add your hotkey to `PERMISSIONED_VALIDATORS` so you can read `GET /rotation` and announce tasks.
+- **Own R2 bucket (write):** `R2_OWN_BUCKET` + `R2_OWN_WRITE_*`. The sampler publishes task artifacts and its own verdicts here.
+- **Peer bucket read keys:** `PEER_VALIDATORS` — a JSON list of every permissioned validator (including you) with read-only creds, shared peer-to-peer. Used to aggregate scores.
+- **Source bucket read keys:** `R2_VIDEOS_READ_*` + `R2_SOURCE_BUCKET` — the owner shares one read-only key pair so the sampler can fetch source clips.
+- **Chutes API key** (`CHUTES_API_KEY`) for the sampler to call miners and for miner validation (Chute-hot check); **Gemini API key** (`GEMINI_API_KEY`) for clip description + evaluation; optional **`HF_TOKEN`** for validating gated/private HuggingFace models.
+- **Validator registration in API DB:** validators with stake ≥ `MIN_VALIDATOR_STAKE` are synced automatically from the metagraph; an admin can also add one manually (e.g. `leoma db add-validator --uid <uid> --hotkey <ss58>`).
 
 ### Environment variables
 
@@ -65,15 +71,17 @@ Set these in `.env` (copy from `env.example`):
 | `NETWORK` | Bittensor network (`finney` for mainnet) |
 | `WALLET_NAME` | Bittensor wallet name (e.g. `default`) |
 | `HOTKEY_NAME` | Bittensor hotkey name (e.g. `default`) |
-| `OPENAI_API_KEY` | OpenAI API key for GPT-4o (evaluator) |
+| `GEMINI_API_KEY` | Gemini key (clip description in the sampler + video evaluation) |
+| `CHUTES_API_KEY` | Chutes key (sampler calls each miner's I2V Chute) |
 | `EPOCH_LEN` | Blocks per epoch (e.g. `180`); optional |
-| `OBJECT_STORAGE_BACKEND` | `r2` (default) or `hippius` |
-| `R2_ENDPOINT`, `R2_REGION`, `R2_SAMPLES_BUCKET`, `R2_SAMPLES_READ_*` | Default backend: R2 S3 API URL (e.g. `https://<ACCOUNT_ID>.r2.cloudflarestorage.com`), region (often `auto`), bucket, and read keys for the evaluator |
-| `HIPPIUS_*` | When `OBJECT_STORAGE_BACKEND=hippius`: endpoint, region, bucket names, and keys (see `env.example`) |
+| `R2_ENDPOINT`, `R2_REGION` | R2 S3 API URL (e.g. `https://<ACCOUNT_ID>.r2.cloudflarestorage.com`) and region (often `auto`) |
+| `R2_SOURCE_BUCKET`, `R2_VIDEOS_READ_*` | Source bucket + read keys (sampler downloads source clips) |
+| `R2_OWN_BUCKET`, `R2_OWN_WRITE_*` | This validator's own result bucket + write keys (sampler publishes tasks + verdicts here) |
+| `PEER_VALIDATORS` | JSON list of all permissioned validators with bucket + read keys (peer aggregation) |
 
 ### Quick start (Docker, recommended)
 
-This repo’s `docker-compose.yml` runs the **validator** (evaluator + weight-setter in one container) and optionally **Watchtower** for auto-updates.
+This repo’s `docker-compose.yml` runs the **validator** (sampler + weight-setter in one container) and optionally **Watchtower** for auto-updates.
 
 ```bash
 # 1. Clone the repo
@@ -82,13 +90,14 @@ cd leoma
 
 # 2. Create .env from example
 cp env.example .env
-# Edit .env: API_URL, OPENAI_API_KEY, HIPPIUS_SAMPLES_READ_*, WALLET_NAME, HOTKEY_NAME, NETUID, NETWORK
+# Edit .env: API_URL, GEMINI_API_KEY, CHUTES_API_KEY, R2_OWN_BUCKET, R2_OWN_WRITE_*,
+#            PEER_VALIDATORS, R2_VIDEOS_READ_*, WALLET_NAME, HOTKEY_NAME, NETUID, NETWORK
 
 # 3. Run
 docker compose up -d
 ```
 
-This starts **leoma-validator** (`leoma serve`: evaluator + weight-setter) and **leoma-watchtower**. Mount your Bittensor wallets so the container can sign weight-setting transactions; the compose file uses `~/.bittensor/wallets:/root/.bittensor/wallets:ro`.
+This starts **leoma-validator** (`leoma serve`: sampler (self-evaluating) + weight-setter) and **leoma-watchtower**. Mount your Bittensor wallets so the container can sign weight-setting transactions; the compose file uses `~/.bittensor/wallets:/root/.bittensor/wallets:ro`.
 
 **Auto-update with Watchtower:** Build and push the image on subnet code updates; Watchtower will pull and restart the validator container. See `env.example` for `WATCHTOWER_POLL_INTERVAL` and related options.
 
@@ -98,17 +107,17 @@ This starts **leoma-validator** (`leoma serve`: evaluator + weight-setter) and *
 # Requires Python 3.12+
 pip install -e .   # or: uv pip install -e .
 
-# Run validator (evaluator + weight-setter in one process)
+# Run validator (sampler with self-eval + weight-setter in one process)
 leoma serve
 ```
 
 ### Split processes (advanced)
 
-You can run evaluator and weight-setter as separate processes:
+You can run the loops as separate processes:
 
 ```bash
-leoma servers evaluator   # Polls GET /tasks/latest, downloads from S3, GPT-4o, POSTs to API
-leoma servers validator   # Every epoch: GET /weights, set on-chain
+leoma servers sampler     # On your turn: sample miners, self-evaluate, publish to own bucket, announce
+leoma servers validator   # Every epoch: aggregate peers' verdicts (per-validator average), set on-chain
 ```
 
 ### API authentication
@@ -155,8 +164,9 @@ To run a **miner** on the Leoma subnet: upload your **Text-Image to Video (TI2V)
 
 ## Storage and API
 
-- **Storage:** Source videos live in the **source bucket**; task artifacts and evaluation results live in the **samples bucket**. The owner chooses **Hippius** or **Cloudflare R2** with `OBJECT_STORAGE_BACKEND` and the matching env vars (`HIPPIUS_*` or `R2_*`). Validators need **read-only** access to the samples bucket. See `env.example` and the [Storage](https://docs.leoma.ai/storage) doc.
-- **API:** The Leoma API provides health, miners, samples, scores, tasks, weights, and blacklist endpoints. Validators use **GET /tasks/latest**, **POST /samples/batch**, and **GET /weights**. See the [API reference](https://docs.leoma.ai/api).
+- **Storage:** Source videos live in one shared **source bucket** (validators get read-only keys via `R2_VIDEOS_READ_*`). Each validator owns its own **result bucket** (`R2_OWN_BUCKET`) where its sampled tasks and evaluation results live; validators share read-only keys to each other's buckets via `PEER_VALIDATORS` to aggregate scores. Decentralized buckets use **Cloudflare R2**. See `env.example` and the [Storage](https://docs.leoma.ai/storage) doc.
+- **API (coordinator):** The owner-api provides health, miners, samples (dashboard), scores, tasks, rotation, and blacklist endpoints. Validators use **GET /rotation** (whose turn), **POST /tasks/announce**, **GET /tasks/latest**, **POST /samples/batch** (dashboard dual-report), and **POST /miners/report** (miner-validation results). Miner validity and on-chain weights are computed by the validators — the owner-api only tallies the **majority consensus** of miner reports for the dashboard and does not validate miners or fetch weights. See the [API reference](https://docs.leoma.ai/api).
+- **Dashboard endpoints (decentralized):** **GET /overview** (network snapshot), **GET /miners/active** (valid + chute-hot miners with per-validator-average score, rank, eligibility, activity), **GET /validators** and **GET /validators/{hotkey}** (each validator's liveness + rotation participation; stake is informational, not used for weighting), and **GET /scores** (per-validator-average leaderboard). Task media is presigned from the sampler's bucket (the API needs `PEER_VALIDATORS` read keys for previews).
 
 ---
 
