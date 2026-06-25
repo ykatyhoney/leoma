@@ -67,7 +67,7 @@ class SignatureVerifier:
                 return True, None
             validator = await self.validator_store.get_validator_by_hotkey(hotkey)
             if validator is None:
-                return False, "Validator not registered. Ensure your hotkey has at least MIN_VALIDATOR_STAKE and wait for sync."
+                return False, "Validator not registered. The subnet owner must add your hotkey (leoma validator add ...)."
             await self.validator_store.update_last_seen(hotkey)
             return True, None
         except Exception as e:
@@ -81,6 +81,16 @@ class SignatureVerifier:
 
     def is_admin(self, hotkey: str) -> bool:
         return hotkey in ADMIN_HOTKEYS
+
+    async def is_permissioned(self, hotkey: str) -> bool:
+        """A validator is permissioned iff it is in the owner-managed validators allowlist (or admin).
+
+        In the unified design every owner-added validator participates in sampling/rotation, so the
+        validators table *is* the permissioned set — there is no separate env allowlist.
+        """
+        if self.is_admin(hotkey):
+            return True
+        return await self.validator_store.get_validator_by_hotkey(hotkey) is not None
 
 
 _verifier: Optional[SignatureVerifier] = None
@@ -121,6 +131,19 @@ async def verify_admin_signature(
     hotkey = await verify_signature(request, x_validator_hotkey, x_signature, x_timestamp)
     if not get_verifier().is_admin(hotkey):
         raise HTTPException(status_code=403, detail="Admin access required")
+    return hotkey
+
+
+async def verify_permissioned_validator(
+    request: Request,
+    x_validator_hotkey: Annotated[str, Header()],
+    x_signature: Annotated[str, Header()],
+    x_timestamp: Annotated[str, Header()],
+) -> str:
+    """Authenticate, then require the hotkey to be in the permissioned sampling allowlist."""
+    hotkey = await verify_signature(request, x_validator_hotkey, x_signature, x_timestamp)
+    if not await get_verifier().is_permissioned(hotkey):
+        raise HTTPException(status_code=403, detail="Not a permissioned sampling validator")
     return hotkey
 
 

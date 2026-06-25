@@ -1,6 +1,6 @@
-"""Validator evaluator: get task from API, download from S3, run GPT-4o, POST results."""
+"""Self-evaluation: a validator evaluates only the tasks it sampled (no cross-validation)."""
 
-from leoma.app.evaluator.main import run_evaluator_loop
+from leoma.app.evaluator.main import evaluate_sampled_task
 
 
-__all__ = ["run_evaluator_loop"]
+__all__ = ["evaluate_sampled_task"]

@@ -1,8 +1,7 @@
 """
 Runtime environment and logging.
 
-Loads configuration from the environment and provides structured logging helpers
-with component context, log levels, and detailed metadata.
+Loads configuration from the environment and provides structured logging helpers.
 """
 
 import inspect
@@ -39,26 +38,22 @@ def _is_debug() -> bool:
     return os.environ.get("LOG_LEVEL", "INFO").upper() == "DEBUG"
 
 
-# ============================================================================
-# ANSI Color Codes - Professional Palette
-# ============================================================================
+# ANSI color codes.
 
 _RESET = "\033[0m"
 _BOLD = "\033[1m"
-_DIM = "\033[90m"      # Dark gray (subtle)
+_DIM = "\033[90m"
 
-# Professional color palette
 _BLACK = "\033[30m"
 _DARK_GRAY = "\033[90m"
-_RED = "\033[31m"       # For errors
-_GREEN = "\033[32m"     # For success
-_YELLOW = "\033[33m"    # For warnings
-_BLUE = "\033[34m"      # For info
-_MAGENTA = "\033[35m"   # For component names
-_CYAN = "\033[36m"      # For debug
+_RED = "\033[31m"
+_GREEN = "\033[32m"
+_YELLOW = "\033[33m"
+_BLUE = "\033[34m"
+_MAGENTA = "\033[35m"
+_CYAN = "\033[36m"
 _WHITE = "\033[37m"
 
-# Bright versions for emphasis
 _BRIGHT_RED = "\033[91m"
 _BRIGHT_GREEN = "\033[92m"
 _BRIGHT_YELLOW = "\033[93m"
@@ -66,17 +61,15 @@ _BRIGHT_BLUE = "\033[94m"
 
 _HEADER_WIDTH = 80
 
-# Level-specific styling (professional, high contrast)
 _LEVEL_COLORS = {
-    "DEBUG": _DIM,              # Subtle gray for debug
-    "INFO": _BLUE,              # Blue for informational
-    "SUCCESS": _GREEN,          # Green for success
-    "WARNING": _YELLOW,         # Yellow for warnings
-    "ERROR": _RED,              # Red for errors
-    "CRITICAL": f"{_BOLD}{_RED}",  # Bold red for critical
+    "DEBUG": _DIM,
+    "INFO": _BLUE,
+    "SUCCESS": _GREEN,
+    "WARNING": _YELLOW,
+    "ERROR": _RED,
+    "CRITICAL": f"{_BOLD}{_RED}",
 }
 
-# Level tokens with consistent styling
 _LEVEL_TOKENS = {
     "DEBUG": f"{_DIM}··{_RESET}",
     "INFO": f"{_BLUE}●{_RESET}",
@@ -88,10 +81,6 @@ _LEVEL_TOKENS = {
 }
 
 
-# ============================================================================
-# Log Level Configuration
-# ============================================================================
-
 class LogLevel:
     DEBUG = "DEBUG"
     INFO = "INFO"
@@ -101,10 +90,6 @@ class LogLevel:
     CRITICAL = "CRITICAL"
     START = "START"
 
-
-# ============================================================================
-# Caller Information
-# ============================================================================
 
 def _get_caller_info(skip_frames: int = 2) -> Dict[str, Any]:
     """Get detailed caller information (file, function, line)."""
@@ -140,10 +125,6 @@ def _get_component_name(caller_info: Dict[str, Any]) -> str:
     return filepath
 
 
-# ============================================================================
-# Timestamp and Formatting
-# ============================================================================
-
 def _wall_clock() -> str:
     """Return full datetime string: YYYY-MM-DD HH:MM:SS.mmm"""
     now = datetime.now()
@@ -156,22 +137,12 @@ def _format_prefix(level: str, ts: str, caller_info: Dict[str, Any], component: 
     Format: [TIMESTAMP] COMP_MODULE  LEVEL_TOKEN  MESSAGE
     """
     level_token = _LEVEL_TOKENS.get(level, " ")
-    
-    # Timestamp in brackets (dimmed)
     timestamp = f"{_DIM}[{ts}]{_RESET}"
-    
-    # Component name in subtle color
     component_str = f"{_MAGENTA}{component}{_RESET}"
-    
-    # Line number (subtle)
     line_str = f"{_DIM}:{caller_info['line']}{_RESET}"
     
     return f"{timestamp} {component_str}{line_str} {level_token}"
 
-
-# ============================================================================
-# Structured Data Support
-# ============================================================================
 
 def _format_data(data: Optional[Dict[str, Any]], indent: bool = False) -> str:
     """Format structured data for logging."""
@@ -190,10 +161,6 @@ def _format_data(data: Optional[Dict[str, Any]], indent: bool = False) -> str:
             return f" | {data}"
 
 
-# ============================================================================
-# Context Management
-# ============================================================================
-
 def set_log_context(**kwargs: Any) -> None:
     """Set context variables to be included in all subsequent logs."""
     current = _request_context.get().copy()
@@ -211,43 +178,27 @@ def get_log_context() -> Dict[str, Any]:
     return _request_context.get().copy()
 
 
-# ============================================================================
-# Main Logging Functions
-# ============================================================================
-
 def emit_log(
     msg: str,
     level: str = "INFO",
     data: Optional[Dict[str, Any]] = None,
     exc: Optional[Exception] = None,
 ) -> None:
-    """Print a structured log line with timestamp, component, level, and optional data.
-    
-    Args:
-        msg: The log message
-        level: Log level (DEBUG, INFO, SUCCESS, WARNING, ERROR, CRITICAL)
-        data: Optional structured data to include
-        exc: Optional exception to include in log
-    """
+    """Print a structured log line with timestamp, component, level, and optional data."""
     caller_info = _get_caller_info()
     component = _get_component_name(caller_info)
     ts = _wall_clock()
-    
-    # Get context
+
     context = get_log_context()
     all_data = {**context, **(data or {})}
     if exc:
         all_data["exception"] = str(exc)
-    
-    # Format prefix
+
     prefix = _format_prefix(level, ts, caller_info, component)
-    
-    # Format data
     data_str = _format_data(all_data) if all_data else ""
-    
-    # Print log line
+
     print(f"{prefix} {msg}{data_str}")
-    
+
     # Also log to standard logger for ERROR/CRITICAL
     if level in ("ERROR", "CRITICAL"):
         logger.error("%s %s", msg, data_str)
@@ -273,48 +224,33 @@ def emit_section(title: str) -> None:
     print(f"\n{_WHITE}---- {title} ----{_RESET}")
 
 
-# ============================================================================
-# Convenience Logging Functions
-# ============================================================================
-
 def log_debug(msg: str, **data: Any) -> None:
-    """Log a debug message."""
     emit_log(msg, level=LogLevel.DEBUG, data=data if data else None)
 
 
 def log_info(msg: str, **data: Any) -> None:
-    """Log an info message."""
     emit_log(msg, level=LogLevel.INFO, data=data if data else None)
 
 
 def log_success(msg: str, **data: Any) -> None:
-    """Log a success message."""
     emit_log(msg, level=LogLevel.SUCCESS, data=data if data else None)
 
 
 def log_warning(msg: str, **data: Any) -> None:
-    """Log a warning message."""
     emit_log(msg, level=LogLevel.WARNING, data=data if data else None)
 
 
 def log_error(msg: str, exc: Optional[Exception] = None, **data: Any) -> None:
-    """Log an error message."""
     emit_log(msg, level=LogLevel.ERROR, data=data if data else None, exc=exc)
 
 
 def log_critical(msg: str, exc: Optional[Exception] = None, **data: Any) -> None:
-    """Log a critical message."""
     emit_log(msg, level=LogLevel.CRITICAL, data=data if data else None, exc=exc)
 
 
 def log_start(msg: str, **data: Any) -> None:
-    """Log a start message."""
     emit_log(msg, level=LogLevel.START, data=data if data else None)
 
-
-# ============================================================================
-# Exception Logging
-# ============================================================================
 
 def log_exception(message: str, exc: Optional[BaseException] = None) -> None:
     """Log an exception; in production omit full traceback to avoid leaking paths."""
@@ -326,10 +262,6 @@ def log_exception(message: str, exc: Optional[BaseException] = None) -> None:
         # Also log to standard logger for full traceback in development
         logger.exception("%s", message, exc_info=exc is None or True)
 
-
-# ============================================================================
-# Performance Timing
-# ============================================================================
 
 class LogTimer:
     """Context manager for timing operations and logging the duration."""
@@ -384,17 +316,9 @@ def timed(operation: str) -> Callable[[Callable[P, R]], Callable[P, R]]:
     return decorator
 
 
-# ============================================================================
-# Legacy Compatibility
-# ============================================================================
-
-# Keep these for backward compatibility
+# Kept for backward compatibility.
 USED_VIDEOS: List[str] = []
 
-
-# ============================================================================
-# Settings
-# ============================================================================
 
 def _read_str(name: str, fallback: str) -> str:
     return os.environ.get(name, fallback)
@@ -452,26 +376,31 @@ class Settings:
         self.hippius_videos_read_secret_key = _read_optional_str("HIPPIUS_VIDEOS_READ_SECRET_KEY")
         self.hippius_videos_write_access_key = _read_optional_str("HIPPIUS_VIDEOS_WRITE_ACCESS_KEY")
         self.hippius_videos_write_secret_key = _read_optional_str("HIPPIUS_VIDEOS_WRITE_SECRET_KEY")
-        self.hippius_samples_read_access_key = _read_optional_str("HIPPIUS_SAMPLES_READ_ACCESS_KEY")
-        self.hippius_samples_read_secret_key = _read_optional_str("HIPPIUS_SAMPLES_READ_SECRET_KEY")
-        self.hippius_samples_write_access_key = _read_optional_str("HIPPIUS_SAMPLES_WRITE_ACCESS_KEY")
-        self.hippius_samples_write_secret_key = _read_optional_str("HIPPIUS_SAMPLES_WRITE_SECRET_KEY")
         self.source_bucket = _read_str("HIPPIUS_SOURCE_BUCKET", "videos")
-        self.samples_bucket = _read_str("HIPPIUS_SAMPLES_BUCKET", "samples")
         self.object_storage_backend = "r2"
 
         self.r2_endpoint_raw = "https://cce499ad4f3a4703b069771d8ff4215a.r2.cloudflarestorage.com"
         self.r2_region = "auto"
         self.r2_source_bucket = "leoma-videos"
-        self.r2_samples_bucket = "leoma-samples"
         self.r2_videos_read_access_key = _read_optional_str("R2_VIDEOS_READ_ACCESS_KEY")
         self.r2_videos_read_secret_key = _read_optional_str("R2_VIDEOS_READ_SECRET_KEY")
         self.r2_videos_write_access_key = _read_optional_str("R2_VIDEOS_WRITE_ACCESS_KEY")
         self.r2_videos_write_secret_key = _read_optional_str("R2_VIDEOS_WRITE_SECRET_KEY")
-        self.r2_samples_read_access_key = "a15afa64fb77da5cd98a511ce20759bd"
-        self.r2_samples_read_secret_key = "bec439451a21f972542b470f1bfe4f8dd71e802a983fe51cdc71477515564c45"
-        self.r2_samples_write_access_key = _read_optional_str("R2_SAMPLES_WRITE_ACCESS_KEY")
-        self.r2_samples_write_secret_key = _read_optional_str("R2_SAMPLES_WRITE_SECRET_KEY")
+
+        # ── Decentralized sampling / per-validator buckets ──
+        # Block-based rotation: only one validator samples per window. task_id = block // interval.
+        self.sampling_rotation_interval = _read_int("SAMPLING_ROTATION_INTERVAL", 100)
+        # The permissioned-validator allowlist is owner-managed in the DB (leoma validator add/remove),
+        # not an env var. The validators table IS the permissioned set.
+        # Static JSON map of every peer's result bucket (incl. self): read creds shared peer-to-peer.
+        self.peer_validators = _read_str("PEER_VALIDATORS", "")
+        # This validator's own R2 result bucket (write creds). Endpoint/region default to R2_ENDPOINT.
+        self.r2_own_endpoint = _read_str("R2_OWN_ENDPOINT", self.r2_endpoint_raw)
+        self.r2_own_region = _read_str("R2_OWN_REGION", self.r2_region)
+        self.r2_own_bucket = _read_optional_str("R2_OWN_BUCKET")
+        self.r2_own_write_access_key = _read_optional_str("R2_OWN_WRITE_ACCESS_KEY")
+        self.r2_own_write_secret_key = _read_optional_str("R2_OWN_WRITE_SECRET_KEY")
+
         self.openai_api_key = _read_optional_str("OPENAI_API_KEY")
         self.gemini_api_key = _read_optional_str("GEMINI_API_KEY")
         self.required_video_width = _read_int("REQUIRED_VIDEO_WIDTH", 832)
@@ -516,20 +445,11 @@ HIPPIUS_VIDEOS_READ_ACCESS_KEY = settings.hippius_videos_read_access_key
 HIPPIUS_VIDEOS_READ_SECRET_KEY = settings.hippius_videos_read_secret_key
 HIPPIUS_VIDEOS_WRITE_ACCESS_KEY = settings.hippius_videos_write_access_key
 HIPPIUS_VIDEOS_WRITE_SECRET_KEY = settings.hippius_videos_write_secret_key
-HIPPIUS_SAMPLES_READ_ACCESS_KEY = settings.hippius_samples_read_access_key
-HIPPIUS_SAMPLES_READ_SECRET_KEY = settings.hippius_samples_read_secret_key
-HIPPIUS_SAMPLES_WRITE_ACCESS_KEY = settings.hippius_samples_write_access_key
-HIPPIUS_SAMPLES_WRITE_SECRET_KEY = settings.hippius_samples_write_secret_key
 OBJECT_STORAGE_BACKEND = settings.object_storage_backend
 SOURCE_BUCKET = (
     settings.r2_source_bucket
     if settings.object_storage_backend == "r2"
     else settings.source_bucket
-)
-SAMPLES_BUCKET = (
-    settings.r2_samples_bucket
-    if settings.object_storage_backend == "r2"
-    else settings.samples_bucket
 )
 OPENAI_API_KEY = settings.openai_api_key
 GEMINI_API_KEY = settings.gemini_api_key
@@ -556,6 +476,8 @@ CORPUS_TARGET_RESOLUTION = settings.corpus_target_resolution
 CORPUS_MAX_FILESIZE = settings.corpus_max_filesize
 MIN_VALIDATOR_STAKE = settings.min_validator_stake
 VALIDATOR_SYNC_INTERVAL = settings.validator_sync_interval
+SAMPLING_ROTATION_INTERVAL = settings.sampling_rotation_interval
+R2_OWN_BUCKET = settings.r2_own_bucket
 
 # Ensure leoma logger has a handler when not configured by application
 if not logger.handlers:

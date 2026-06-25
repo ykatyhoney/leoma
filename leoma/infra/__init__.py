@@ -3,15 +3,21 @@
 from leoma.infra.commit_parser import parse_commit, validate_commit_fields, validate_commit_count
 from leoma.infra.chute_resolver import build_chute_endpoint, get_chute_info
 from leoma.infra.storage_backend import (
-    create_minio_client,
-    create_samples_read_client,
-    create_samples_write_client,
+    create_own_write_client,
+    create_peer_read_client,
     create_source_read_client,
     create_source_write_client,
     ensure_bucket_exists,
     get_task_media_presigned_urls,
     upload_evaluation_result_json,
     upload_task_artifacts,
+)
+from leoma.infra.peer_registry import (
+    PeerBucket,
+    get_peer,
+    load_peers,
+    own_bucket,
+    peer_hotkeys,
 )
 from leoma.infra.eligibility import (
     detect_plagiarism,
@@ -42,12 +48,16 @@ __all__ = [
     "APIClient",
     "build_chute_endpoint",
     "create_api_client_from_wallet",
-    "create_minio_client",
-    "create_samples_read_client",
-    "create_samples_write_client",
+    "create_own_write_client",
+    "create_peer_read_client",
     "create_source_read_client",
     "create_source_write_client",
     "compute_rank_from_miner_stats",
+    "PeerBucket",
+    "get_peer",
+    "load_peers",
+    "own_bucket",
+    "peer_hotkeys",
     "detect_plagiarism",
     "ensure_bucket_exists",
     "evaluate_generated_video_async",

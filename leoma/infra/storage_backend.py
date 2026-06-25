@@ -12,7 +12,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from minio import Minio
 
-from leoma.bootstrap import SAMPLES_BUCKET, emit_log
+from leoma.bootstrap import emit_log
 from leoma.bootstrap.runtime import normalize_s3_endpoint_host, settings
 
 
@@ -48,6 +48,57 @@ def _create_minio_client(
         secret_key=secret_key,
         secure=True,
         region=region,
+    )
+
+
+def _build_minio_client(
+    endpoint_raw: str | None,
+    region: str | None,
+    access_key: str | None,
+    secret_key: str | None,
+    *,
+    purpose: str,
+) -> Minio:
+    """Build a Minio client from an explicit endpoint/region/creds (per-validator bucket)."""
+    if not endpoint_raw or not endpoint_raw.strip():
+        raise ValueError(f"Missing object storage endpoint for {purpose}")
+    if not access_key or not secret_key:
+        raise ValueError(
+            f"Missing object storage credentials for {purpose}. "
+            "Set the matching access key and secret key (R2_OWN_* or PEER_VALIDATORS)."
+        )
+    return Minio(
+        normalize_s3_endpoint_host(endpoint_raw),
+        access_key=access_key,
+        secret_key=secret_key,
+        secure=True,
+        region=region or "auto",
+    )
+
+
+def create_own_write_client() -> Minio:
+    """Minio client for this validator's OWN result bucket (write creds from env)."""
+    return _build_minio_client(
+        settings.r2_own_endpoint,
+        settings.r2_own_region,
+        settings.r2_own_write_access_key,
+        settings.r2_own_write_secret_key,
+        purpose="own result bucket write access",
+    )
+
+
+def create_peer_read_client(peer: "Any") -> Minio:
+    """Minio read client for a peer validator's bucket (creds from the peer registry).
+
+    ``peer`` is a ``leoma.infra.peer_registry.PeerBucket`` (or any object exposing
+    ``endpoint``/``region``/``read_access_key``/``read_secret_key``).
+    """
+    return _build_minio_client(
+        peer.endpoint,
+        peer.region,
+        peer.read_access_key,
+        peer.read_secret_key,
+        purpose=f"peer result bucket read access ({peer.hotkey[:12]}...)",
     )
 
 
@@ -87,24 +138,6 @@ def create_source_write_client() -> Minio:
     return _create_minio_client(ak, sk, purpose="source bucket write access")
 
 
-def create_samples_write_client() -> Minio:
-    if settings.object_storage_backend == "r2":
-        ak, sk = settings.r2_samples_write_access_key, settings.r2_samples_write_secret_key
-    else:
-        ak, sk = settings.hippius_samples_write_access_key, settings.hippius_samples_write_secret_key
-    return _create_minio_client(ak, sk, purpose="samples bucket write access")
-
-
-def create_samples_read_client() -> Minio:
-    if settings.object_storage_backend == "r2":
-        ak = settings.r2_samples_read_access_key or settings.r2_samples_write_access_key
-        sk = settings.r2_samples_read_secret_key or settings.r2_samples_write_secret_key
-    else:
-        ak = settings.hippius_samples_read_access_key or settings.hippius_samples_write_access_key
-        sk = settings.hippius_samples_read_secret_key or settings.hippius_samples_write_secret_key
-    return _create_minio_client(ak, sk, purpose="samples bucket read access")
-
-
 def get_presigned_get_url(
     minio_client: Minio,
     bucket: str,
@@ -120,11 +153,25 @@ async def get_task_media_presigned_urls(
     task_id: int,
     miner_hotkey: str,
     *,
-    bucket: str = SAMPLES_BUCKET,
+    sampler_hotkey: Optional[str] = None,
     expires: Optional[timedelta] = None,
 ) -> Optional[Dict[str, str]]:
+    """Presign a task's media from the SAMPLER's bucket (decentralized, per-validator buckets).
+
+    Each task's artifacts live in the bucket of the validator that sampled it. We resolve that
+    validator's read creds from the peer registry (``PEER_VALIDATORS`` on the API). Returns None
+    when ``sampler_hotkey`` is unknown or the API has no read creds for that bucket (preview is
+    best-effort; scores/leaderboard work regardless).
+    """
+    from leoma.infra.peer_registry import get_peer
+
+    if not sampler_hotkey:
+        return None
+    peer = get_peer(sampler_hotkey)
+    if peer is None:
+        return None
     try:
-        client = create_samples_read_client()
+        client = create_peer_read_client(peer)
     except ValueError:
         return None
     prefix = str(task_id)
@@ -138,7 +185,7 @@ async def get_task_media_presigned_urls(
     for name, object_name in keys.items():
         try:
             url = await asyncio.to_thread(
-                get_presigned_get_url, client, bucket, object_name, expires
+                get_presigned_get_url, client, peer.bucket, object_name, expires
             )
             result[name] = url
         except Exception:
@@ -212,10 +259,6 @@ async def list_evaluated_task_ids(
     return task_ids
 
 
-def create_minio_client() -> Minio:
-    return create_samples_read_client()
-
-
 async def ensure_bucket_exists(minio_client: Minio, bucket_name: str) -> None:
     exists = await asyncio.to_thread(minio_client.bucket_exists, bucket_name)
     if not exists:
@@ -225,6 +268,7 @@ async def ensure_bucket_exists(minio_client: Minio, bucket_name: str) -> None:
 
 async def upload_evaluation_result_json(
     minio_client: Minio,
+    bucket: str,
     task_id: int,
     validator_hotkey: str,
     payload: list,
@@ -236,18 +280,19 @@ async def upload_evaluation_result_json(
     body = json.dumps(wrapper, indent=2).encode("utf-8")
     await asyncio.to_thread(
         minio_client.put_object,
-        SAMPLES_BUCKET,
+        bucket,
         object_name,
         io.BytesIO(body),
         len(body),
         content_type="application/json",
     )
-    emit_log(f"Uploaded evaluation result: {object_name}", "info")
+    emit_log(f"Uploaded evaluation result: {bucket}/{object_name}", "info")
     return object_name
 
 
 async def upload_task_artifacts(
     minio_client: Minio,
+    bucket: str,
     task_id: int,
     original_clip_path: str,
     first_frame_path: str,
@@ -257,16 +302,16 @@ async def upload_task_artifacts(
     prefix = str(task_id)
     if _is_non_empty_file(original_clip_path):
         await _upload_file(
-            minio_client, SAMPLES_BUCKET, f"{prefix}/original_clip.mp4", original_clip_path
+            minio_client, bucket, f"{prefix}/original_clip.mp4", original_clip_path
         )
     if _is_non_empty_file(first_frame_path):
         await _upload_file(
-            minio_client, SAMPLES_BUCKET, f"{prefix}/first_frame.png", first_frame_path
+            minio_client, bucket, f"{prefix}/first_frame.png", first_frame_path
         )
     metadata_path = _write_metadata_file(prefix, metadata)
     try:
         await _upload_file(
-            minio_client, SAMPLES_BUCKET, f"{prefix}/metadata.json", metadata_path
+            minio_client, bucket, f"{prefix}/metadata.json", metadata_path
         )
     finally:
         if os.path.exists(metadata_path):
@@ -276,7 +321,7 @@ async def upload_task_artifacts(
             continue
         safe_hotkey = hotkey.replace("/", "_").replace("\\", "_")
         object_name = f"{prefix}/generated_videos/{safe_hotkey}.mp4"
-        await _upload_file(minio_client, SAMPLES_BUCKET, object_name, local_path)
-        emit_log(f"Uploaded: {object_name}", "info")
+        await _upload_file(minio_client, bucket, object_name, local_path)
+        emit_log(f"Uploaded: {bucket}/{object_name}", "info")
     return prefix
 

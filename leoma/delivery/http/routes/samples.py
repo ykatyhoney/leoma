@@ -7,7 +7,6 @@ from leoma.delivery.http.verifier import verify_signature
 from leoma.delivery.http.contracts import SampleSubmission, SampleResponse, SampleBatchSubmission
 from leoma.delivery.http.validators import validate_miner_hotkey, validate_validator_hotkey
 from leoma.infra.db.stores import EvaluationSignatureStore, SampleStore
-from leoma.infra.storage_backend import create_samples_write_client, upload_evaluation_result_json
 
 
 router = APIRouter()
@@ -25,8 +24,6 @@ def _to_sample_response(sample: Any) -> SampleResponse:
         validator_hotkey=sample.validator_hotkey,
         miner_hotkey=sample.miner_hotkey,
         prompt=sample.prompt,
-        s3_bucket=sample.s3_bucket,
-        s3_prefix=sample.s3_prefix,
         passed=sample.passed,
         confidence=sample.confidence,
         reasoning=sample.reasoning,
@@ -35,54 +32,18 @@ def _to_sample_response(sample: Any) -> SampleResponse:
     )
 
 
-def _sample_to_eval_entry(sample: Any) -> dict:
-    """Build one per-hotkey entry for evaluation_results JSON (canonical shape for signing)."""
-    passed = bool(sample.passed)
-    return {
-        "hotkey": sample.miner_hotkey,
-        "passed": passed,
-        "status": "passed" if passed else "failed",
-        "confidence": getattr(sample, "confidence", None),
-        "reasoning": getattr(sample, "reasoning", None),
-        "latency_ms": getattr(sample, "latency_ms", None),
-        "original_artifacts": getattr(sample, "original_artifacts", None),
-        "generated_artifacts": getattr(sample, "generated_artifacts", None),
-        "presentation_order": getattr(sample, "presentation_order", None),
-    }
-
-
-async def _upload_evaluation_result_for_task(
-    task_id: int,
-    validator_hotkey: str,
-) -> None:
-    """Upload evaluation_results JSON to S3 for (task_id, validator) as {signature, data}."""
-    try:
-        samples = await validator_samples_dao.get_samples_by_validator_and_task_id(
-            validator_hotkey=validator_hotkey,
-            task_id=task_id,
-        )
-        if not samples:
-            return
-        payload = [_sample_to_eval_entry(s) for s in samples]
-        signature = await evaluation_signature_dao.get_signature(task_id, validator_hotkey)
-        client = create_samples_write_client()
-        await upload_evaluation_result_json(
-            client, task_id, validator_hotkey, payload, signature=signature
-        )
-    except Exception as e:
-        # Log but do not fail the request
-        from leoma.bootstrap import emit_log as log
-        log(f"Failed to upload evaluation result to S3: {e}", "error")
-
-
 async def _save_submitted_sample(
     sample: SampleSubmission,
     validator_hotkey: str,
     *,
-    upload_to_s3: bool = True,
     evaluation_signature: str | None = None,
 ) -> Any:
-    """Persist a submitted sample through the sample store."""
+    """Persist a submitted sample through the sample store (dashboard DB only).
+
+    Decentralized model: validators upload the evaluation_results JSON to their OWN
+    bucket directly; the API just records the sample for the dashboard, so there is no
+    central-bucket upload here.
+    """
     passed = sample.passed
     saved = await validator_samples_dao.save_sample(
         validator_hotkey=validator_hotkey,
@@ -102,8 +63,6 @@ async def _save_submitted_sample(
     sig = evaluation_signature or getattr(sample, "evaluation_signature", None)
     if sig:
         await evaluation_signature_dao.set_signature(sample.task_id, validator_hotkey, sig)
-    if upload_to_s3:
-        await _upload_evaluation_result_for_task(sample.task_id, validator_hotkey)
     return saved
 
 
@@ -112,19 +71,7 @@ async def submit_sample(
     sample: SampleSubmission,
     hotkey: Annotated[str, Depends(verify_signature)],
 ) -> SampleResponse:
-    """Submit sample metadata.
-    
-    Validators call this endpoint after evaluating a sample to store
-    the metadata and result in the centralized database.
-    
-    Args:
-        sample: Sample submission data
-        
-    Requires validator signature authentication.
-    
-    Returns:
-        Created sample record
-    """
+    """Submit sample metadata after evaluating a sample. Requires validator signature authentication."""
     result = await _save_submitted_sample(
         sample, validator_hotkey=hotkey,
         evaluation_signature=getattr(sample, "evaluation_signature", None),
@@ -137,22 +84,9 @@ async def submit_samples_batch(
     body: SampleBatchSubmission,
     hotkey: Annotated[str, Depends(verify_signature)],
 ) -> List[SampleResponse]:
-    """Submit multiple samples in batch.
-    
-    Validators can use this endpoint to submit multiple samples at once.
-    Limited to 100 samples per request. Optional signature is over the
-    evaluation payload (same shape as S3 "data") for verification.
-    
-    Args:
-        body: { signature?: str, samples: SampleSubmission[] }
-        
-    Requires validator signature authentication.
-    
-    Returns:
-        List of created sample records
-        
-    Raises:
-        HTTPException: If batch size exceeds limit
+    """Submit multiple samples in batch (max 100). Requires validator signature authentication.
+
+    Optional signature is over the evaluation payload (same shape as S3 "data") for verification.
     """
     samples = body.samples
     if len(samples) > MAX_BATCH_SIZE:
@@ -171,17 +105,10 @@ async def submit_samples_batch(
         await evaluation_signature_dao.set_signature(tid, hotkey, body.signature)
     
     results = []
-    task_ids_upload = set()
     for sample in samples:
-        result = await _save_submitted_sample(
-            sample, validator_hotkey=hotkey, upload_to_s3=False
-        )
+        result = await _save_submitted_sample(sample, validator_hotkey=hotkey)
         results.append(_to_sample_response(result))
-        if sample.task_id is not None:
-            task_ids_upload.add(sample.task_id)
-    for tid in task_ids_upload:
-        await _upload_evaluation_result_for_task(tid, hotkey)
-    
+
     return results
 
 
@@ -198,8 +125,13 @@ async def list_recent_samples(
 async def get_task_samples(
     validator_hotkey: str,
     task_id: int,
+    _hotkey: Annotated[str, Depends(verify_signature)],
 ) -> List[SampleResponse]:
-    """Get all samples for one evaluation task from one validator. Public."""
+    """Get all samples for one evaluation task from one validator. Validator-signature only.
+
+    Exposes a validator's raw verdicts; gated like the sibling ``/samples/validator/{hk}`` and
+    ``/samples/miner/{hk}`` reads (the public dashboard uses ``/tasks/{id}`` instead).
+    """
     validator_hotkey = validate_validator_hotkey(validator_hotkey)
     samples = await validator_samples_dao.get_samples_by_validator_and_task_id(
         validator_hotkey=validator_hotkey,
@@ -214,17 +146,7 @@ async def get_validator_samples(
     hotkey: Annotated[str, Depends(verify_signature)],
     limit: int = Query(100, ge=1, le=MAX_LIST_LIMIT, description="Max items to return"),
 ) -> List[SampleResponse]:
-    """Get samples submitted by a validator.
-    
-    Args:
-        validator_hotkey: Validator's SS58 hotkey
-        limit: Maximum number of samples to return
-        
-    Requires validator signature authentication.
-    
-    Returns:
-        List of sample records
-    """
+    """Get samples submitted by a validator. Requires validator signature authentication."""
     validator_hotkey = validate_validator_hotkey(validator_hotkey)
     samples = await validator_samples_dao.get_samples_by_validator(
         validator_hotkey=validator_hotkey,
@@ -240,17 +162,7 @@ async def get_miner_samples(
     hotkey: Annotated[str, Depends(verify_signature)],
     limit: int = Query(100, ge=1, le=MAX_LIST_LIMIT, description="Max items to return"),
 ) -> List[SampleResponse]:
-    """Get samples for a miner across all validators.
-    
-    Args:
-        miner_hotkey: Miner's SS58 hotkey
-        limit: Maximum number of samples to return
-        
-    Requires validator signature authentication.
-    
-    Returns:
-        List of sample records
-    """
+    """Get samples for a miner across all validators. Requires validator signature authentication."""
     miner_hotkey = validate_miner_hotkey(miner_hotkey)
     samples = await validator_samples_dao.get_samples_by_miner(
         miner_hotkey=miner_hotkey,

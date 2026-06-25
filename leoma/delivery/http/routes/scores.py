@@ -32,10 +32,7 @@ from leoma.infra.db.stores import (
     SampleStore,
     ValidatorStore,
 )
-from leoma.infra.scorer_constants import (
-    COMPLETENESS_ELIGIBILITY_THRESHOLD,
-    scoring_window_task_ids,
-)
+from leoma.infra.scorer_constants import COMPLETENESS_ELIGIBILITY_THRESHOLD
 
 router = APIRouter()
 rank_scores_dao = RankStore()
@@ -104,56 +101,9 @@ def _aggregate_miner_scores(scores: list[Any]) -> AggregatedStats:
         validator_count=len(scores),
     )
 
-def _stake_map_from_validators(validators: list[Any]) -> dict[str, float]:
-    return {v.hotkey: max(0.0, float(v.stake)) for v in validators}
-
-
-async def _merge_sampling_into_aggregated_scores(
-    aggregated: dict[str, dict[str, Any]],
-) -> None:
-    """Replace total_samples/total_passed/pass_rate with stake-weighted distinct-task stats.
-
-    When ``max(task_id)`` is known, counts are restricted to the current scoring window
-    (same consecutive ``task_id`` range as the stake-weighted scorer). Otherwise falls
-    back to all-time distinct-task stats (no ``max_task_id`` yet).
-    """
-    if not aggregated:
-        return
-    validators = await validators_dao.get_all_validators()
-    stake_map = _stake_map_from_validators(validators)
-    max_tid = await validator_samples_dao.get_max_evaluated_task_id()
-    window = scoring_window_task_ids(max_tid)
-    sampling = await validator_samples_dao.get_miner_sampling_stats_by_hotkeys(
-        stake_map, aggregated.keys(), task_ids=window
-    )
-    for hk, data in aggregated.items():
-        s = sampling.get(hk)
-        if window is None:
-            if not s or s["total_tasks"] <= 0:
-                continue
-            tt, pt = s["total_tasks"], s["passed_tasks"]
-        else:
-            if s and s["total_tasks"] > 0:
-                tt, pt = s["total_tasks"], s["passed_tasks"]
-            else:
-                tt, pt = 0, 0
-        pr = pt / tt if tt else 0.0
-        data["total_samples"] = tt
-        data["total_passed"] = pt
-        data["pass_rate"] = pr
-        if window is not None:
-            data["avg_score"] = pr
-
-
 @router.get("/validators", response_model=List[ValidatorSummaryResponse])
 async def get_validator_summaries() -> List[ValidatorSummaryResponse]:
-    """Get validator summaries for dashboard (total samples, passed_count, avg score, last updated).
-    
-    This endpoint is public (no authentication required).
-    
-    Returns:
-        List of validator summaries for the overview table
-    """
+    """Get validator summaries for dashboard (total samples, passed_count, avg score, last updated). Public."""
     summaries = await rank_scores_dao.get_validator_summaries()
     return [
         ValidatorSummaryResponse(
@@ -170,18 +120,14 @@ async def get_validator_summaries() -> List[ValidatorSummaryResponse]:
 
 @router.get("", response_model=AggregatedScoreResponse)
 async def get_aggregated_scores() -> AggregatedScoreResponse:
-    """Get aggregated dashboard scores across all validators.
-    
-    Scores are calculated server-side from submitted sample metadata by the
-    score calculation task (which also updates miner rank). Sample counts
-    on the miner leaderboard reflect this aggregated data only.
-    This endpoint is public (no authentication required).
-    
-    Returns:
-        Aggregated scores for all miners (dashboard view)
+    """Get aggregated dashboard scores across all validators. Public.
+
+    Scores are calculated server-side from submitted sample metadata by the score calculation
+    task (which also updates miner rank); leaderboard sample counts reflect this aggregated data only.
     """
+    # Equal weight: aggregated score per miner = AVG of each validator's pass-rate
+    # (RankStore.get_aggregated_scores), i.e. the per-validator-average. No stake weighting.
     scores = await rank_scores_dao.get_aggregated_scores()
-    await _merge_sampling_into_aggregated_scores(scores)
     all_scores = await rank_scores_dao.get_all_scores()
 
     validators = set(s.validator_hotkey for s in all_scores)
@@ -199,51 +145,11 @@ async def get_aggregated_scores() -> AggregatedScoreResponse:
 async def get_miner_scores(
     miner_hotkey: str,
 ) -> MinerScoresResponse:
-    """Get dashboard scores for a specific miner from all validators.
-    
-    This endpoint is public (no authentication required).
-    
-    Args:
-        miner_hotkey: Miner's SS58 hotkey
-        
-    Returns:
-        Miner's dashboard scores from all validators
-    """
+    """Get dashboard scores for a specific miner from all validators. Public."""
     miner_hotkey = validate_miner_hotkey(miner_hotkey)
     scores = await rank_scores_dao.get_scores_by_miner(miner_hotkey)
+    # Per-validator-average: each validator's pass-rate is one row; avg_score is their mean.
     agg = _aggregate_miner_scores(scores)
-    validators = await validators_dao.get_all_validators()
-    max_tid = await validator_samples_dao.get_max_evaluated_task_id()
-    window = scoring_window_task_ids(max_tid)
-    sampling = await validator_samples_dao.get_miner_sampling_stats_by_hotkeys(
-        _stake_map_from_validators(validators), [miner_hotkey], task_ids=window
-    )
-    s = sampling.get(miner_hotkey)
-    if window is None:
-        if s and s["total_tasks"] > 0:
-            tt, pt = s["total_tasks"], s["passed_tasks"]
-            agg = AggregatedStats(
-                total_samples=tt,
-                total_passed=pt,
-                avg_score=agg.avg_score,
-                pass_rate=pt / tt if tt else 0.0,
-                validator_count=agg.validator_count,
-            )
-    else:
-        if s and s["total_tasks"] > 0:
-            tt, pt = s["total_tasks"], s["passed_tasks"]
-        else:
-            tt, pt = 0, 0
-        pr = pt / tt if tt else 0.0
-        agg = AggregatedStats(
-            total_samples=tt,
-            total_passed=pt,
-            avg_score=pr,
-            pass_rate=pr,
-            validator_count=agg.validator_count,
-        )
-
-    
     return MinerScoresResponse(
         miner_hotkey=miner_hotkey,
         by_validator=[_validator_score_detail(score) for score in scores],
@@ -255,16 +161,7 @@ async def get_miner_scores(
 async def get_validator_scores(
     validator_hotkey: str,
 ) -> ValidatorScoresResponse:
-    """Get dashboard scores reported by a specific validator.
-    
-    This endpoint is public (no authentication required).
-    
-    Args:
-        validator_hotkey: Validator's SS58 hotkey
-        
-    Returns:
-        Validator's dashboard scores for all miners
-    """
+    """Get dashboard scores reported by a specific validator. Public."""
     validator_hotkey = validate_validator_hotkey(validator_hotkey)
     scores = await rank_scores_dao.get_scores_by_validator(validator_hotkey)
     
@@ -290,17 +187,20 @@ async def get_rank() -> RankResponse:
     for the consecutive scoring window ending at max task_id (default threshold 80%).
     """
     rows = await miner_rank_dao.get_all_ordered_by_rank()
+    # Batch-load miners + task ranks once (avoid a per-row N+1).
+    uid_by_hotkey = {m.miner_hotkey: m.uid for m in await valid_miners_dao.get_all_miners()}
+    completeness_by_hotkey = {
+        t.miner_hotkey: float(t.completeness or 0.0)
+        for t in await miner_task_rank_dao.get_all_ranked()
+    }
     entries: List[MinerRankEntry] = []
     for r in rows:
-        miner = await valid_miners_dao.get_miner_by_hotkey(r.miner_hotkey)
-        uid = _uid_for_rank_miner(miner)
-        task_rank = await miner_task_rank_dao.get_by_miner(r.miner_hotkey)
-        comp = float(getattr(task_rank, "completeness", 0.0)) if task_rank else 0.0
-        eligible = task_rank is not None and comp >= COMPLETENESS_ELIGIBILITY_THRESHOLD - 1e-9
+        comp = completeness_by_hotkey.get(r.miner_hotkey)
+        eligible = comp is not None and comp >= COMPLETENESS_ELIGIBILITY_THRESHOLD - 1e-9
         entries.append(
             MinerRankEntry(
                 miner_hotkey=r.miner_hotkey,
-                uid=uid,
+                uid=uid_by_hotkey.get(r.miner_hotkey),
                 rank=r.rank,
                 passed_count=r.passed_count,
                 pass_rate=r.pass_rate,
@@ -313,17 +213,10 @@ async def get_rank() -> RankResponse:
 
 @router.get("/stats", response_model=ScoreStatsResponse)
 async def get_score_stats() -> ScoreStatsResponse:
-    """Get dashboard score statistics.
-    
-    This endpoint is public (no authentication required).
-    
-    Returns:
-        Dashboard score statistics summary
-    """
+    """Get dashboard score statistics. Public."""
     all_scores = await rank_scores_dao.get_all_scores()
     total_samples_count = await validator_samples_dao.get_total_sample_count()
-    
-    # Calculate stats
+
     validators = set(s.validator_hotkey for s in all_scores)
     miners = set(s.miner_hotkey for s in all_scores)
     

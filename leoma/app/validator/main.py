@@ -1,10 +1,14 @@
 """
-Validator service for Leoma.
+Validator service for Leoma (fully decentralized).
 
-Runs two loops in one process:
-1. Evaluator: poll GET /tasks/latest, download task from object storage (R2 or Hippius), run Gemini per miner, POST results to API.
-2. Weight-setter: at each epoch boundary, GET /weights from API, set top-ranked-only weights on-chain
-   (weight 1.0 for winner_uid, 0 for others; if no top-ranked miner, UID 0 to burn alpha).
+Runs three loops in one process:
+1. Sampler: on this validator's rotation turn (GET /rotation), sample valid miners, upload the
+   task to its own R2 bucket, and announce it (POST /tasks/announce).
+2. Evaluator: poll GET /tasks/latest, download the task from the sampler's bucket, run Gemini per
+   miner, publish results to its own bucket, and dual-report to the API for the dashboard.
+3. Weight-setter: at each epoch boundary, read every peer's results from their buckets, aggregate
+   with equal weight (one validator = one vote), and set top-ranked-only weights on-chain
+   (weight 1.0 for winner_uid, 0 for others; if no eligible miner, UID 0 to burn alpha).
 """
 
 import os
@@ -21,13 +25,12 @@ from leoma.bootstrap import (
     WALLET_NAME,
     HOTKEY_NAME,
     NETWORK,
-    SAMPLES_BUCKET,
 )
 from leoma.bootstrap import emit_log as log, emit_header as log_header
-from leoma.app.evaluator.main import run_evaluator_loop
+from leoma.app.sampler.loop import run_sampler_loop
+from leoma.app.validator.miner_validation import run_validation_loop
 
 
-# API configuration
 API_URL = os.environ.get("API_URL", "https://api.leoma.ai")
 
 
@@ -41,26 +44,32 @@ async def run_epoch(
     wallet: bt.Wallet,
     block: int,
 ) -> None:
-    """Get winner_uid from API /weights, set top-ranked-only weights on-chain. If no top-ranked miner or API fails, UID 0 burns alpha."""
-    log(f"[{block}] Fetching weights from API", "info")
+    """Aggregate peer evaluation results locally (equal weight) and set top-ranked-only weights.
+
+    Reads every permissioned validator's results from their buckets, computes the winner with
+    one-vote-per-validator, and sets weight 1.0 on the winner. If aggregation fails or no miner
+    is eligible, UID 0 burns alpha.
+    """
+    log(f"[{block}] Aggregating peer evaluation results locally (equal weight)", "info")
     winner_uid = 0
     try:
         from leoma.infra.remote_api import create_api_client_from_wallet
+        from leoma.app.validator.aggregate_local import compute_local_winner
         api_client = create_api_client_from_wallet(
             wallet_name=WALLET_NAME,
             hotkey_name=HOTKEY_NAME,
             api_url=API_URL,
         )
         try:
-            data = await api_client.get_weights()
-            winner_uid = int(data.get("winner_uid", 0))
-            miners = data.get("miners") or []
-            if miners:
-                log(f"[{block}] Weights API: {len(miners)} miners, top_uid(winner_uid)={winner_uid}", "info")
+            # block is the epoch-boundary block (block % EPOCH_LEN == 0), identical across validators
+            # running this epoch, so the block-derived scoring window is identical for all of them.
+            winner_uid, winner_hotkey = await compute_local_winner(api_client, epoch_block=block)
+            if winner_hotkey:
+                log(f"[{block}] Local winner: uid={winner_uid} hotkey={winner_hotkey[:12]}...", "info")
         finally:
             await api_client.close()
     except Exception as e:
-        log(f"[{block}] Failed to get weights from API: {e}; setting UID 0 (burn alpha)", "error")
+        log(f"[{block}] Local aggregation failed: {e}; setting UID 0 (burn alpha)", "error")
 
     # Top-ranked-only weighting: set weight 1.0 for winner_uid only (or UID 0 to burn alpha)
     uids, weights = _build_weight_payload(winner_uid)
@@ -78,15 +87,7 @@ async def step(
     subtensor: bt.AsyncSubtensor,
     wallet: bt.Wallet,
 ) -> int | None:
-    """Wait for epoch boundary and run weight setting.
-
-    Args:
-        subtensor: Bittensor async subtensor instance
-        wallet: Bittensor wallet for signing transactions
-
-    Returns:
-        The epoch number that was processed, or None if waiting
-    """
+    """Wait for the epoch boundary and run weight setting. Returns the processed epoch, or None if still waiting."""
     current_block = await subtensor.get_current_block()
     current_epoch = current_block // EPOCH_LEN
 
@@ -109,18 +110,15 @@ async def step(
 
 
 async def main() -> None:
-    """Main entry point: run evaluator (background) + weight-setting loop."""
-    log_header("Leoma Validator Starting (evaluator + weight-setter)")
+    """Main entry point: run the sampler (sample + self-evaluate) + weight-setting loop."""
+    log_header("Leoma Validator Starting (sampler + self-evaluator + weight-setter)")
 
     if not GEMINI_API_KEY:
-        log("Evaluator requires GEMINI_API_KEY", "error")
+        log("Sampler/evaluator requires GEMINI_API_KEY", "error")
         return
 
-    log(f"Using centralized API: {API_URL}", "info")
-    log(
-        f"Evaluator object storage: backend={OBJECT_STORAGE_BACKEND}, samples_bucket={SAMPLES_BUCKET}",
-        "info",
-    )
+    log(f"Coordinator API: {API_URL}", "info")
+    log(f"Object storage backend: {OBJECT_STORAGE_BACKEND}", "info")
 
     subtensor = bt.AsyncSubtensor(network=NETWORK)
     wallet = bt.Wallet(name=WALLET_NAME, hotkey=HOTKEY_NAME)
@@ -130,18 +128,23 @@ async def main() -> None:
     log(f"NetUID: {NETUID}", "info")
     log(f"Epoch length: {EPOCH_LEN} blocks (~{EPOCH_LEN * 12}s)", "info")
 
-    log("Starting evaluator loop in background...", "start")
-    evaluator_task = asyncio.create_task(run_evaluator_loop())
+    def _log_background_exception(name: str):
+        def _cb(task: asyncio.Task) -> None:
+            try:
+                exc = task.exception()
+                if exc is not None:
+                    log(f"Background {name} task failed: {exc}", "error")
+            except asyncio.CancelledError:
+                log(f"Background {name} task was cancelled", "warn")
+        return _cb
 
-    def handle_evaluator_exception(task: asyncio.Task) -> None:
-        try:
-            exc = task.exception()
-            if exc is not None:
-                log(f"Background evaluator task failed: {exc}", "error")
-        except asyncio.CancelledError:
-            log("Background evaluator task was cancelled", "warn")
+    log("Starting miner-validation loop in background (validates miners + reports to owner-api)...", "start")
+    validation_task = asyncio.create_task(run_validation_loop())
+    validation_task.add_done_callback(_log_background_exception("miner-validation"))
 
-    evaluator_task.add_done_callback(handle_evaluator_exception)
+    log("Starting sampler loop in background (samples + self-evaluates own tasks)...", "start")
+    sampler_task = asyncio.create_task(run_sampler_loop())
+    sampler_task.add_done_callback(_log_background_exception("sampler"))
 
     log("Starting weight-setting loop...", "start")
     while True:
