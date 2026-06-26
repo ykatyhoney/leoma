@@ -126,7 +126,6 @@ def mock_get_session(db_session: AsyncSessionAdapter, monkeypatch: pytest.Monkey
     for mod in (
         "leoma.infra.db.stores.store_participant",
         "leoma.infra.db.stores.store_sample",
-        "leoma.infra.db.stores.store_produced_task",
         "leoma.infra.db.stores.store_rank",
         "leoma.infra.db.stores.store_blacklist",
         "leoma.infra.db.stores.store_validator",

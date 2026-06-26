@@ -1,70 +1,52 @@
 """
-Tests for owner-api-outage resilience in weight setting.
+Chain/allowlist-outage resilience in weight setting.
 
-When the scoring window can't be fetched (owner-api down), the validator retries, then repeats the
-last winner it computed instead of burning the epoch — but only when the owner-api is *unreachable*,
-not when it is reachable and there is legitimately no eligible miner. Also covers the persisted
-last-winner store.
+When the on-chain allowlist can't be read (chain unreachable), the validator repeats the last winner
+it computed instead of burning the epoch — but only when the allowlist is *unreachable*, not when it
+is readable and there is legitimately no settled window. Also covers the persisted last-winner store.
 """
-import pytest
-
 from leoma.app.validator import aggregate_local, last_winner
+from leoma.infra.onchain_allowlist import AllowlistSnapshot
 
 
-@pytest.fixture(autouse=True)
-def _fast_retries(monkeypatch):
-    # Avoid real backoff sleeps in tests.
-    monkeypatch.setattr(aggregate_local, "_WINDOW_FETCH_ATTEMPTS", 1)
-    monkeypatch.setattr(aggregate_local, "_WINDOW_FETCH_BACKOFF", 0.0)
+def _areturn(val):
+    async def f(*a, **k):
+        return val
+    return f
 
 
-class _DownClient:
-    async def get_task_window(self, as_of_block=None):
-        raise ConnectionError("owner-api down")
-
-    async def close(self):
-        pass
-
-
-async def test_repeats_last_winner_when_owner_api_down(monkeypatch):
+async def test_repeats_last_winner_when_chain_unreachable(monkeypatch):
     monkeypatch.setattr(aggregate_local, "load_peers", lambda: {"V": object()})
+    monkeypatch.setattr(aggregate_local, "create_source_read_client", lambda: object())
+    monkeypatch.setattr(aggregate_local, "read_allowlist", _areturn(None))   # chain down
     monkeypatch.setattr(aggregate_local, "load_last_winner", lambda: (5, "winner_hotkey_xyz"))
-    uid, hk = await aggregate_local.compute_local_winner(_DownClient(), epoch_block=18000)
+    uid, hk = await aggregate_local.compute_local_winner(object(), epoch_block=18000)
     assert (uid, hk) == (5, "winner_hotkey_xyz")
 
 
 async def test_burns_when_down_and_no_last_winner(monkeypatch):
     monkeypatch.setattr(aggregate_local, "load_peers", lambda: {"V": object()})
+    monkeypatch.setattr(aggregate_local, "create_source_read_client", lambda: object())
+    monkeypatch.setattr(aggregate_local, "read_allowlist", _areturn(None))
     monkeypatch.setattr(aggregate_local, "load_last_winner", lambda: None)
-    uid, hk = await aggregate_local.compute_local_winner(_DownClient(), epoch_block=18000)
+    uid, hk = await aggregate_local.compute_local_winner(object(), epoch_block=18000)
     assert (uid, hk) == (0, None)
 
 
-async def test_reachable_empty_window_is_legitimate_burn_not_fallback(monkeypatch):
-    # A transient blip recovers on retry; the window is reachable but empty -> burn, NOT last winner.
-    monkeypatch.setattr(aggregate_local, "_WINDOW_FETCH_ATTEMPTS", 2)
+async def test_readable_but_empty_window_is_legitimate_burn_not_fallback(monkeypatch):
+    # Allowlist reads fine, but nothing has been produced -> empty window -> burn, NOT last winner.
+    snap = AllowlistSnapshot(validators=["V"], interval=100, digest="d")
     monkeypatch.setattr(aggregate_local, "load_peers", lambda: {"V": object()})
+    monkeypatch.setattr(aggregate_local, "create_source_read_client", lambda: object())
+    monkeypatch.setattr(aggregate_local, "read_allowlist", _areturn(snap))
+    monkeypatch.setattr(aggregate_local, "_discover_produced", _areturn(({"V": set()}, {})))
     fallback_calls = {"n": 0}
     monkeypatch.setattr(
         aggregate_local, "load_last_winner", lambda: (fallback_calls.__setitem__("n", 1) or (5, "x"))
     )
-
-    calls = {"n": 0}
-
-    class _Flaky:
-        async def get_task_window(self, as_of_block=None):
-            calls["n"] += 1
-            if calls["n"] == 1:
-                raise ConnectionError("blip")
-            return {"window": [], "active_validators": []}
-
-        async def close(self):
-            pass
-
-    uid, hk = await aggregate_local.compute_local_winner(_Flaky(), epoch_block=18000)
+    uid, hk = await aggregate_local.compute_local_winner(object(), epoch_block=18000)
     assert (uid, hk) == (0, None)
-    assert calls["n"] == 2           # retried after the blip
-    assert fallback_calls["n"] == 0  # did NOT fall back to last winner
+    assert fallback_calls["n"] == 0   # did NOT fall back to last winner
 
 
 def test_last_winner_round_trip(tmp_path, monkeypatch):
@@ -76,5 +58,5 @@ def test_last_winner_round_trip(tmp_path, monkeypatch):
 
 def test_last_winner_ignores_uid_zero(tmp_path, monkeypatch):
     monkeypatch.setenv("LEOMA_STATE_DIR", str(tmp_path))
-    last_winner.save_last_winner(0, "hk", epoch_block=1)  # UID 0 is a burn, not a real winner
+    last_winner.save_last_winner(0, "hk", epoch_block=1)   # UID 0 is a burn, not a real winner
     assert last_winner.load_last_winner() is None

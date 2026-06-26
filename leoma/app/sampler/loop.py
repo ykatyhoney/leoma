@@ -1,15 +1,16 @@
 """
 Per-validator sampler loop (decentralized task generation).
 
-Each permissioned validator runs this loop. The owner-api is the authoritative clock:
-``GET /rotation`` says whose turn it is. When it's this validator's turn it samples the
-miners once for the current rotation window (``task_id == rotation_index``), uploads the
-artifacts to its OWN result bucket, and announces the task so peers/the dashboard can
-find it. Only one validator samples per window, so miners never get concurrent requests.
+Each permissioned validator runs this loop. Whose turn it is to sample is computed LOCALLY from the
+current chain block + the on-chain-anchored allowlist (no owner-api): on its turn it samples its
+locally-validated miners once for the window (``task_id == rotation_index``), self-evaluates, and
+publishes the artifacts + signed verdicts to its OWN bucket. It then best-effort announces and
+dual-reports to the owner-api for the dashboard only. Only one validator samples per window.
 """
 import os
 import asyncio
 
+import bittensor as bt
 from google import genai
 
 from leoma.bootstrap import (
@@ -17,6 +18,7 @@ from leoma.bootstrap import (
     R2_OWN_BUCKET,
     WALLET_NAME,
     HOTKEY_NAME,
+    NETWORK,
 )
 from leoma.bootstrap import emit_log as log, emit_header as log_header, log_exception
 from leoma.infra.storage_backend import (
@@ -62,42 +64,38 @@ async def run_sampler_loop() -> None:
         wallet_name=WALLET_NAME, hotkey_name=HOTKEY_NAME, api_url=API_URL
     )
 
+    from leoma.app.validator.rotation_local import LocalRotation
+    subtensor = bt.AsyncSubtensor(network=NETWORK)
+    local_rotation = LocalRotation(subtensor, api_client.hotkey, source_read_client=source_client)
+
     log_header("Validator Sampler Starting")
     log(f"Own result bucket: {R2_OWN_BUCKET}", "info")
-    log(f"API: {API_URL}  poll={SAMPLER_POLL_INTERVAL}s", "info")
+    log(f"Rotation: on-chain allowlist (local); poll={SAMPLER_POLL_INTERVAL}s", "info")
 
     last_sampled_index: int | None = None
-    not_permissioned_logged = False
 
     while True:
         try:
-            rotation = await api_client.get_rotation()
-            rotation_index = int(rotation.get("rotation_index"))
-            is_your_turn = bool(rotation.get("is_your_turn"))
-
-            if not is_your_turn:
+            # Whose turn is computed locally from the chain block + on-chain allowlist (no owner-api).
+            view = await local_rotation.whose_turn()
+            if view is None:
+                # Chain / allowlist unreadable right now (or our hotkey isn't allowlisted yet); idle.
+                await asyncio.sleep(SAMPLER_POLL_INTERVAL)
+                continue
+            rotation_index = view.rotation_index
+            if not view.is_your_turn:
                 await asyncio.sleep(SAMPLER_POLL_INTERVAL)
                 continue
             if rotation_index == last_sampled_index:
-                # Already sampled this window; wait it out.
                 await asyncio.sleep(SAMPLER_POLL_INTERVAL)
                 continue
-
-            log_header(f"Sampler turn – task_id={rotation_index}")
-            # Lease the turn so a returning primary and a failover backup can't both sample it.
-            try:
-                claim = await api_client.claim_task(rotation_index)
-            except Exception as e:
-                log(f"Could not claim sampling turn {rotation_index}: {e}; will retry", "warn")
-                await asyncio.sleep(SAMPLER_POLL_INTERVAL)
-                continue
-            if not claim.get("granted"):
-                holder = claim.get("holder")
-                reason = "already produced" if claim.get("already_produced") else f"held by {str(holder)[:12]}…"
-                log(f"Standing down on turn {rotation_index} ({reason})", "info")
+            if view.produced:
+                # Already produced this window (e.g. we restarted after sampling it); stand down.
                 last_sampled_index = rotation_index
                 await asyncio.sleep(SAMPLER_POLL_INTERVAL)
                 continue
+
+            log_header(f"Sampler turn – task_id={rotation_index} (failover step {view.failover_step})")
 
             # Locally-validated miners (this validator's own validation, not the owner-api's).
             valid_miners = local_valid_miners()
@@ -156,32 +154,23 @@ async def run_sampler_loop() -> None:
                         eval_entries,
                         signature=signature,
                     )
-                    # 4. Dual-report to the API for the dashboard (best-effort).
+                    # 4. Best-effort dual-report to the owner-api for the dashboard (the dashboard
+                    #    derives the produced-task window from these samples; not consensus-critical).
                     try:
                         await api_client.submit_samples_batch(
                             samples_payload, evaluation_signature=signature
                         )
                     except Exception as e:
                         log(f"Dashboard dual-report failed: {e}", "warn")
-                # 5. Announce so the dashboard/peers can discover this task.
-                await api_client.announce_task(result.task_id)
                 last_sampled_index = rotation_index
                 log(
                     f"Task {result.task_id}: published + self-evaluated "
-                    f"({len(eval_entries)}/{len(result.miner_paths)} miners) and announced",
+                    f"({len(eval_entries)}/{len(result.miner_paths)} miners)",
                     "success",
                 )
             finally:
                 cleanup(result)
 
-        except PermissionError:
-            if not not_permissioned_logged:
-                log(
-                    "GET /rotation denied (403): this hotkey is not a permissioned sampler. "
-                    "Idling; will retry in case the allowlist changes.",
-                    "warn",
-                )
-                not_permissioned_logged = True
         except Exception as e:
             log(f"Sampler error: {e}", "error")
             log_exception("Sampler error", e)

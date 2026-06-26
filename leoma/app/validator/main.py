@@ -53,21 +53,13 @@ async def run_epoch(
     log(f"[{block}] Aggregating peer evaluation results locally (equal weight)", "info")
     winner_uid = 0
     try:
-        from leoma.infra.remote_api import create_api_client_from_wallet
         from leoma.app.validator.aggregate_local import compute_local_winner
-        api_client = create_api_client_from_wallet(
-            wallet_name=WALLET_NAME,
-            hotkey_name=HOTKEY_NAME,
-            api_url=API_URL,
-        )
-        try:
-            # block is the epoch-boundary block (block % EPOCH_LEN == 0), identical across validators
-            # running this epoch, so the block-derived scoring window is identical for all of them.
-            winner_uid, winner_hotkey = await compute_local_winner(api_client, epoch_block=block)
-            if winner_hotkey:
-                log(f"[{block}] Local winner: uid={winner_uid} hotkey={winner_hotkey[:12]}...", "info")
-        finally:
-            await api_client.close()
+
+        # block is the epoch-boundary block (block % EPOCH_LEN == 0), identical across validators
+        # running this epoch, so the on-chain allowlist + block-derived window are identical for all.
+        winner_uid, winner_hotkey = await compute_local_winner(subtensor, epoch_block=block)
+        if winner_hotkey:
+            log(f"[{block}] Local winner: uid={winner_uid} hotkey={winner_hotkey[:12]}...", "info")
     except Exception as e:
         log(f"[{block}] Local aggregation failed: {e}; setting UID 0 (burn alpha)", "error")
 

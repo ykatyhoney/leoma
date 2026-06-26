@@ -1,10 +1,15 @@
-"""Shared scoring-window settings (block-derived, so all validators agree by construction)."""
+"""Shared scoring-window settings.
+
+The window is the last N *produced* tasks (derived from peer-bucket producedness by validators, and
+from the dual-reported ``validator_samples`` for the dashboard) — not a block-number range — so a
+skipped rotation turn doesn't dilute it. These constants make every validator size + settle the
+window identically.
+"""
 
 import math
 import os
-from typing import List, Optional
 
-# Consecutive task_id window length (N IDs ending at the settled window end).
+# Number of produced tasks in the scoring window (the last N produced/distinct task_ids).
 SCORER_TASK_WINDOW = int(os.environ.get("SCORER_TASK_WINDOW", "100"))
 
 # Hard cap on how far back (in blocks) the production-based window may reach. Bounds the wall-clock
@@ -19,45 +24,6 @@ SCORER_MAX_LOOKBACK_BLOCKS = int(os.environ.get("SCORER_MAX_LOOKBACK_BLOCKS", "3
 # so two validators reading at slightly different instants always see identical inputs. Default 2 covers
 # a sampler that overruns its ~20-min turn.
 SCORER_SETTLE_MARGIN = int(os.environ.get("SCORER_SETTLE_MARGIN", "2"))
-
-
-def settled_window_end(block: int, interval: int, margin: Optional[int] = None) -> int:
-    """The most-recent SETTLED rotation index at ``block``: ``floor(block / interval) - margin``.
-
-    Derived purely from the consensus block + interval, so every validator that runs an epoch at
-    the same block computes the same value (no dependence on a mutable announced ``latest_task_id``).
-    """
-    if margin is None:
-        margin = SCORER_SETTLE_MARGIN
-    if interval <= 0:
-        interval = 1
-    return (block // interval) - margin
-
-
-def window_task_ids_ending_at(window_end: Optional[int]) -> Optional[List[int]]:
-    """The ``SCORER_TASK_WINDOW`` consecutive task_ids ending at ``window_end`` (inclusive).
-
-    Returns ``None`` when ``window_end`` is ``None`` or negative (subnet too young to have a settled
-    window). The lower bound is clamped to 0 so an early subnet yields a shorter window rather than
-    negative ids.
-    """
-    if window_end is None or window_end < 0:
-        return None
-    start = max(0, window_end - SCORER_TASK_WINDOW + 1)
-    return list(range(start, window_end + 1))
-
-
-def scoring_window_task_ids(max_task_id: Optional[int]) -> Optional[List[int]]:
-    """Legacy helper: window ending at a known ``max_task_id`` (no settle margin).
-
-    Prefer ``settled_window_end`` + ``window_task_ids_ending_at`` (block-derived). Kept for any
-    caller that already has a concrete max task id.
-    """
-    if max_task_id is None:
-        return None
-    if max_task_id < SCORER_TASK_WINDOW:
-        return list(range(1, max_task_id + 1))
-    return list(range(max_task_id - SCORER_TASK_WINDOW + 1, max_task_id + 1))
 
 
 # Fraction of the window's existing tasks a miner must have been evaluated on to rank (e.g. 0.8 = 80%).

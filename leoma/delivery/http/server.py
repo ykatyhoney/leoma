@@ -69,14 +69,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     await init_database()
     emit_log("Database initialized", "success")
     await _create_tables_if_needed()
-    # Seed the produced-task scoring ledger from historical samples if it's empty (idempotent),
-    # so the scoring window isn't blank on a fresh deploy until live announces accrue.
-    try:
-        from leoma.infra.ledger_backfill import backfill_produced_task_ledger
-
-        await backfill_produced_task_ledger(only_if_empty=True)
-    except Exception as e:
-        emit_log(f"Produced-task ledger backfill skipped: {e}", "warn")
     _start_background_tasks()
     emit_log("Background tasks started", "success")
     yield
