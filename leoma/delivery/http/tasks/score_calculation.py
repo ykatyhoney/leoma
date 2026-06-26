@@ -208,12 +208,11 @@ class ScoreCalculationTask:
                 )
 
     async def _run_scorer(self) -> None:
-        """Per-validator-average scorer over a consecutive task_id window of SCORER_TASK_WINDOW.
+        """Pooled-pass-rate scorer over the last SCORER_TASK_WINDOW produced tasks.
 
-        Self-evaluation model: each task has one verdict (from its sampler). To weight validators
-        equally, a miner's score is the MEAN of each validator's pass-rate over that validator's
-        own tasks (identical to the on-chain ``aggregate_per_validator_average``). Window =
-        [max_task_id - N + 1, max_task_id]; no rankings until max_task_id >= N. Writes
+        Self-evaluation model: each task has one verdict (from its sampler). A miner's score is the
+        pooled pass-rate total_passed / total_evaluated over the window (identical to the on-chain
+        ``aggregate_scores``), gated by completeness + per-validator completeness. Writes
         miner_task_ranks (completeness/eligibility) and miner_ranks (dominance rank) for the
         dashboard's /scores/rank and /weights.
         """
@@ -254,7 +253,7 @@ class ScoreCalculationTask:
             aggregates, set(), DOMINANCE_THRESHOLD, min_distinct_validators=min_distinct
         )
 
-        # miner_ranks: eligible miners ranked by mean per-validator rate (drives /weights, /rank).
+        # miner_ranks: eligible miners ranked by pooled pass-rate (drives /weights, /rank).
         await self.miner_rank_dao.replace_all(rank_entries)
 
         # miner_task_ranks: completeness + totals for the eligible set (eligibility display).

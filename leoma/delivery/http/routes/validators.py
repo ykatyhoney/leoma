@@ -23,6 +23,7 @@ from leoma.delivery.http.dashboard_service import compute_validator_participatio
 from leoma.delivery.http.routes.rotation import current_scoring_window, ordered_validators
 from leoma.delivery.http.validators import validate_validator_hotkey
 from leoma.delivery.http.verifier import verify_admin_signature
+from leoma.infra.allowlist import VALIDATOR_ALLOWLIST
 from leoma.infra.db.stores import RankStore, SampleStore, ValidatorStore
 
 
@@ -55,14 +56,15 @@ async def _window_participation():
     return compute_validator_participation(samples, await ordered_validators(), window)
 
 
-def _card(validator, participation, permissioned: bool) -> ValidatorCard:
-    p = participation.get(validator.hotkey)
+def _card(hotkey: str, validator, participation) -> ValidatorCard:
+    """Build a card for an allowlisted hotkey; ``validator`` is its DB row (uid/stake) or None."""
+    p = participation.get(hotkey)
     return ValidatorCard(
-        uid=validator.uid,
-        hotkey=validator.hotkey,
-        stake=float(validator.stake),
-        permissioned=permissioned,
-        online=_is_online(validator.last_seen_at),
+        uid=validator.uid if validator else 0,
+        hotkey=hotkey,
+        stake=float(validator.stake) if validator else 0.0,
+        permissioned=True,
+        online=_is_online(validator.last_seen_at) if validator else False,
         last_sampled_task_id=p.last_task_id if p else None,
         last_sampled_at=_iso(p.last_evaluated_at) if p else None,
         tasks_sampled=p.tasks_sampled if p else 0,
@@ -75,13 +77,14 @@ def _card(validator, participation, permissioned: bool) -> ValidatorCard:
 
 @router.get("", response_model=List[ValidatorCard])
 async def list_validators() -> List[ValidatorCard]:
-    """All registered validators with liveness + rotation participation. Public.
+    """The hardcoded permissioned validator allowlist with liveness + rotation participation. Public.
 
-    Every registered validator is owner-managed and permissioned (it samples + sets weights).
+    Membership is the repo allowlist (the consensus source of truth); uid/stake come from the DB row
+    when the owner has seeded one for display, else 0.
     """
-    validators = await validators_dao.get_all_validators()
+    by_hotkey = {v.hotkey: v for v in await validators_dao.get_all_validators()}
     participation = await _window_participation()
-    cards = [_card(v, participation, True) for v in validators]
+    cards = [_card(hk, by_hotkey.get(hk), participation) for hk in sorted(set(VALIDATOR_ALLOWLIST))]
     cards.sort(key=lambda c: -c.participation_rate)
     return cards
 

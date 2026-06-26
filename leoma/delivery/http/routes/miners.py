@@ -132,7 +132,7 @@ async def get_active_miners() -> List[ActiveMinerEntry]:
     window = await current_scoring_window() or []
     samples = await validator_samples_dao.get_samples_in_task_window(window) if window else []
     activity = compute_miner_activity(samples)
-    # Windowed per-validator-average for EVERY active miner (ranked or not), so the score column
+    # Windowed pooled pass-rate for EVERY active miner (ranked or not), so the score column
     # is one consistent metric — not a lifetime mean for unranked rows.
     aggregates = compute_miner_aggregates(
         {(s.validator_hotkey, s.task_id, s.miner_hotkey): bool(s.passed) for s in samples},
@@ -150,7 +150,7 @@ async def get_active_miners() -> List[ActiveMinerEntry]:
         ag = aggregates.get(hk)
         completeness = ag.completeness if ag else 0.0
         eligible = completeness >= COMPLETENESS_ELIGIBILITY_THRESHOLD - 1e-9
-        score = float(r.pass_rate) if r is not None else (float(ag.avg_rate) if ag else 0.0)
+        score = float(r.pass_rate) if r is not None else (float(ag.score) if ag else 0.0)
         entries.append(
             ActiveMinerEntry(
                 uid=m.uid,

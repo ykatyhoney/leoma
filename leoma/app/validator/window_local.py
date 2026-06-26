@@ -1,7 +1,7 @@
 """Local scoring-window derivation (no owner-api ledger).
 
 Instead of asking the owner-api ``GET /tasks/window``, each validator reconstructs the settled
-window itself from the on-chain allowlist + the peer buckets it already reads:
+window itself from the hardcoded allowlist + the peer buckets it already reads:
 
   1. list every validator's bucket for the rotations it published a verdict for;
   2. resolve the canonical sampler per rotation (the primary, or the earliest failover backup that

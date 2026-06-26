@@ -349,57 +349,6 @@ def validator_remove(hotkey: str):
     _run_async(run())
 
 
-@validator.command("publish")
-@click.option("--interval", type=int, default=None,
-              help="Rotation interval in blocks (default SAMPLING_ROTATION_INTERVAL).")
-def validator_publish(interval):
-    """Anchor the current allowlist ON-CHAIN so validators read it without the owner-api.
-
-    Writes allowlist/v1.json to the source bucket and commits its sha256 on-chain from the
-    subnet-owner wallet (WALLET_NAME/HOTKEY_NAME must be the subnet owner). Validators verify the
-    file against the on-chain hash and compute rotation + the scoring window locally. Re-run after
-    `leoma validator add/remove` to push changes.
-    """
-    import bittensor as bt
-    from leoma.bootstrap import (
-        emit_log as log, WALLET_NAME, HOTKEY_NAME, NETWORK, NETUID,
-        SOURCE_BUCKET, SAMPLING_ROTATION_INTERVAL,
-    )
-
-    async def run():
-        from leoma.infra.remote_api import APIClient
-        from leoma.infra.storage_backend import create_source_write_client
-        from leoma.infra.onchain_allowlist import publish_allowlist
-
-        client = APIClient(api_url=_api_url())
-        try:
-            validators = await client.get_validators()
-        finally:
-            await client.close()
-        hotkeys = [v["hotkey"] for v in validators if v.get("hotkey")]
-        if not hotkeys:
-            log("No validators in the allowlist; add some first (leoma validator add ...)", "error")
-            return
-
-        eff_interval = interval or SAMPLING_ROTATION_INTERVAL
-        wallet = bt.Wallet(name=WALLET_NAME, hotkey=HOTKEY_NAME)
-        subtensor = bt.AsyncSubtensor(network=NETWORK)
-        write_client = create_source_write_client()
-        try:
-            digest = await publish_allowlist(
-                subtensor, wallet, NETUID, write_client, SOURCE_BUCKET, hotkeys, eff_interval
-            )
-            log(
-                f"Published allowlist on-chain: {len(hotkeys)} validators, "
-                f"interval={eff_interval}, digest={digest[:16]}…",
-                "success",
-            )
-        finally:
-            await subtensor.close()
-
-    _run_async(run())
-
-
 @cli.group()
 def corpus():
     """Video corpus management commands.

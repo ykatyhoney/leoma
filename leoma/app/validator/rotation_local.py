@@ -1,8 +1,8 @@
 """Local rotation resolution (owner-api-free).
 
-Whose turn it is to sample is a deterministic function of the current chain block and the on-chain
-allowlist, so each validator computes it itself — there is no ``GET /rotation``. Failover is purely
-block-derived, and "did the scheduled sampler already produce this rotation?" is read from its
+Whose turn it is to sample is a deterministic function of the current chain block and the hardcoded
+validator allowlist, so each validator computes it itself — there is no ``GET /rotation``. Failover is
+purely block-derived, and "did the scheduled sampler already produce this rotation?" is read from its
 bucket, so there is no claim lease either. Duplicate production during a failover race is harmless:
 the window's canonical-sampler resolution deterministically keeps the earliest-failover-order producer.
 """
@@ -11,15 +11,13 @@ import os
 from dataclasses import dataclass
 from typing import List, Optional
 
-from leoma.bootstrap import NETUID, SOURCE_BUCKET, emit_log as log
-from leoma.infra.onchain_allowlist import AllowlistSnapshot, read_allowlist
+from leoma.bootstrap import SAMPLING_ROTATION_INTERVAL, emit_log as log
+from leoma.infra.allowlist import load_allowlist
 from leoma.infra.peer_registry import load_peers
 from leoma.infra.rotation_math import compute_sampler, effective_sampler, grace_blocks_for
-from leoma.infra.storage_backend import create_peer_read_client, create_source_read_client
+from leoma.infra.storage_backend import create_peer_read_client
 
 _GRACE_OVERRIDE = int(os.environ.get("SAMPLER_FAILOVER_GRACE_BLOCKS", "0"))
-# Re-read the on-chain allowlist at most this often (blocks); cheap to cache between.
-_ALLOWLIST_REFRESH_BLOCKS = int(os.environ.get("ALLOWLIST_REFRESH_BLOCKS", "300"))
 
 
 @dataclass
@@ -34,23 +32,11 @@ class RotationView:
 
 
 class LocalRotation:
-    """Resolves the current sampling turn from chain block + on-chain allowlist (no owner-api)."""
+    """Resolves the current sampling turn from chain block + hardcoded allowlist (no owner-api)."""
 
-    def __init__(self, subtensor, my_hotkey: str, source_read_client=None):
+    def __init__(self, subtensor, my_hotkey: str):
         self._sub = subtensor
         self._me = my_hotkey
-        self._source = source_read_client
-        self._snap: Optional[AllowlistSnapshot] = None
-        self._snap_block = -10**9
-
-    async def _allowlist(self, block: int) -> Optional[AllowlistSnapshot]:
-        if self._snap is None or block - self._snap_block >= _ALLOWLIST_REFRESH_BLOCKS:
-            snap = await read_allowlist(
-                self._sub, NETUID, self._source or create_source_read_client(), SOURCE_BUCKET
-            )
-            if snap is not None:
-                self._snap, self._snap_block = snap, block
-        return self._snap
 
     async def _produced(self, rotation_id: int, sampler: Optional[str]) -> bool:
         """True if ``sampler`` has already published a verdict file for ``rotation_id``."""
@@ -71,15 +57,13 @@ class LocalRotation:
             return False
 
     async def whose_turn(self) -> Optional[RotationView]:
-        """Current rotation view, or ``None`` if the chain/allowlist can't be read (caller idles)."""
+        """Current rotation view, or ``None`` if the chain block can't be read (caller idles)."""
         try:
             block = int(await self._sub.get_current_block())
         except Exception as e:
             log(f"Could not read current block: {e}", "warn")
             return None
-        snap = await self._allowlist(block)
-        if snap is None:
-            return None
+        snap = load_allowlist(SAMPLING_ROTATION_INTERVAL)
         validators, interval = snap.validators, snap.interval
         rid = block // max(1, interval)
         primary = compute_sampler(validators, rid)

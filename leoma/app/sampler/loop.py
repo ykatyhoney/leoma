@@ -2,7 +2,7 @@
 Per-validator sampler loop (decentralized task generation).
 
 Each permissioned validator runs this loop. Whose turn it is to sample is computed LOCALLY from the
-current chain block + the on-chain-anchored allowlist (no owner-api): on its turn it samples its
+current chain block + the hardcoded validator allowlist (no owner-api): on its turn it samples its
 locally-validated miners once for the window (``task_id == rotation_index``), self-evaluates, and
 publishes the artifacts + signed verdicts to its OWN bucket. It then best-effort announces and
 dual-reports to the owner-api for the dashboard only. Only one validator samples per window.
@@ -66,17 +66,17 @@ async def run_sampler_loop() -> None:
 
     from leoma.app.validator.rotation_local import LocalRotation
     subtensor = bt.AsyncSubtensor(network=NETWORK)
-    local_rotation = LocalRotation(subtensor, api_client.hotkey, source_read_client=source_client)
+    local_rotation = LocalRotation(subtensor, api_client.hotkey)
 
     log_header("Validator Sampler Starting")
     log(f"Own result bucket: {R2_OWN_BUCKET}", "info")
-    log(f"Rotation: on-chain allowlist (local); poll={SAMPLER_POLL_INTERVAL}s", "info")
+    log(f"Rotation: hardcoded allowlist (local); poll={SAMPLER_POLL_INTERVAL}s", "info")
 
     last_sampled_index: int | None = None
 
     while True:
         try:
-            # Whose turn is computed locally from the chain block + on-chain allowlist (no owner-api).
+            # Whose turn is computed locally from the chain block + hardcoded allowlist (no owner-api).
             view = await local_rotation.whose_turn()
             if view is None:
                 # Chain / allowlist unreadable right now (or our hotkey isn't allowlisted yet); idle.
