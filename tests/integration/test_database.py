@@ -19,22 +19,13 @@ class TestEvaluationPersistenceFlow:
         integration_participant_store,
         integration_evaluation_store,
         integration_rank_store,
-        integration_validator_store,
         test_hotkeys,
     ):
         """Persist task evaluations, aggregate stats, and write scores."""
         validator_hotkey = test_hotkeys[0]
         miner_hotkeys = test_hotkeys[1:4]
 
-        # 1. Create a validator
-        await integration_validator_store.save_validator(
-            uid=0,
-            hotkey=validator_hotkey,
-            stake=10000.0,
-            s3_bucket="validator-evaluations",
-        )
-
-        # 2. Create miners
+        # 1. Create miners
         for i, hotkey in enumerate(miner_hotkeys):
             await integration_participant_store.save_miner(
                 uid=i,
@@ -88,7 +79,6 @@ class TestEvaluationPersistenceFlow:
         self,
         integration_participant_store,
         integration_evaluation_store,
-        integration_validator_store,
         test_hotkeys,
     ):
         """Multiple validators can evaluate the same miner across different tasks."""
@@ -103,14 +93,8 @@ class TestEvaluationPersistenceFlow:
             is_valid=True,
         )
 
-        # Create validators and persist evaluations
+        # Persist evaluations from multiple validators
         for i, validator_hotkey in enumerate(validator_hotkeys):
-            await integration_validator_store.save_validator(
-                uid=i,
-                hotkey=validator_hotkey,
-                stake=10000.0 + i * 1000,
-            )
-
             for j in range(3):
                 await integration_evaluation_store.save_sample(
                     validator_hotkey=validator_hotkey,
@@ -137,19 +121,11 @@ class TestConcurrentWrites:
     async def test_concurrent_task_evaluation_writes(
         self,
         integration_evaluation_store,
-        integration_validator_store,
         test_hotkeys,
     ):
         """Concurrent evaluation writes should not conflict."""
         validator_hotkey = test_hotkeys[0]
         miner_hotkeys = test_hotkeys[1:4]
-
-        # Create validator
-        await integration_validator_store.save_validator(
-            uid=0,
-            hotkey=validator_hotkey,
-            stake=10000.0,
-        )
 
         # Concurrent writes
         async def write_evaluation(miner_hotkey: str, index: int):
@@ -327,28 +303,6 @@ class TestDatabaseConstraints:
         assert len(evaluations) == 1
         assert evaluations[0].passed is False
         assert evaluations[0].confidence == 90
-
-    async def test_unique_validator_hotkey_constraint(
-        self,
-        integration_validator_store,
-        test_hotkeys,
-    ):
-        """Test that validator hotkey must be unique."""
-        # Create validator
-        await integration_validator_store.save_validator(
-            uid=0,
-            hotkey=test_hotkeys[0],
-            stake=10000.0,
-        )
-
-        # Attempt to create with same hotkey but different UID should fail
-        with pytest.raises(Exception):  # IntegrityError
-            await integration_validator_store.save_validator(
-                uid=1,
-                hotkey=test_hotkeys[0],
-                stake=20000.0,
-            )
-
 
 class TestDeleteOperations:
     """Tests for delete operations."""
