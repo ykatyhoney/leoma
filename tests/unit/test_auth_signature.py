@@ -183,115 +183,53 @@ class TestSignatureVerifierWithRealKeypair:
         except ImportError:
             pytest.skip("substrateinterface not available")
 
-    async def test_verify_request_with_valid_signature(self, keypair):
-        """Test verify_request accepts valid signature when hotkey is in validator list."""
+    def _verifier(self, monkeypatch, allowlist, admins=()):
+        monkeypatch.setattr("leoma.delivery.http.verifier.VALIDATOR_ALLOWLIST", list(allowlist))
+        monkeypatch.setattr("leoma.delivery.http.verifier.ADMIN_HOTKEYS", list(admins))
+        verifier = SignatureVerifier()
         mock_blacklist = MagicMock()
         mock_blacklist.is_blacklisted = AsyncMock(return_value=False)
-
-        mock_validators = MagicMock()
-        mock_validators.get_validator_by_hotkey = AsyncMock(return_value=MagicMock())
-        mock_validators.update_last_seen = AsyncMock(return_value=True)
-
-        verifier = SignatureVerifier()
         verifier.blacklist_store = mock_blacklist
-        verifier.validator_store = mock_validators
+        return verifier
 
+    async def test_verify_request_with_valid_signature(self, keypair, monkeypatch):
+        """verify_request accepts a valid signature when the hotkey is in the hardcoded allowlist."""
+        verifier = self._verifier(monkeypatch, allowlist=[keypair.ss58_address])
         body = b'{"test": "data"}'
         timestamp = str(int(time.time()))
-
-        # Generate valid signature
         signature = sign_message(keypair, body, timestamp)
 
         is_valid, error = await verifier.verify_request(
-            body=body,
-            hotkey=keypair.ss58_address,
-            signature=signature,
-            timestamp=timestamp,
+            body=body, hotkey=keypair.ss58_address, signature=signature, timestamp=timestamp,
         )
-
         assert is_valid is True
         assert error is None
 
-    async def test_verify_request_updates_last_seen_on_success(self, keypair):
-        """Test verify_request updates last_seen on successful verification."""
-        mock_blacklist = MagicMock()
-        mock_blacklist.is_blacklisted = AsyncMock(return_value=False)
-
-        mock_validators = MagicMock()
-        mock_validators.get_validator_by_hotkey = AsyncMock(return_value=MagicMock())
-        mock_validators.update_last_seen = AsyncMock(return_value=True)
-
-        verifier = SignatureVerifier()
-        verifier.blacklist_store = mock_blacklist
-        verifier.validator_store = mock_validators
-
-        body = b'{"test": "data"}'
-        timestamp = str(int(time.time()))
-        signature = sign_message(keypair, body, timestamp)
-
-        await verifier.verify_request(
-            body=body,
-            hotkey=keypair.ss58_address,
-            signature=signature,
-            timestamp=timestamp,
-        )
-
-        mock_validators.update_last_seen.assert_called_once_with(keypair.ss58_address)
-
-    async def test_verify_request_rejects_valid_signature_when_not_in_validator_list(self, keypair):
-        """Test verify_request rejects when signature is valid but hotkey not in validator list."""
-        mock_blacklist = MagicMock()
-        mock_blacklist.is_blacklisted = AsyncMock(return_value=False)
-        mock_validators = MagicMock()
-        mock_validators.get_validator_by_hotkey = AsyncMock(return_value=None)
-
-        verifier = SignatureVerifier()
-        verifier.blacklist_store = mock_blacklist
-        verifier.validator_store = mock_validators
-
+    async def test_verify_request_rejects_valid_signature_when_not_in_allowlist(self, keypair, monkeypatch):
+        """A valid signature from a hotkey absent from the allowlist is rejected."""
+        verifier = self._verifier(monkeypatch, allowlist=[])
         body = b'{"test": "data"}'
         timestamp = str(int(time.time()))
         signature = sign_message(keypair, body, timestamp)
 
         is_valid, error = await verifier.verify_request(
-            body=body,
-            hotkey=keypair.ss58_address,
-            signature=signature,
-            timestamp=timestamp,
+            body=body, hotkey=keypair.ss58_address, signature=signature, timestamp=timestamp,
         )
-
         assert is_valid is False
-        assert "Validator not registered" in (error or "")
+        assert "Not a permissioned validator" in (error or "")
 
-    async def test_verify_request_allows_admin_without_validator_list(self, keypair, monkeypatch):
-        """Test verify_request allows admin hotkey even when not in validator list."""
-        monkeypatch.setattr(
-            "leoma.delivery.http.verifier.ADMIN_HOTKEYS",
-            [keypair.ss58_address],
-        )
-        mock_blacklist = MagicMock()
-        mock_blacklist.is_blacklisted = AsyncMock(return_value=False)
-        mock_validators = MagicMock()
-        mock_validators.get_validator_by_hotkey = AsyncMock(return_value=None)
-
-        verifier = SignatureVerifier()
-        verifier.blacklist_store = mock_blacklist
-        verifier.validator_store = mock_validators
-
+    async def test_verify_request_allows_admin_without_allowlist(self, keypair, monkeypatch):
+        """An admin hotkey is accepted even when absent from the validator allowlist."""
+        verifier = self._verifier(monkeypatch, allowlist=[], admins=[keypair.ss58_address])
         body = b'{"test": "data"}'
         timestamp = str(int(time.time()))
         signature = sign_message(keypair, body, timestamp)
 
         is_valid, error = await verifier.verify_request(
-            body=body,
-            hotkey=keypair.ss58_address,
-            signature=signature,
-            timestamp=timestamp,
+            body=body, hotkey=keypair.ss58_address, signature=signature, timestamp=timestamp,
         )
-
         assert is_valid is True
         assert error is None
-        mock_validators.get_validator_by_hotkey.assert_not_called()
 
 
 class TestSignMessage:

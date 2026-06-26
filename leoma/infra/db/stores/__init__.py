@@ -9,7 +9,6 @@ from leoma.infra.db.stores.store_participant import ParticipantStore
 from leoma.infra.db.stores.store_rank import RankStore
 from leoma.infra.db.stores.store_sample import SampleStore
 from leoma.infra.db.stores.store_sampling_state import SamplingStateStore
-from leoma.infra.db.stores.store_validator import ValidatorStore
 
 __all__ = [
     "BlacklistStore",
@@ -21,5 +20,4 @@ __all__ = [
     "RankStore",
     "SampleStore",
     "SamplingStateStore",
-    "ValidatorStore",
 ]

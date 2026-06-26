@@ -235,28 +235,6 @@ class APIClient:
     async def remove_from_blacklist(self, hotkey: str) -> Dict[str, Any]:
         return await self._request("DELETE", f"/blacklist/{hotkey}", require_auth=True)
 
-    async def get_validators(self) -> List[Dict[str, Any]]:
-        """All registered validators (public)."""
-        return await self._request("GET", "/validators", require_auth=False)
-
-    async def register_validator(
-        self, hotkey: str, uid: Optional[int] = None, stake: Optional[float] = None
-    ) -> Dict[str, Any]:
-        """Add/update a validator in the owner-managed allowlist (admin).
-
-        ``uid``/``stake`` are resolved from the metagraph server-side when omitted.
-        """
-        data: Dict[str, Any] = {"hotkey": hotkey}
-        if uid is not None:
-            data["uid"] = uid
-        if stake is not None:
-            data["stake"] = stake
-        return await self._request("POST", "/validators", data=data, require_auth=True)
-
-    async def remove_validator(self, hotkey: str) -> Dict[str, Any]:
-        """Remove a validator from the owner-managed allowlist (admin)."""
-        return await self._request("DELETE", f"/validators/{hotkey}", require_auth=True)
-
     async def health_check(self) -> Dict[str, Any]:
         return await self._request("GET", "/health", require_auth=False)
 

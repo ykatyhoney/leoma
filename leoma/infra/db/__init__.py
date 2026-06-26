@@ -18,7 +18,6 @@ from leoma.infra.db.tables import (
     RankScore,
     SamplingState,
     ValidMiner,
-    Validator,
     ValidatorSample,
 )
 from leoma.infra.db.stores import (
@@ -30,7 +29,6 @@ from leoma.infra.db.stores import (
     RankStore,
     SampleStore,
     SamplingStateStore,
-    ValidatorStore,
 )
 
 __all__ = [
@@ -50,9 +48,7 @@ __all__ = [
     "SamplingState",
     "SamplingStateStore",
     "ValidMiner",
-    "Validator",
     "ValidatorSample",
-    "ValidatorStore",
     "close_database",
     "create_tables",
     "drop_tables",

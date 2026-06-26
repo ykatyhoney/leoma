@@ -28,13 +28,13 @@ from leoma.delivery.http.routes.rotation import (
     current_scoring_window,
     current_scoring_window_rows,
 )
+from leoma.infra.allowlist import VALIDATOR_ALLOWLIST
 from leoma.infra.db.stores import (
     MinerRankStore,
     MinerTaskRankStore,
     ParticipantStore,
     RankStore,
     SampleStore,
-    ValidatorStore,
 )
 
 
@@ -51,7 +51,6 @@ class ScoreCalculationTask:
     def __init__(self):
         self.validator_samples_dao = SampleStore()
         self.rank_scores_dao = RankStore()
-        self.validators_dao = ValidatorStore()
         self.valid_miners_dao = ParticipantStore()
         self.miner_task_rank_dao = MinerTaskRankStore()
         self.miner_rank_dao = MinerRankStore()
@@ -155,17 +154,17 @@ class ScoreCalculationTask:
         if removed > 0:
             log(f"Removed {removed} scores for invalid miners", "info")
 
-        validators = await self.validators_dao.get_all_validators()
+        validators = sorted(set(VALIDATOR_ALLOWLIST))
 
         if not validators:
-            log("No validators found", "info")
+            log("No validators in the allowlist", "info")
             return
 
         total_scores = 0
 
-        for validator in validators:
+        for validator_hotkey in validators:
             stats = await self.validator_samples_dao.get_miner_stats_by_validator(
-                validator.hotkey
+                validator_hotkey
             )
 
             if not stats:
@@ -177,7 +176,7 @@ class ScoreCalculationTask:
                 continue
 
             count = await self.rank_scores_dao.batch_save_scores(
-                validator_hotkey=validator.hotkey,
+                validator_hotkey=validator_hotkey,
                 scores=scores_to_save,
             )
             total_scores += count

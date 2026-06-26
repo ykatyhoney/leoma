@@ -363,16 +363,6 @@ class ValidatorCard(BaseModel):
     avg_latency_ms: Optional[int] = None
 
 
-class ValidatorRegistration(BaseModel):
-    """Admin request to add a validator to the owner-managed allowlist.
-
-    ``uid`` and ``stake`` are auto-resolved from the metagraph (by hotkey) when omitted.
-    """
-    hotkey: str = Field(..., min_length=1, max_length=48, description="Validator SS58 hotkey.")
-    uid: Optional[int] = Field(None, ge=0, description="Validator UID; auto-resolved from the metagraph if omitted.")
-    stake: Optional[float] = Field(None, ge=0, description="Informational stake; auto-resolved from the metagraph if omitted.")
-
-
 class ValidatorMinerScore(BaseModel):
     miner_hotkey: str
     pass_rate: float

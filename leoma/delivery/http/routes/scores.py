@@ -30,14 +30,12 @@ from leoma.infra.db.stores import (
     ParticipantStore,
     RankStore,
     SampleStore,
-    ValidatorStore,
 )
 from leoma.infra.scorer_constants import COMPLETENESS_ELIGIBILITY_THRESHOLD
 
 router = APIRouter()
 rank_scores_dao = RankStore()
 validator_samples_dao = SampleStore()
-validators_dao = ValidatorStore()
 miner_rank_dao = MinerRankStore()
 miner_task_rank_dao = MinerTaskRankStore()
 valid_miners_dao = ParticipantStore()

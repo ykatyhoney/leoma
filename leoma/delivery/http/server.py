@@ -30,7 +30,6 @@ from leoma.delivery.http.routes import (
 from leoma.delivery.http.tasks import (
     MinerConsensusTask,
     ScoreCalculationTask,
-    ValidatorSyncTask,
 )
 
 _background_tasks: list[asyncio.Task] = []
@@ -48,10 +47,8 @@ async def _create_tables_if_needed() -> None:
 def _start_background_tasks() -> None:
     miner_task = MinerConsensusTask()
     score_task = ScoreCalculationTask()
-    validator_sync_task = ValidatorSyncTask()
     _background_tasks.append(asyncio.create_task(miner_task.run()))
     _background_tasks.append(asyncio.create_task(score_task.run()))
-    _background_tasks.append(asyncio.create_task(validator_sync_task.run()))
 
 
 async def _stop_background_tasks() -> None:

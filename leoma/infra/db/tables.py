@@ -129,18 +129,6 @@ class Blacklist(Base):
     created_at: Mapped[datetime] = _utc_timestamp_column()
 
 
-class Validator(Base):
-    """Registered validators."""
-    __tablename__ = "validators"
-
-    uid: Mapped[int] = mapped_column(Integer, primary_key=True)
-    hotkey: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
-    stake: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
-    s3_bucket: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-    last_seen_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
-    created_at: Mapped[datetime] = _utc_timestamp_column()
-
-
 class EvaluationSignature(Base):
     """Validator signature over evaluation result payload for a task."""
     __tablename__ = "evaluation_signatures"
