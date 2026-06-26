@@ -13,22 +13,13 @@ class TestValidatorEvaluationFlow:
         self,
         integration_participant_store,
         integration_evaluation_store,
-        integration_validator_store,
         test_hotkeys,
     ):
         """Persist validator task reviews and verify derived stats."""
         validator_hotkey = test_hotkeys[0]
         miner_hotkeys = test_hotkeys[1:4]
 
-        # 1. Setup: Register validator
-        await integration_validator_store.save_validator(
-            uid=0,
-            hotkey=validator_hotkey,
-            stake=15000.0,
-            s3_bucket="validator-bucket",
-        )
-
-        # 2. Setup: Create valid miners
+        # 1. Setup: Create valid miners
         for i, hotkey in enumerate(miner_hotkeys):
             await integration_participant_store.save_miner(
                 uid=i,
@@ -81,18 +72,10 @@ class TestValidatorEvaluationFlow:
     async def test_batch_task_evaluation_submission(
         self,
         integration_evaluation_store,
-        integration_validator_store,
         test_hotkeys,
     ):
         """Persist a batch of task evaluations for one validator."""
         validator_hotkey = test_hotkeys[0]
-
-        # Register validator
-        await integration_validator_store.save_validator(
-            uid=0,
-            hotkey=validator_hotkey,
-            stake=10000.0,
-        )
 
         batch_size = 10
         for i in range(batch_size):
@@ -121,7 +104,6 @@ class TestScoreAggregation:
         integration_participant_store,
         integration_evaluation_store,
         integration_rank_store,
-        integration_validator_store,
         test_hotkeys,
     ):
         """Test score aggregation across multiple validators."""
@@ -138,12 +120,6 @@ class TestScoreAggregation:
 
         # Each validator submits samples and we calculate scores
         for i, validator_hotkey in enumerate(validator_hotkeys):
-            await integration_validator_store.save_validator(
-                uid=i,
-                hotkey=validator_hotkey,
-                stake=10000.0 + i * 5000,
-            )
-
             # Submit samples with varying pass rates
             samples_count = 10
             pass_target = 5 + i  # Different pass rates per validator
@@ -186,19 +162,11 @@ class TestScoreAggregation:
         integration_participant_store,
         integration_evaluation_store,
         integration_rank_store,
-        integration_validator_store,
         test_hotkeys,
     ):
         """Derive pass-rate scores from task evaluation rows."""
         validator_hotkey = test_hotkeys[0]
         miner_hotkeys = test_hotkeys[1:4]
-
-        # Setup validator
-        await integration_validator_store.save_validator(
-            uid=0,
-            hotkey=validator_hotkey,
-            stake=20000.0,
-        )
 
         # Setup miners
         for i, hotkey in enumerate(miner_hotkeys):
@@ -316,86 +284,6 @@ class TestBlacklistInFlow:
         retrieved = await integration_blacklist_store.get(hotkey)
         assert retrieved.reason == reason
         assert retrieved.added_by == admin_hotkey
-
-
-class TestValidatorTracking:
-    """Tests for validator registration and tracking."""
-
-    async def test_validator_registration_and_update(
-        self,
-        integration_validator_store,
-        test_hotkeys,
-    ):
-        """Test validator registration and updates."""
-        validator_hotkey = test_hotkeys[0]
-
-        # Initial registration
-        validator = await integration_validator_store.save_validator(
-            uid=0,
-            hotkey=validator_hotkey,
-            stake=10000.0,
-        )
-        assert validator.stake == 10000.0
-
-        # Update stake
-        success = await integration_validator_store.update_stake(
-            hotkey=validator_hotkey,
-            stake=15000.0,
-        )
-        assert success is True
-
-        # Verify update
-        updated = await integration_validator_store.get_validator_by_hotkey(validator_hotkey)
-        assert updated.stake == 15000.0
-
-    async def test_validator_last_seen_tracking(
-        self,
-        integration_validator_store,
-        test_hotkeys,
-    ):
-        """Test validator activity tracking."""
-        validator_hotkey = test_hotkeys[0]
-
-        # Register validator
-        validator = await integration_validator_store.save_validator(
-            uid=0,
-            hotkey=validator_hotkey,
-            stake=10000.0,
-        )
-        original_last_seen = validator.last_seen_at
-
-        # Update last seen
-        success = await integration_validator_store.update_last_seen(validator_hotkey)
-        assert success is True
-
-        # Verify update
-        updated = await integration_validator_store.get_validator_by_hotkey(validator_hotkey)
-        assert updated.last_seen_at >= original_last_seen
-
-    async def test_get_validators_by_stake(
-        self,
-        integration_validator_store,
-        test_hotkeys,
-    ):
-        """Test retrieving validators by stake threshold."""
-        # Create validators with different stakes
-        stakes = [5000.0, 15000.0, 25000.0]
-        for i, (hotkey, stake) in enumerate(zip(test_hotkeys[:3], stakes)):
-            await integration_validator_store.save_validator(
-                uid=i,
-                hotkey=hotkey,
-                stake=stake,
-            )
-
-        # Get validators with stake >= 10000
-        high_stake = await integration_validator_store.get_validators_by_stake(
-            min_stake=10000.0
-        )
-        assert len(high_stake) == 2
-
-        # Should be sorted by stake descending
-        assert high_stake[0].stake == 25000.0
-        assert high_stake[1].stake == 15000.0
 
 
 class TestMinerValidation:

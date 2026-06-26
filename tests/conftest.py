@@ -24,7 +24,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from leoma.infra.db.tables import Base, ValidMiner, ValidatorSample, RankScore, Blacklist, Validator
+from leoma.infra.db.tables import Base, ValidMiner, ValidatorSample, RankScore, Blacklist
 
 
 class AsyncSessionAdapter:
@@ -128,7 +128,6 @@ def mock_get_session(db_session: AsyncSessionAdapter, monkeypatch: pytest.Monkey
         "leoma.infra.db.stores.store_sample",
         "leoma.infra.db.stores.store_rank",
         "leoma.infra.db.stores.store_blacklist",
-        "leoma.infra.db.stores.store_validator",
         "leoma.infra.db.stores.store_sampling_state",
         "leoma.infra.db.stores.store_miner_rank",
         "leoma.infra.db.stores.store_miner_task_rank",
@@ -335,30 +334,6 @@ class BlacklistFactory:
         )
 
 
-class ValidatorFactory:
-    """Factory for creating test Validator objects."""
-    
-    @staticmethod
-    def create(
-        uid: int,
-        hotkey: Optional[str] = None,
-        stake: float = 10000.0,
-        s3_bucket: Optional[str] = None,
-        **kwargs: Any,
-    ) -> Validator:
-        """Create a Validator instance with sensible defaults."""
-        if hotkey is None:
-            hotkey = f"5{'V' * 47}"  # Validator hotkey format
-        
-        return Validator(
-            uid=uid,
-            hotkey=hotkey,
-            stake=stake,
-            s3_bucket=s3_bucket,
-            last_seen_at=kwargs.get("last_seen_at"),
-        )
-
-
 @pytest.fixture
 def valid_miner_factory() -> type[ValidMinerFactory]:
     """Provide access to the ValidMinerFactory class."""
@@ -381,12 +356,6 @@ def rank_score_factory() -> type[RankScoreFactory]:
 def blacklist_factory() -> type[BlacklistFactory]:
     """Provide access to the BlacklistFactory class."""
     return BlacklistFactory
-
-
-@pytest.fixture
-def validator_factory() -> type[ValidatorFactory]:
-    """Provide access to the ValidatorFactory class."""
-    return ValidatorFactory
 
 
 # -----------------------------------------------------------------------------

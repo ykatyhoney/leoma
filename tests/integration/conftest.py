@@ -177,13 +177,6 @@ def integration_blacklist_store(mock_postgres_get_session):
     return BlacklistStore()
 
 
-@pytest.fixture
-def integration_validator_store(mock_postgres_get_session):
-    """Provide a ValidatorStore instance connected to PostgreSQL."""
-    from leoma.infra.db.stores.store_validator import ValidatorStore
-    return ValidatorStore()
-
-
 # -----------------------------------------------------------------------------
 # Docker Compose Helper Markers
 # -----------------------------------------------------------------------------

@@ -3,7 +3,7 @@
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from leoma.infra.db.tables import ValidMiner, ValidatorSample, RankScore, Blacklist, Validator
+from leoma.infra.db.tables import ValidMiner, ValidatorSample, RankScore, Blacklist
 
 
 # -----------------------------------------------------------------------------
@@ -37,13 +37,6 @@ def blacklist_store(mock_get_session):
     """Provide a BlacklistStore instance that uses the test database."""
     from leoma.infra.db.stores.store_blacklist import BlacklistStore
     return BlacklistStore()
-
-
-@pytest.fixture
-def validator_store(mock_get_session):
-    """Provide a ValidatorStore instance that uses the test database."""
-    from leoma.infra.db.stores.store_validator import ValidatorStore
-    return ValidatorStore()
 
 
 # -----------------------------------------------------------------------------
@@ -210,30 +203,6 @@ async def db_with_blacklist(
         await db_session.refresh(entry)
     
     return entries
-
-
-@pytest.fixture
-async def db_with_validators(
-    db_session: AsyncSession,
-    validator_factory,
-    test_hotkeys: list[str],
-) -> list[Validator]:
-    """Provide a database session with multiple validators."""
-    validators = []
-    for i, hotkey in enumerate(test_hotkeys[:3]):  # 3 validators
-        validator = validator_factory.create(
-            uid=i,
-            hotkey=hotkey,
-            stake=10000.0 + (i * 5000),
-        )
-        db_session.add(validator)
-        validators.append(validator)
-    
-    await db_session.commit()
-    for validator in validators:
-        await db_session.refresh(validator)
-    
-    return validators
 
 
 # -----------------------------------------------------------------------------

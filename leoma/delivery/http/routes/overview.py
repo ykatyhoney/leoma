@@ -6,18 +6,17 @@ from fastapi import APIRouter
 from leoma.bootstrap import SAMPLING_ROTATION_INTERVAL
 from leoma.delivery.http.contracts import OverviewResponse
 from leoma.delivery.http.routes.rotation import current_scoring_window
+from leoma.infra.allowlist import VALIDATOR_ALLOWLIST
 from leoma.infra.chute_status import probe_hot_chutes
 from leoma.infra.db.stores import (
     ParticipantStore,
     SampleStore,
     SamplingStateStore,
-    ValidatorStore,
 )
 
 
 router = APIRouter()
 valid_miners_dao = ParticipantStore()
-validators_dao = ValidatorStore()
 sampling_state_dao = SamplingStateStore()
 validator_samples_dao = SampleStore()
 
@@ -30,7 +29,7 @@ async def get_overview() -> OverviewResponse:
     active = sum(1 for m in valid if m.chute_id and hot.get(m.chute_id))
     total_miners = await valid_miners_dao.get_total_count()
 
-    validators = await validators_dao.get_all_validators()
+    n_validators = len(set(VALIDATOR_ALLOWLIST))
     interval = await sampling_state_dao.get_rotation_interval(SAMPLING_ROTATION_INTERVAL)
     latest = await validator_samples_dao.get_latest_task()
     latest_task_id = latest[0] if latest else None
@@ -44,9 +43,9 @@ async def get_overview() -> OverviewResponse:
         active_miners=active,
         valid_miners=len(valid),
         total_miners=total_miners,
-        total_validators=len(validators),
-        # Every owner-managed validator is permissioned in the unified design.
-        permissioned_validators=len(validators),
+        total_validators=n_validators,
+        # Every hardcoded-allowlist validator is permissioned.
+        permissioned_validators=n_validators,
         rotation_interval=interval,
         current_sampler=current_sampler,
         latest_task_id=latest_task_id,

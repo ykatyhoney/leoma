@@ -11,7 +11,8 @@ from fastapi import HTTPException, Header, Request, Depends
 from substrateinterface import Keypair
 
 from leoma.bootstrap import emit_log
-from leoma.infra.db.stores import BlacklistStore, ValidatorStore
+from leoma.infra.allowlist import VALIDATOR_ALLOWLIST
+from leoma.infra.db.stores import BlacklistStore
 
 SIGNATURE_EXPIRY_SECONDS = int(os.environ.get("SIGNATURE_EXPIRY_SECONDS", "300"))
 
@@ -26,7 +27,6 @@ ADMIN_HOTKEYS = _load_admin_hotkeys()
 class SignatureVerifier:
     def __init__(self):
         self.blacklist_store = BlacklistStore()
-        self.validator_store = ValidatorStore()
 
     @staticmethod
     def _validate_timestamp(timestamp: str) -> Tuple[bool, Optional[str]]:
@@ -62,14 +62,10 @@ class SignatureVerifier:
             is_valid = keypair.verify(message, sig_bytes)
             if not is_valid:
                 return False, "Invalid signature"
-            # Admin hotkeys bypass validator list; others must be in list (synced from metagraph by stake)
-            if self.is_admin(hotkey):
+            # Admin hotkeys bypass the allowlist; everyone else must be in the hardcoded allowlist.
+            if self.is_admin(hotkey) or hotkey in VALIDATOR_ALLOWLIST:
                 return True, None
-            validator = await self.validator_store.get_validator_by_hotkey(hotkey)
-            if validator is None:
-                return False, "Validator not registered. The subnet owner must add your hotkey (leoma validator add ...)."
-            await self.validator_store.update_last_seen(hotkey)
-            return True, None
+            return False, "Not a permissioned validator (hotkey is not in the repo allowlist)."
         except Exception as e:
             emit_log(f"Signature verification error: {e}", "warn")
             return False, "Signature verification failed"
@@ -83,14 +79,12 @@ class SignatureVerifier:
         return hotkey in ADMIN_HOTKEYS
 
     async def is_permissioned(self, hotkey: str) -> bool:
-        """A validator is permissioned iff it is in the owner-managed validators allowlist (or admin).
+        """A validator is permissioned iff it is in the hardcoded repo allowlist (or an admin).
 
-        In the unified design every owner-added validator participates in sampling/rotation, so the
-        validators table *is* the permissioned set — there is no separate env allowlist.
+        The repo ``VALIDATOR_ALLOWLIST`` is the single source of truth for membership — the same list
+        that drives rotation and the equal-weight voter set — so auth never drifts from consensus.
         """
-        if self.is_admin(hotkey):
-            return True
-        return await self.validator_store.get_validator_by_hotkey(hotkey) is not None
+        return self.is_admin(hotkey) or hotkey in VALIDATOR_ALLOWLIST
 
 
 _verifier: Optional[SignatureVerifier] = None

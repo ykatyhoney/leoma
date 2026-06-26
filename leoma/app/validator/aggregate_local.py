@@ -1,13 +1,13 @@
 """
-Local per-validator-average aggregation → on-chain winner (decentralized weight setting).
+Local pooled-pass-rate aggregation → on-chain winner (decentralized weight setting).
 
 Each task is sampled AND evaluated by exactly one validator (its sampler), whose bucket holds its
 verdicts at ``{task_id}/evaluation_results/<hotkey>.json``. At each epoch every validator:
 
-  1. reads the on-chain-anchored validator allowlist (no owner-api),
+  1. reads the hardcoded validator allowlist from the repo (no owner-api),
   2. derives the settled scoring window itself from peer-bucket producedness + the shared epoch block,
-  3. reads each window task's verdict from its canonical sampler, gives every validator equal weight
-     (mean of per-validator pass-rates), and ranks miners by dominance.
+  3. reads each window task's verdict from its canonical sampler, scores miners by pooled pass-rate
+     (total_passed / total_evaluated), and ranks them by dominance.
 
 The whole path is owner-api-independent: the allowlist comes from the chain, the window from the
 buckets validators already read. Every validator computes the identical window — and winner — over
@@ -21,16 +21,15 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from substrateinterface import Keypair
 
-from leoma.bootstrap import emit_log as log, log_exception, NETUID, SOURCE_BUCKET
+from leoma.bootstrap import emit_log as log, log_exception, SAMPLING_ROTATION_INTERVAL
 from leoma.app.validator.last_winner import load_last_winner, save_last_winner
 from leoma.app.validator.window_local import resolve_canonical_samplers, derive_window
-from leoma.infra.aggregate import aggregate_per_validator_average, Verdicts
-from leoma.infra.onchain_allowlist import read_allowlist
+from leoma.infra.aggregate import aggregate_scores, Verdicts
+from leoma.infra.allowlist import load_allowlist
 from leoma.infra.scorer_constants import required_distinct_validators
 from leoma.infra.peer_registry import PeerBucket, load_peers
 from leoma.infra.storage_backend import (
     create_peer_read_client,
-    create_source_read_client,
     list_evaluated_task_ids,
 )
 
@@ -125,44 +124,29 @@ async def _fetch_one(client, peer: PeerBucket, task_id: int, verdicts: Verdicts,
 
 
 async def compute_local_winner(
-    subtensor,
     epoch_block: int,
     *,
-    source_read_client=None,
     get_all_miners=None,
 ) -> Tuple[int, Optional[str]]:
-    """Aggregate peer verdicts (per-validator average) into a winner. Returns (winner_uid, winner_hotkey).
+    """Aggregate peer verdicts (pooled pass-rate) into a winner. Returns (winner_uid, winner_hotkey).
 
-    Owner-api-independent: the validator set comes from the on-chain-anchored allowlist, and the
-    settled window is derived locally from peer-bucket producedness anchored to ``epoch_block`` (the
-    shared consensus block) — so every validator computes the identical window over immutable, signed
-    verdict files. Returns (0, None) when there is nothing to score (no peers, no settled window, or
-    no eligible miner), so the caller burns alpha on UID 0.
+    Owner-api-independent: the validator set is the hardcoded repo allowlist, and the settled window
+    is derived locally from peer-bucket producedness anchored to ``epoch_block`` (the shared consensus
+    block) — so every validator computes the identical window over immutable, signed verdict files.
+    Returns (0, None) when there is nothing to score (no peers, no settled window, or no eligible
+    miner), so the caller burns alpha on UID 0.
 
-    If the chain / allowlist is unreachable, repeat the last winner this validator computed instead of
-    burning the epoch — every validator's last winner is the same deterministic value, so they stay
-    aligned through the outage. Burns only if there is no cached winner yet.
+    If a settled window exists but no verdict files could be read (likely a transient peer-bucket
+    outage), repeat the last winner this validator computed instead of burning the epoch — every
+    validator's last winner is the same deterministic value, so they stay aligned through the outage.
     """
     peers = load_peers()
     if not peers:
         log("PEER_VALIDATORS not configured; cannot aggregate locally", "error")
         return 0, None
 
-    # The owner-managed validator set, anchored + verified on-chain (not from the owner-api).
-    snap = await read_allowlist(
-        subtensor, NETUID, source_read_client or create_source_read_client(), SOURCE_BUCKET
-    )
-    if snap is None:
-        fallback = load_last_winner()
-        if fallback:
-            log(
-                f"Allowlist/chain unreachable; repeating last winner uid={fallback[0]} "
-                f"hotkey={fallback[1][:12]}... to avoid burning this epoch",
-                "warn",
-            )
-            return fallback
-        log("Allowlist/chain unreachable and no last winner cached; burning this epoch (UID 0)", "warn")
-        return 0, None
+    # The owner-managed validator set, hardcoded in the repo (single source of truth, no R2/chain).
+    snap = load_allowlist(SAMPLING_ROTATION_INTERVAL)
     validators, interval = snap.validators, snap.interval
 
     # Derive the window ourselves: who produced which rotation (from buckets) + the shared epoch block.
@@ -191,6 +175,14 @@ async def compute_local_winner(
         log_exception("Peer verdict read error", e)
 
     if not verdicts:
+        fallback = load_last_winner()
+        if fallback:
+            log(
+                f"No verdict files readable for the window (peer-bucket outage?); repeating last "
+                f"winner uid={fallback[0]} hotkey={fallback[1][:12]}... to avoid burning this epoch",
+                "warn",
+            )
+            return fallback
         log("No verdicts found across peer buckets for the window", "info")
         return 0, None
 
@@ -212,7 +204,7 @@ async def compute_local_winner(
 
     # Eligibility is implicit via sampling: only sampled (locally-validated) miners have verdicts,
     # and the completeness gate requires broad sampling — so no explicit valid-miner filter here.
-    winner_hotkey, rank_entries = aggregate_per_validator_average(
+    winner_hotkey, rank_entries = aggregate_scores(
         verdicts,
         window,
         set(),

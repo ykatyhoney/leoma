@@ -1,14 +1,14 @@
 """
 End-to-end DECENTRALIZED consensus simulation (production launch validation).
 
-Owner-api-FREE: the validator set is read from the on-chain-anchored allowlist and the settled
-scoring window is derived by each validator itself from peer-bucket producedness — there is no
-/rotation and no /tasks/window. Each validator independently runs the real ``compute_local_winner``
-over the shared (in-memory) buckets, and they all select the IDENTICAL winner UID.
+Owner-api-FREE: the validator set is the hardcoded repo allowlist and the settled scoring window is
+derived by each validator itself from peer-bucket producedness — there is no /rotation and no
+/tasks/window. Each validator independently runs the real ``compute_local_winner`` over the shared
+(in-memory) buckets, and they all select the IDENTICAL winner UID.
 
-The story also proves: per-validator-average (not task-pooled), the dominance hold (the
-earliest-registered miner keeps #1 over a higher-scoring rival within the 5% margin), the
-completeness gate, the min-distinct-validators gate, and the settle margin (filler tasks dropped).
+The story also proves: pooled pass-rate scoring, the dominance hold (the earliest-registered miner
+keeps #1 over a higher-scoring rival within the 5% margin), the completeness gate, the
+per-validator-completeness min-distinct gate, and the settle margin (filler tasks dropped).
 
 Run with ``-s`` to see the report.
 """
@@ -19,8 +19,7 @@ import pytest
 
 from leoma.app.validator import aggregate_local, miner_validation as mv
 from leoma.app.validator.aggregate_local import compute_local_winner
-from leoma.bootstrap import NETUID, SOURCE_BUCKET
-from leoma.infra import onchain_allowlist as oa
+from leoma.infra.allowlist import AllowlistSnapshot
 from leoma.infra.aggregate import compute_miner_aggregates, rank_from_aggregates
 from leoma.infra.peer_registry import PeerBucket
 from leoma.infra.scorer_constants import (
@@ -35,7 +34,6 @@ FILLER = 2                                     # 2 newest produced -> dropped by
 INTERVAL = 50
 EPOCH_BLOCK = 2000                             # epoch_rid = 40 >= SETTLED+FILLER, so the margin (not
                                                # the block anchor) is what drops the fillers
-OWNER = "5Owner0000000000000000000000000000000000000a"
 
 VALIDATORS = [f"VAL_{i}" for i in range(N_VALIDATORS)]  # already sorted
 
@@ -122,15 +120,6 @@ class _FakeBucketClient:
         return [_Obj(k) for k in self._store.get(bucket, {}) if k.startswith(prefix or "")]
 
 
-class _FakeSubtensor:
-    def __init__(self): self.commitments = {}
-    async def set_commitment(self, wallet, netuid, data, period=32):
-        self.commitments[OWNER] = data
-        return True
-    async def get_subnet_owner_hotkey(self, netuid, block=None): return OWNER
-    async def get_all_commitments(self, netuid, **kw): return dict(self.commitments)
-
-
 class _MockMiner:
     def __init__(self, hotkey, uid, block):
         self.hotkey, self.uid, self.block = hotkey, uid, block
@@ -151,21 +140,16 @@ def sim(tmp_path, monkeypatch):
     }
     monkeypatch.setattr(aggregate_local, "load_peers", lambda: peers)
     monkeypatch.setattr(aggregate_local, "create_peer_read_client", lambda peer: _FakeBucketClient(store))
+    # The validator set is the hardcoded allowlist; override it with this sim's validators.
+    monkeypatch.setattr(
+        aggregate_local, "load_allowlist", lambda interval=INTERVAL: AllowlistSnapshot(VALIDATORS, INTERVAL)
+    )
 
-    sub = _FakeSubtensor()
-    source_client = _FakeBucketClient(store)
     mock_miners = [_MockMiner(m.hk, m.uid, m.block) for m in miners]
-
-    async def _setup():
-        # Owner anchors the allowlist on-chain (hash) + to the shared source bucket (the file).
-        await oa.publish_allowlist(sub, None, NETUID, source_client, SOURCE_BUCKET, VALIDATORS, INTERVAL)
-
-    return {"miners": miners, "verdicts": verdicts, "mock_miners": mock_miners,
-            "sub": sub, "source_client": source_client, "setup": _setup}
+    return {"miners": miners, "verdicts": verdicts, "mock_miners": mock_miners}
 
 
 async def test_e2e_decentralized_consensus(sim, capsys):
-    await sim["setup"]()
     miners = sim["miners"]
     verdicts = sim["verdicts"]
     by_uid = {m.uid: m for m in miners}
@@ -173,12 +157,11 @@ async def test_e2e_decentralized_consensus(sim, capsys):
     async def _get_all_miners():
         return sim["mock_miners"]
 
-    # --- Each validator INDEPENDENTLY derives the winner: on-chain allowlist + bucket-derived window ---
+    # --- Each validator INDEPENDENTLY derives the winner: hardcoded allowlist + bucket-derived window ---
     results = {}
     for vhk in VALIDATORS:
         uid, hotkey = await compute_local_winner(
-            sim["sub"], epoch_block=EPOCH_BLOCK,
-            source_read_client=sim["source_client"], get_all_miners=_get_all_miners,
+            epoch_block=EPOCH_BLOCK, get_all_miners=_get_all_miners,
         )
         results[vhk] = (uid, hotkey)
     selected_uids = {uid for uid, _ in results.values()}
@@ -193,7 +176,7 @@ async def test_e2e_decentralized_consensus(sim, capsys):
 
     print("\n" + "=" * 78)
     print(f"DECENTRALIZED CONSENSUS (owner-api-free) — {N_VALIDATORS} validators, {SETTLED} settled "
-          f"tasks (+{FILLER} dropped by settle margin); allowlist read from chain")
+          f"tasks (+{FILLER} dropped by settle margin); hardcoded repo allowlist")
     print("=" * 78)
     for vhk, (uid, _) in results.items():
         print(f"  {vhk}: winner uid={uid}")
@@ -205,7 +188,7 @@ async def test_e2e_decentralized_consensus(sim, capsys):
     # 2) Winner is the champion (uid 3), held #1 by dominance despite the rival scoring higher.
     assert winner_uid == 3
     assert winner_hotkey == by_uid[3].hk
-    assert aggs[by_uid[7].hk].avg_rate > aggs[by_uid[3].hk].avg_rate
+    assert aggs[by_uid[7].hk].score > aggs[by_uid[3].hk].score
     assert ranking[0]["miner_hotkey"] == by_uid[3].hk
     # 3) Gates exclude the bad miners; ranking is champ > rival > mid.
     ranked_uids = [next(m for m in miners if m.hk == e["miner_hotkey"]).uid for e in ranking]

@@ -56,8 +56,8 @@ async def run_epoch(
         from leoma.app.validator.aggregate_local import compute_local_winner
 
         # block is the epoch-boundary block (block % EPOCH_LEN == 0), identical across validators
-        # running this epoch, so the on-chain allowlist + block-derived window are identical for all.
-        winner_uid, winner_hotkey = await compute_local_winner(subtensor, epoch_block=block)
+        # running this epoch, so the hardcoded allowlist + block-derived window are identical for all.
+        winner_uid, winner_hotkey = await compute_local_winner(epoch_block=block)
         if winner_hotkey:
             log(f"[{block}] Local winner: uid={winner_uid} hotkey={winner_hotkey[:12]}...", "info")
     except Exception as e:

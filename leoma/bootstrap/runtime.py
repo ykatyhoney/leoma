@@ -424,8 +424,6 @@ class Settings:
         self.corpus_max_duration = _read_int("CORPUS_MAX_DURATION", 300)
         self.corpus_target_resolution = _read_str("CORPUS_TARGET_RESOLUTION", "720")
         self.corpus_max_filesize = _read_int("CORPUS_MAX_FILESIZE", 200_000_000)
-        self.min_validator_stake = _read_float("MIN_VALIDATOR_STAKE", 1000.0)
-        self.validator_sync_interval = _read_int("VALIDATOR_SYNC_INTERVAL", 600)
 
 
 _settings_instance = Settings()
@@ -474,8 +472,6 @@ CORPUS_MIN_DURATION = settings.corpus_min_duration
 CORPUS_MAX_DURATION = settings.corpus_max_duration
 CORPUS_TARGET_RESOLUTION = settings.corpus_target_resolution
 CORPUS_MAX_FILESIZE = settings.corpus_max_filesize
-MIN_VALIDATOR_STAKE = settings.min_validator_stake
-VALIDATOR_SYNC_INTERVAL = settings.validator_sync_interval
 SAMPLING_ROTATION_INTERVAL = settings.sampling_rotation_interval
 R2_OWN_BUCKET = settings.r2_own_bucket
 

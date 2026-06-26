@@ -28,13 +28,13 @@ from leoma.delivery.http.routes.rotation import (
     current_scoring_window,
     current_scoring_window_rows,
 )
+from leoma.infra.allowlist import VALIDATOR_ALLOWLIST
 from leoma.infra.db.stores import (
     MinerRankStore,
     MinerTaskRankStore,
     ParticipantStore,
     RankStore,
     SampleStore,
-    ValidatorStore,
 )
 
 
@@ -51,7 +51,6 @@ class ScoreCalculationTask:
     def __init__(self):
         self.validator_samples_dao = SampleStore()
         self.rank_scores_dao = RankStore()
-        self.validators_dao = ValidatorStore()
         self.valid_miners_dao = ParticipantStore()
         self.miner_task_rank_dao = MinerTaskRankStore()
         self.miner_rank_dao = MinerRankStore()
@@ -155,17 +154,17 @@ class ScoreCalculationTask:
         if removed > 0:
             log(f"Removed {removed} scores for invalid miners", "info")
 
-        validators = await self.validators_dao.get_all_validators()
+        validators = sorted(set(VALIDATOR_ALLOWLIST))
 
         if not validators:
-            log("No validators found", "info")
+            log("No validators in the allowlist", "info")
             return
 
         total_scores = 0
 
-        for validator in validators:
+        for validator_hotkey in validators:
             stats = await self.validator_samples_dao.get_miner_stats_by_validator(
-                validator.hotkey
+                validator_hotkey
             )
 
             if not stats:
@@ -177,7 +176,7 @@ class ScoreCalculationTask:
                 continue
 
             count = await self.rank_scores_dao.batch_save_scores(
-                validator_hotkey=validator.hotkey,
+                validator_hotkey=validator_hotkey,
                 scores=scores_to_save,
             )
             total_scores += count
@@ -208,12 +207,11 @@ class ScoreCalculationTask:
                 )
 
     async def _run_scorer(self) -> None:
-        """Per-validator-average scorer over a consecutive task_id window of SCORER_TASK_WINDOW.
+        """Pooled-pass-rate scorer over the last SCORER_TASK_WINDOW produced tasks.
 
-        Self-evaluation model: each task has one verdict (from its sampler). To weight validators
-        equally, a miner's score is the MEAN of each validator's pass-rate over that validator's
-        own tasks (identical to the on-chain ``aggregate_per_validator_average``). Window =
-        [max_task_id - N + 1, max_task_id]; no rankings until max_task_id >= N. Writes
+        Self-evaluation model: each task has one verdict (from its sampler). A miner's score is the
+        pooled pass-rate total_passed / total_evaluated over the window (identical to the on-chain
+        ``aggregate_scores``), gated by completeness + per-validator completeness. Writes
         miner_task_ranks (completeness/eligibility) and miner_ranks (dominance rank) for the
         dashboard's /scores/rank and /weights.
         """
@@ -254,7 +252,7 @@ class ScoreCalculationTask:
             aggregates, set(), DOMINANCE_THRESHOLD, min_distinct_validators=min_distinct
         )
 
-        # miner_ranks: eligible miners ranked by mean per-validator rate (drives /weights, /rank).
+        # miner_ranks: eligible miners ranked by pooled pass-rate (drives /weights, /rank).
         await self.miner_rank_dao.replace_all(rank_entries)
 
         # miner_task_ranks: completeness + totals for the eligible set (eligibility display).
