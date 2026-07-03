@@ -39,3 +39,30 @@ class TestIsResolutionAcceptable:
         """get_video_resolution returns (0, 0) on probe failure — must be rejected."""
         from leoma.app.sampler.core import _is_resolution_acceptable
         assert _is_resolution_acceptable(0, 0) is False
+
+
+class TestDeterministicOrder:
+    """Block-hash-seeded source ordering is deterministic + a full permutation."""
+
+    KEYS = ["a.mp4", "b.mp4", "c.mp4", "d.mp4", "e.mp4"]
+
+    def test_reproducible_and_permutation(self):
+        from leoma.app.sampler.core import _deterministic_order
+        h = "0x" + "de" * 24
+        o1 = _deterministic_order(self.KEYS, h)
+        o2 = _deterministic_order(self.KEYS, h)
+        assert o1 == o2                          # same (keys, hash) -> same order
+        assert sorted(o1) == sorted(self.KEYS)   # every key exactly once (a permutation)
+
+    def test_starts_at_hash_index_and_walks_forward(self):
+        from leoma.app.sampler.core import _deterministic_order
+        h = "0x" + "ab" * 24
+        start = int(h, 16) % len(self.KEYS)
+        expected = [self.KEYS[(start + i) % len(self.KEYS)] for i in range(len(self.KEYS))]
+        order = _deterministic_order(self.KEYS, h)
+        assert order == expected
+        assert order[0] == self.KEYS[start]      # the mandated primary source
+
+    def test_empty(self):
+        from leoma.app.sampler.core import _deterministic_order
+        assert _deterministic_order([], "0x1") == []

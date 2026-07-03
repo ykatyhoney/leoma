@@ -19,7 +19,6 @@ from leoma.bootstrap.runtime import (
     LogTimer,
     timed,
     LogLevel,
-    USED_VIDEOS,
     CHUTES_API_KEY,
     CHUTES_API_URL,
     CLIP_DURATION,
@@ -39,7 +38,6 @@ from leoma.bootstrap.runtime import (
     HIPPIUS_VIDEOS_WRITE_SECRET_KEY,
     HOTKEY_NAME,
     MAX_CONCURRENT_MINERS,
-    MAX_VIDEO_HISTORY,
     MAX_VIDEO_SIZE,
     MIN_VIDEO_SIZE,
     REQUIRED_VIDEO_HEIGHT,
@@ -66,7 +64,6 @@ from leoma.bootstrap.runtime import (
 
 __all__ = [
     "settings",
-    "USED_VIDEOS",
     "CHUTES_API_KEY",
     "CHUTES_API_URL",
     "CLIP_DURATION",
@@ -86,7 +83,6 @@ __all__ = [
     "HIPPIUS_VIDEOS_WRITE_SECRET_KEY",
     "HOTKEY_NAME",
     "MAX_CONCURRENT_MINERS",
-    "MAX_VIDEO_HISTORY",
     "MAX_VIDEO_SIZE",
     "MIN_VIDEO_SIZE",
     "REQUIRED_VIDEO_HEIGHT",

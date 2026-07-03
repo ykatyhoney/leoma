@@ -121,7 +121,15 @@ async def run_sampler_loop() -> None:
             )
             log(f"Sampling {len(miners)} valid miners", "info")
 
-            result = await sample_once(rotation_index, miners, source_client, gemini_client)
+            # Deterministic source selection: seed off the hash of the rotation's start block, so the
+            # sampled clip is a reproducible/auditable function of the chain (not the sampler's choice)
+            # yet unpredictable in advance (the hash isn't known until that block is mined).
+            rotation_block = view.rotation_index * view.interval
+            block_hash = await subtensor.get_block_hash(rotation_block)
+
+            result = await sample_once(
+                rotation_index, miners, source_client, gemini_client, block_hash
+            )
             if result is None:
                 log("Sampling produced no usable task this window", "warn")
                 last_sampled_index = rotation_index
