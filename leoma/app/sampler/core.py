@@ -9,7 +9,6 @@ to its own bucket, so the exact same generation path runs in every permissioned 
 import os
 import time
 import base64
-import random
 import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -28,7 +27,6 @@ from leoma.bootstrap import (
     REQUIRED_VIDEO_HEIGHT,
     REQUIRED_VIDEO_WIDTH,
     VIDEO_RESOLUTION_TOLERANCE,
-    MAX_VIDEO_HISTORY,
 )
 from leoma.bootstrap import emit_log as log
 from leoma.infra.video_utils import (
@@ -46,9 +44,6 @@ MAX_CONCURRENT_MINERS = int(os.environ.get("MAX_CONCURRENT_MINERS", "40"))
 ONE_SHOT_SCENE_THRESHOLD = float(os.environ.get("ONE_SHOT_SCENE_THRESHOLD", "0.18"))
 ONE_SHOT_BOUNDARY_MARGIN = float(os.environ.get("ONE_SHOT_BOUNDARY_MARGIN", "0.15"))
 SAFE_CLIP_START_OFFSET_SECONDS = float(os.environ.get("SAFE_CLIP_START_OFFSET_SECONDS", "2.0"))
-
-# Recently used source videos (in-memory, per sampler process).
-USED_VIDEOS: list[str] = []
 
 
 @dataclass
@@ -119,43 +114,39 @@ async def _list_source_videos(minio_client: Minio) -> list[str]:
     objects = await asyncio.to_thread(
         lambda: list(minio_client.list_objects(SOURCE_BUCKET, recursive=True))
     )
-    return [
+    keys = [
         obj.object_name
         for obj in objects
         if obj.object_name.endswith(".mp4") and MIN_VIDEO_SIZE < obj.size < MAX_VIDEO_SIZE
     ]
+    # Stable, reproducible order so the block-hash index below is deterministic across validators.
+    return sorted(keys)
 
 
-def _prioritize_video_keys(video_keys: list[str]) -> list[str]:
-    global USED_VIDEOS
+def _deterministic_order(video_keys: list[str], block_hash: str) -> list[str]:
+    """Deterministic try-order seeded by the rotation's block hash.
+
+    Start at ``index = int(block_hash, 16) % count`` and walk forward, wrapping — the first entry is
+    the mandated source, the rest are the deterministic fallback order if it has no one-shot segment.
+    ``video_keys`` must already be sorted, so the same ``(keys, block_hash)`` yields the same order
+    for every validator and any external auditor.
+    """
     if not video_keys:
         return []
-    available = [key for key in video_keys if key not in USED_VIDEOS]
-    if not available:
-        recent = USED_VIDEOS[-5:] if len(USED_VIDEOS) >= 5 else []
-        USED_VIDEOS.clear()
-        USED_VIDEOS.extend(recent)
-        available = [key for key in video_keys if key not in USED_VIDEOS]
-    if not available:
-        available = list(video_keys)
-    random.shuffle(available)
-    return available
-
-
-def _register_used_video(video_key: str) -> None:
-    global USED_VIDEOS
-    USED_VIDEOS.append(video_key)
-    if len(USED_VIDEOS) > MAX_VIDEO_HISTORY:
-        USED_VIDEOS[:] = USED_VIDEOS[-MAX_VIDEO_HISTORY:]
+    n = len(video_keys)
+    start = int(block_hash, 16) % n
+    return [video_keys[(start + i) % n] for i in range(n)]
 
 
 async def select_one_shot_video(
     minio_client: Minio,
     local_video_path: str,
+    block_hash: str,
 ) -> tuple[str, OneShotClipSelection] | None:
-    """Iterate source videos until one has a one-shot segment holding the full clip duration."""
+    """Iterate source videos in the block-hash-derived deterministic order until one has a one-shot
+    segment holding the full clip duration."""
     video_keys = await _list_source_videos(minio_client)
-    for video_key in _prioritize_video_keys(video_keys):
+    for video_key in _deterministic_order(video_keys, block_hash):
         try:
             remove_file(local_video_path)
             await asyncio.to_thread(
@@ -166,6 +157,7 @@ async def select_one_shot_video(
                 CLIP_DURATION,
                 scene_threshold=ONE_SHOT_SCENE_THRESHOLD,
                 boundary_margin=ONE_SHOT_BOUNDARY_MARGIN,
+                seed=block_hash,
             )
             if selection is None:
                 log("No one-shot segment found; retrying next video", "warn")
@@ -185,7 +177,6 @@ async def select_one_shot_video(
                 video_duration_seconds=selection.video_duration_seconds,
                 scene_cuts=selection.scene_cuts,
             )
-            _register_used_video(video_key)
             return video_key, selection
         except Exception:
             continue
@@ -266,6 +257,7 @@ async def sample_once(
     miners: Dict[str, Dict[str, Any]],
     source_client: Minio,
     gemini_client: Any,
+    block_hash: str,
 ) -> Optional[SampledTask]:
     """Run one sampling round for a given task_id: select source, describe, call miners, validate.
 
@@ -278,7 +270,7 @@ async def sample_once(
     miner_paths: Dict[str, str] = {}
     success = False
     try:
-        selected = await select_one_shot_video(source_client, video_path)
+        selected = await select_one_shot_video(source_client, video_path, block_hash)
         if not selected:
             log("No source video contains a one-shot segment for the clip duration", "warn")
             return None

@@ -13,7 +13,7 @@ import time
 from contextvars import ContextVar
 from datetime import datetime
 from functools import wraps
-from typing import Any, Dict, List, Optional, Callable, TypeVar, ParamSpec
+from typing import Any, Dict, Optional, Callable, TypeVar, ParamSpec
 
 from dotenv import load_dotenv
 
@@ -316,9 +316,6 @@ def timed(operation: str) -> Callable[[Callable[P, R]], Callable[P, R]]:
     return decorator
 
 
-# Kept for backward compatibility.
-USED_VIDEOS: List[str] = []
-
 
 def _read_str(name: str, fallback: str) -> str:
     return os.environ.get(name, fallback)
@@ -409,7 +406,6 @@ class Settings:
         self.min_video_size = _read_int("MIN_VIDEO_SIZE", 1_000_000)
         self.max_video_size = _read_int("MAX_VIDEO_SIZE", 200_000_000)
         self.clip_duration = _read_int("CLIP_DURATION", 5)
-        self.max_video_history = _read_int("MAX_VIDEO_HISTORY", 50)
         self.chute_cache_ttl = _read_int("CHUTE_CACHE_TTL", 300)
         self.max_concurrent_miners = _read_int("MAX_CONCURRENT_MINERS", 5)
         self.database_url = _read_optional_str("DATABASE_URL")
@@ -457,7 +453,6 @@ VIDEO_RESOLUTION_TOLERANCE = settings.video_resolution_tolerance
 MIN_VIDEO_SIZE = settings.min_video_size
 MAX_VIDEO_SIZE = settings.max_video_size
 CLIP_DURATION = settings.clip_duration
-MAX_VIDEO_HISTORY = settings.max_video_history
 CHUTE_CACHE_TTL = settings.chute_cache_ttl
 MAX_CONCURRENT_MINERS = settings.max_concurrent_miners
 DATABASE_URL = settings.database_url

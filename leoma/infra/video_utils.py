@@ -182,11 +182,17 @@ async def choose_one_shot_clip_start(
     *,
     scene_threshold: float = DEFAULT_SCENE_THRESHOLD,
     boundary_margin: float = 0.15,
+    seed: "str | int | None" = None,
 ) -> Optional[OneShotClipSelection]:
     """
     Choose a clip start offset such that the full clip stays inside a single shot.
     Returns None when no detected one-shot segment can hold clip_duration.
+
+    When ``seed`` is given the segment and offset are drawn from a seeded RNG, so the same
+    ``(video, seed)`` always yields the same clip — used to make sampling deterministic off the
+    rotation's block hash. With ``seed=None`` selection is random as before.
     """
+    rng = random.Random(seed) if seed is not None else random
     duration = await get_video_duration(video_path)
     if duration < clip_duration:
         return None
@@ -220,12 +226,12 @@ async def choose_one_shot_clip_start(
     candidates.sort(key=lambda seg: seg[1] - seg[0], reverse=True)
     best_span = candidates[0][1] - candidates[0][0]
     near_best = [seg for seg in candidates if (seg[1] - seg[0]) >= (best_span - 1.0)]
-    selected_start, selected_end = random.choice(near_best)
+    selected_start, selected_end = rng.choice(near_best)
     max_start = selected_end - clip_duration
     clip_start = (
         selected_start
         if max_start <= selected_start
-        else random.uniform(selected_start, max_start)
+        else rng.uniform(selected_start, max_start)
     )
 
     return OneShotClipSelection(

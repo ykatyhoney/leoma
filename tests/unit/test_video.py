@@ -450,3 +450,31 @@ class TestSceneDetection:
         assert selection is not None
         assert selection.segment_start_seconds <= selection.clip_start_seconds
         assert (selection.segment_end_seconds - selection.clip_start_seconds) >= 5.0
+
+
+class TestClipStartSeedDeterminism:
+    """A block-hash seed makes clip selection reproducible (same seed -> same clip)."""
+
+    async def _select(self, seed):
+        from unittest.mock import MagicMock, patch
+        from leoma.infra.video_utils import choose_one_shot_clip_start
+        duration = MagicMock(); duration.stdout = "30.0"
+        scenes = MagicMock(); scenes.returncode = 0
+        scenes.stdout = "pts_time:10.0\npts_time:20.0\n"; scenes.stderr = ""
+        with patch("leoma.infra.video_utils.asyncio.to_thread", side_effect=[duration, scenes]):
+            return await choose_one_shot_clip_start(
+                "/input/video.mp4", clip_duration=5.0, scene_threshold=0.2, boundary_margin=0.0, seed=seed,
+            )
+
+    async def test_same_seed_same_clip(self):
+        a = await self._select("0xabc123")
+        b = await self._select("0xabc123")
+        assert a is not None and b is not None
+        assert (a.segment_start_seconds, a.clip_start_seconds) == (b.segment_start_seconds, b.clip_start_seconds)
+
+    async def test_selection_valid_across_seeds(self):
+        for seed in ("0x1", "0xdeadbeef", "0xffffffffffffffff"):
+            s = await self._select(seed)
+            assert s is not None
+            assert s.segment_start_seconds <= s.clip_start_seconds
+            assert (s.segment_end_seconds - s.clip_start_seconds) >= 5.0
