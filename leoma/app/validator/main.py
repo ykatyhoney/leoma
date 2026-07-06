@@ -1,150 +1,264 @@
 """
-Validator service for Leoma (fully decentralized).
+Validator service for Leoma — king of the hill.
 
-Runs three loops in one process:
-1. Sampler: on this validator's rotation turn (GET /rotation), sample valid miners, upload the
-   task to its own R2 bucket, and announce it (POST /tasks/announce).
-2. Evaluator: poll GET /tasks/latest, download the task from the sampler's bucket, run Gemini per
-   miner, publish results to its own bucket, and dual-report to the API for the dashboard.
-3. Weight-setter: at each epoch boundary, read every peer's results from their buckets, aggregate
-   with equal weight (one validator = one vote), and set top-ranked-only weights on-chain
-   (weight 1.0 for winner_uid, 0 for others; if no eligible miner, UID 0 to burn alpha).
+Each permissioned validator independently:
+  1. scans the chain's revealed commitments for miner model submissions
+     (``reveal_scan``) — no owner-api, no rotation,
+  2. duels each new challenger against the reigning king on a GPU eval server
+     (deterministic, block-hash-seeded), and
+  3. crowns a challenger that wins by a confident margin, then sets equal weights
+     across the king + recent prior kings (else burns to UID 0).
+
+Because the duel is deterministic given the chain + reveals, every validator
+converges on the same king with no cross-validator coordination. The king state
+persists to this validator's own bucket (``state_store``).
 """
 
 import os
+import json
 import asyncio
-from typing import List
+from typing import Optional
 
 import bittensor as bt
 
 from leoma.bootstrap import (
     NETUID,
-    EPOCH_LEN,
-    OBJECT_STORAGE_BACKEND,
-    GEMINI_API_KEY,
+    NETWORK,
     WALLET_NAME,
     HOTKEY_NAME,
-    NETWORK,
+    R2_OWN_BUCKET,
 )
-from leoma.bootstrap import emit_log as log, emit_header as log_header
-from leoma.app.sampler.loop import run_sampler_loop
-from leoma.app.validator.miner_validation import run_validation_loop
+from leoma.bootstrap import emit_log as log, emit_header as log_header, log_exception
+from leoma.infra.storage_backend import create_own_write_client, ensure_bucket_exists
+from leoma.infra.chain_config import SEED_REPO, SEED_DIGEST
+from leoma.app.validator.reveal_scan import scan_reveals, ChallengerEntry
+from leoma.app.validator.state_store import JsonBucketStore, KingState
+from leoma.app.validator import king as K
+
+EVAL_SERVER_URL = os.environ.get("EVAL_SERVER_URL", "http://localhost:9000")
+CHALLENGE_POLL_INTERVAL = int(os.environ.get("LEOMA_CHALLENGE_POLL_INTERVAL", "60"))
+
+# Duel parameters (must match across validators for consensus).
+DUEL_METRIC = os.environ.get("LEOMA_DUEL_METRIC", "lpips")
+DUEL_N_CLIPS = int(os.environ.get("LEOMA_DUEL_N_CLIPS", "32"))
+DELTA_THRESHOLD = float(os.environ.get("LEOMA_DELTA_THRESHOLD", "0.0025"))
+ALPHA = float(os.environ.get("LEOMA_ALPHA", "0.001"))
+N_BOOTSTRAP = int(os.environ.get("LEOMA_N_BOOTSTRAP", "10000"))
+
+# Eval dispatch: connect fast, but allow a long duel (N clips x 2 generations).
+_EVAL_CONNECT_TIMEOUT = 30.0
+_EVAL_READ_TIMEOUT = float(os.environ.get("LEOMA_EVAL_TIMEOUT", "3600"))
 
 
-API_URL = os.environ.get("API_URL", "https://api.leoma.ai")
+def _seen_key(hotkey: str, digest: str) -> str:
+    return f"{hotkey}|{digest}"
 
 
-def _build_weight_payload(winner_uid: int) -> tuple[List[int], List[float]]:
-    """Build (uids, weights) for top-ranked-only weighting: only winner_uid gets 1.0. If winner_uid=0, burn alpha."""
-    return [winner_uid], [1.0]
+def _is_current_king(state: KingState, entry: ChallengerEntry) -> bool:
+    k = state.king or {}
+    return k.get("hotkey") == entry.hotkey and k.get("model_digest") == entry.model_digest
 
 
-async def run_epoch(
-    subtensor: bt.AsyncSubtensor,
-    wallet: bt.Wallet,
-    block: int,
-) -> None:
-    """Aggregate peer evaluation results locally (equal weight) and set top-ranked-only weights.
+async def refresh_uid_map(subtensor: bt.AsyncSubtensor) -> dict[str, int]:
+    meta = await subtensor.metagraph(NETUID)
+    hotkeys = list(getattr(meta, "hotkeys", []) or [])
+    return {hk: uid for uid, hk in enumerate(hotkeys)}
 
-    Reads every permissioned validator's results from their buckets, computes the winner with
-    one-vote-per-validator, and sets weight 1.0 on the winner. If aggregation fails or no miner
-    is eligible, UID 0 burns alpha.
+
+async def dispatch_duel(
+    entry: ChallengerEntry,
+    king: dict,
+    block_hash: str,
+) -> Optional[dict]:
+    """POST a duel to the eval server and stream its verdict.
+
+    Returns the verdict dict, or None when the server is busy (409) so the
+    caller retries later. Raises on an eval-server error event.
     """
-    log(f"[{block}] Aggregating peer evaluation results locally (equal weight)", "info")
-    winner_uid = 0
-    try:
-        from leoma.app.validator.aggregate_local import compute_local_winner
+    import httpx
 
-        # block is the epoch-boundary block (block % EPOCH_LEN == 0), identical across validators
-        # running this epoch, so the hardcoded allowlist + block-derived window are identical for all.
-        winner_uid, winner_hotkey = await compute_local_winner(epoch_block=block)
-        if winner_hotkey:
-            log(f"[{block}] Local winner: uid={winner_uid} hotkey={winner_hotkey[:12]}...", "info")
-    except Exception as e:
-        log(f"[{block}] Local aggregation failed: {e}; setting UID 0 (burn alpha)", "error")
+    payload = {
+        "king_repo": king["model_repo"],
+        "king_digest": king["model_digest"],
+        "challenger_repo": entry.model_repo,
+        "challenger_digest": entry.model_digest,
+        "block_hash": block_hash,
+        "hotkey": entry.hotkey,
+        "metric": DUEL_METRIC,
+        "n_clips": DUEL_N_CLIPS,
+        "delta_threshold": DELTA_THRESHOLD,
+        "alpha": ALPHA,
+        "n_bootstrap": N_BOOTSTRAP,
+    }
+    timeout = httpx.Timeout(_EVAL_READ_TIMEOUT, connect=_EVAL_CONNECT_TIMEOUT)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(f"{EVAL_SERVER_URL}/eval", json=payload)
+        if resp.status_code == 409:
+            log("Eval server busy; will retry", "warn")
+            return None
+        resp.raise_for_status()
+        eval_id = resp.json()["eval_id"]
 
-    # Top-ranked-only weighting: set weight 1.0 for winner_uid only (or UID 0 to burn alpha)
-    uids, weights = _build_weight_payload(winner_uid)
-    try:
-        await subtensor.set_weights(wallet=wallet, netuid=NETUID, uids=uids, weights=weights, wait_for_inclusion=True)
-        if winner_uid == 0:
-            log(f"[{block}] Set weights: no top-ranked miner, UID 0 (burn alpha)", "success")
-        else:
-            log(f"[{block}] Set weights: top-ranked-only UID {winner_uid}", "success")
-    except Exception as e:
-        log(f"[{block}] Failed to set weights: {e}", "error")
+        verdict: Optional[dict] = None
+        async with client.stream("GET", f"{EVAL_SERVER_URL}/eval/{eval_id}/stream") as stream:
+            async for line in stream.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                event = json.loads(line[6:])
+                phase = event.get("phase")
+                if phase == "verdict":
+                    verdict = event
+                elif phase == "error":
+                    raise RuntimeError(f"eval server error: {event.get('error')}")
+    return verdict
 
 
-async def step(
+async def maybe_set_weights(
     subtensor: bt.AsyncSubtensor,
     wallet: bt.Wallet,
-) -> int | None:
-    """Wait for the epoch boundary and run weight setting. Returns the processed epoch, or None if still waiting."""
+    state: KingState,
+    uid_map: dict[str, int],
+    store: JsonBucketStore,
+    *,
+    force: bool = False,
+) -> bool:
+    """Set equal weights over the king chain (else burn UID 0), rate-limited."""
     current_block = await subtensor.get_current_block()
-    current_epoch = current_block // EPOCH_LEN
+    if not force and current_block - state.last_weight_block < K.WEIGHT_INTERVAL:
+        return False
 
-    if current_block % EPOCH_LEN != 0:
-        remaining = EPOCH_LEN - (current_block % EPOCH_LEN)
-        wait_time = 12 * remaining
-        log(f"Block {current_block}: waiting {remaining} blocks (~{wait_time}s) until epoch", "info")
-        await asyncio.sleep(wait_time)
-        return None
+    uids, weights, label = K.weight_targets(state.king, state.king_chain, uid_map)
+    log(f"[{current_block}] set_weights -> {label}: uids={uids} weights={[round(w,4) for w in weights]}", "info")
+    try:
+        await subtensor.set_weights(
+            wallet=wallet, netuid=NETUID, uids=uids, weights=weights, wait_for_inclusion=True
+        )
+    except Exception as e:
+        log(f"[{current_block}] set_weights failed: {e}", "error")
+        return False
 
-    log_header(f"Leoma Epoch #{current_epoch} (block {current_block})")
+    state.last_weight_block = current_block
+    state.last_winner_hotkey = label
+    state.flush(store)
+    return True
 
-    await run_epoch(subtensor, wallet, current_block)
 
-    wait_time = EPOCH_LEN * 12
-    log(f"Waiting {wait_time}s until next epoch", "info")
-    await asyncio.sleep(wait_time)
+def ensure_genesis_king(state: KingState, block: int) -> None:
+    """Seed the genesis king from chain.toml on first run (empty hotkey ⇒ burns
+    emission until a miner's challenger dethrones the base model)."""
+    if state.king:
+        return
+    if not SEED_DIGEST:
+        log("No seed_digest in chain.toml; king unset (burning) until first crown", "warn")
+        return
+    king, chain = K.crown(
+        None, [], hotkey="", model_repo=SEED_REPO, model_digest=SEED_DIGEST,
+        block=block, challenge_id=K.SEED_CHALLENGE_ID,
+    )
+    state.king, state.king_chain = king, chain
+    log(f"Seeded genesis king from {SEED_REPO}@{SEED_DIGEST[:16]}...", "success")
 
-    return current_epoch
+
+async def process_challengers(
+    subtensor: bt.AsyncSubtensor,
+    wallet: bt.Wallet,
+    state: KingState,
+    uid_map: dict[str, int],
+    store: JsonBucketStore,
+    entries: list[ChallengerEntry],
+) -> None:
+    """Duel each new challenger; crown the winners and refresh weights."""
+    for entry in entries:
+        key = _seen_key(entry.hotkey, entry.model_digest)
+        if key in state.seen_hotkeys or _is_current_king(state, entry):
+            continue
+        if not state.king:
+            # No king to duel against and no seed configured; the first valid
+            # challenger takes the crown unopposed.
+            state.king, state.king_chain = K.crown(
+                None, state.king_chain, hotkey=entry.hotkey, model_repo=entry.model_repo,
+                model_digest=entry.model_digest, block=entry.block, challenge_id="first",
+            )
+            state.seen_hotkeys.add(key)
+            state.stats["accepted"] = state.stats.get("accepted", 0) + 1
+            state.flush(store)
+            log(f"Crowned first king {entry.hotkey[:12]}... ({entry.model_repo})", "success")
+            await maybe_set_weights(subtensor, wallet, state, uid_map, store, force=True)
+            continue
+
+        block_hash = await subtensor.get_block_hash(entry.block)
+        log(f"Dueling challenger {entry.hotkey[:12]}... vs king {state.king.get('hotkey','')[:12] or 'base'}...", "info")
+        try:
+            verdict = await dispatch_duel(entry, state.king, block_hash)
+        except Exception as e:
+            log(f"Duel dispatch failed for {entry.hotkey[:12]}...: {e}", "error")
+            return  # leave unseen so it retries next tick
+
+        if verdict is None:
+            return  # server busy; retry later, keep entry unseen
+
+        state.seen_hotkeys.add(key)
+        if verdict.get("accepted"):
+            state.king, state.king_chain = K.crown(
+                state.king, state.king_chain, hotkey=entry.hotkey, model_repo=entry.model_repo,
+                model_digest=entry.model_digest, block=entry.block,
+                challenge_id=verdict.get("challenge_id") or f"block-{entry.block}",
+            )
+            state.stats["accepted"] = state.stats.get("accepted", 0) + 1
+            state.flush(store)
+            log(f"Challenger {entry.hotkey[:12]}... CROWNED (lcb={verdict.get('lcb')})", "success")
+            await maybe_set_weights(subtensor, wallet, state, uid_map, store, force=True)
+        else:
+            state.stats["rejected"] = state.stats.get("rejected", 0) + 1
+            state.flush(store)
+            log(f"Challenger {entry.hotkey[:12]}... rejected (lcb={verdict.get('lcb')})", "info")
+
+
+async def tick(
+    subtensor: bt.AsyncSubtensor,
+    wallet: bt.Wallet,
+    state: KingState,
+    store: JsonBucketStore,
+) -> None:
+    block = await subtensor.get_current_block()
+    uid_map = await refresh_uid_map(subtensor)
+    ensure_genesis_king(state, block)
+
+    commits = await subtensor.get_all_revealed_commitments(NETUID, block=block)
+    entries = scan_reveals(commits)
+    if entries:
+        await process_challengers(subtensor, wallet, state, uid_map, store, entries)
+
+    # Periodic weight refresh (also keeps the king chain aligned as UIDs change).
+    await maybe_set_weights(subtensor, wallet, state, uid_map, store)
 
 
 async def main() -> None:
-    """Main entry point: run the sampler (sample + self-evaluate) + weight-setting loop."""
-    log_header("Leoma Validator Starting (sampler + self-evaluator + weight-setter)")
+    """Run the king-of-the-hill validator loop."""
+    log_header("Leoma Validator Starting (king of the hill)")
 
-    if not GEMINI_API_KEY:
-        log("Sampler/evaluator requires GEMINI_API_KEY", "error")
+    if not R2_OWN_BUCKET:
+        log("R2_OWN_BUCKET not set; validator disabled (cannot persist king state)", "error")
         return
-
-    log(f"Coordinator API: {API_URL}", "info")
-    log(f"Object storage backend: {OBJECT_STORAGE_BACKEND}", "info")
 
     subtensor = bt.AsyncSubtensor(network=NETWORK)
     wallet = bt.Wallet(name=WALLET_NAME, hotkey=HOTKEY_NAME)
+    log(f"Wallet: {WALLET_NAME}/{HOTKEY_NAME}  Network: {NETWORK}  NetUID: {NETUID}", "info")
+    log(f"Eval server: {EVAL_SERVER_URL}  metric={DUEL_METRIC} n_clips={DUEL_N_CLIPS} delta={DELTA_THRESHOLD}", "info")
 
-    log(f"Wallet: {WALLET_NAME}/{HOTKEY_NAME}", "info")
-    log(f"Network: {NETWORK}", "info")
-    log(f"NetUID: {NETUID}", "info")
-    log(f"Epoch length: {EPOCH_LEN} blocks (~{EPOCH_LEN * 12}s)", "info")
+    own_client = create_own_write_client()
+    await ensure_bucket_exists(own_client, R2_OWN_BUCKET)
+    store = JsonBucketStore(own_client, R2_OWN_BUCKET)
+    state = KingState.load(store)
+    log(f"Loaded king: {(state.king or {}).get('model_repo', 'none')} chain={len(state.king_chain)}", "info")
 
-    def _log_background_exception(name: str):
-        def _cb(task: asyncio.Task) -> None:
-            try:
-                exc = task.exception()
-                if exc is not None:
-                    log(f"Background {name} task failed: {exc}", "error")
-            except asyncio.CancelledError:
-                log(f"Background {name} task was cancelled", "warn")
-        return _cb
-
-    log("Starting miner-validation loop in background (validates miners + reports to owner-api)...", "start")
-    validation_task = asyncio.create_task(run_validation_loop())
-    validation_task.add_done_callback(_log_background_exception("miner-validation"))
-
-    log("Starting sampler loop in background (samples + self-evaluates own tasks)...", "start")
-    sampler_task = asyncio.create_task(run_sampler_loop())
-    sampler_task.add_done_callback(_log_background_exception("sampler"))
-
-    log("Starting weight-setting loop...", "start")
     while True:
         try:
-            await step(subtensor, wallet)
+            await tick(subtensor, wallet, state, store)
         except Exception as e:
-            log(f"Weight-setting loop error: {e}", "error")
-            await asyncio.sleep(10)
+            log(f"Validator tick error: {e}", "error")
+            log_exception("Validator tick error", e)
+        await asyncio.sleep(CHALLENGE_POLL_INTERVAL)
 
 
 def main_sync() -> None:

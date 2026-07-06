@@ -46,13 +46,12 @@ def api():
 
 @cli.command()
 def serve():
-    """Start the validator (sampler + evaluator + weight setter).
+    """Start the king-of-the-hill validator.
 
-    Runs the complete decentralized Leoma validator in one process:
-    - sampler loop: on this validator's rotation turn, sample miners and publish to its own bucket
-    - evaluator loop: download the latest task from the sampler's bucket, Gemini-evaluate, publish results
-    - weight-setting loop: aggregate all peers' results equally and set on-chain weights
-    Requires R2_OWN_BUCKET, PEER_VALIDATORS, source-bucket read creds, CHUTES_API_KEY, GEMINI_API_KEY.
+    Scans on-chain miner reveals, duels each new challenger against the reigning
+    king on the GPU eval server (deterministic, block-hash-seeded), crowns
+    winners, and sets equal weights across the king chain (else burns UID 0).
+    Requires R2_OWN_BUCKET and a reachable EVAL_SERVER_URL.
     """
     from leoma.app.validator.main import main
     _run_async(main())
@@ -80,28 +79,25 @@ def start_sampler():
 
 @servers.command("validator")
 def start_validator():
-    """Start weight-setting service only.
-    
-    Polls API GET /weights and sets top-ranked-only weights on-chain. For full validator
-    (evaluator + weight-setter), use leoma serve.
+    """Start the king-of-the-hill validator (duel + weight-setter).
+
+    Scans on-chain reveals, duels new challengers against the king on the eval
+    server, crowns winners, and sets equal weights across the king chain (else
+    burns to UID 0). Same as `leoma serve`.
     """
-    import bittensor as bt
-    
-    from leoma.bootstrap import NETWORK, WALLET_NAME, HOTKEY_NAME, emit_log as log, emit_header as log_header
-    from leoma.app.validator.main import step
-    
-    async def run_validator():
-        log_header("Leoma Validator (Weight Setter) Starting")
-        
-        subtensor = bt.AsyncSubtensor(network=NETWORK)
-        wallet = bt.Wallet(name=WALLET_NAME, hotkey=HOTKEY_NAME)
-        log(f"Wallet: {WALLET_NAME}/{HOTKEY_NAME}", "info")
-        log(f"Network: {NETWORK}", "info")
-        
-        while True:
-            await step(subtensor, wallet)
-    
-    _run_async(run_validator())
+    from leoma.app.validator.main import main
+    _run_async(main())
+
+
+@servers.command("eval-server")
+def start_eval_server():
+    """Start the GPU eval server (video-generation duel).
+
+    FastAPI service the validator dispatches duels to (POST /eval, SSE stream).
+    Listens on EVAL_SERVER_HOST:EVAL_SERVER_PORT (default 0.0.0.0:9000).
+    """
+    from leoma.eval_server import main as eval_main
+    eval_main()
 
 
 @cli.group()
