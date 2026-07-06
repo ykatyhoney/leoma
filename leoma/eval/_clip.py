@@ -1,0 +1,73 @@
+"""Lazy CLIP backend (open_clip). Imported only for the ``clip`` metric.
+
+Semantic-fidelity distance: embed the generation frames and the real-continuation
+frames with a CLIP image encoder and take the mean per-frame cosine distance.
+Unlike pixel/perceptual metrics, this is forgiving of *plausible* divergence —
+it asks "does this look like the same scene/content", not "do the pixels match" —
+which helps with the one-to-many nature of video generation.
+
+``torch``/``open_clip`` are imported lazily; the cosine-distance math
+(``cosine_distance``) is pure numpy and unit-testable. Like LPIPS this runs on
+GPU, so it carries the same cross-validator determinism caveat.
+"""
+from __future__ import annotations
+
+import numpy as np
+
+_model = None
+_preprocess = None
+
+CLIP_MODEL = "ViT-B-32"
+CLIP_PRETRAINED = "openai"
+
+
+def _get_model():
+    global _model, _preprocess
+    if _model is None:
+        import torch
+        import open_clip
+
+        model, _, preprocess = open_clip.create_model_and_transforms(
+            CLIP_MODEL, pretrained=CLIP_PRETRAINED
+        )
+        model.eval()
+        if torch.cuda.is_available():
+            model = model.to("cuda")
+        _model, _preprocess = model, preprocess
+    return _model, _preprocess
+
+
+def cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
+    """Mean per-row cosine distance (1 - cos) between two (N, D) embedding sets."""
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    if a.size == 0 or b.size == 0:
+        return 0.0
+    a = a / (np.linalg.norm(a, axis=-1, keepdims=True) + 1e-12)
+    b = b / (np.linalg.norm(b, axis=-1, keepdims=True) + 1e-12)
+    return float(np.mean(1.0 - (a * b).sum(axis=-1)))
+
+
+def _embed(frames: np.ndarray) -> np.ndarray:
+    import torch
+    from PIL import Image
+
+    model, preprocess = _get_model()
+    device = next(model.parameters()).device
+    batch = torch.stack([
+        preprocess(Image.fromarray(np.asarray(f).astype("uint8")))
+        for f in frames
+    ]).to(device)
+    with torch.no_grad():
+        emb = model.encode_image(batch)
+    return emb.detach().cpu().numpy()
+
+
+def clip_video_distance(gen: np.ndarray, truth: np.ndarray) -> float:
+    """Mean per-frame CLIP cosine distance between generation and truth."""
+    g = np.asarray(gen)
+    t = np.asarray(truth)
+    n = min(g.shape[0], t.shape[0])
+    if n == 0:
+        return 0.0
+    return cosine_distance(_embed(g[:n]), _embed(t[:n]))

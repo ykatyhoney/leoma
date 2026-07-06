@@ -10,20 +10,17 @@ dependencies = [
     "bittensor==9.12.2",
     "python-dotenv>=1.0.0",
     "huggingface-hub",
+    "hippius-hub",
     "minio",
     "openai>=1.0.0,<2",
     "google-genai>=0.3.0",
     "click",
     "pydantic>=2.0.0,<3",
     "yt-dlp",
-    # Database
-    "asyncpg>=0.29.0,<0.30",
-    "sqlalchemy[asyncio]>=2.0.0,<3",
-    # API (pin minor for reproducible builds; run pip audit before production)
+    # Eval server HTTP (validator dispatches duels here)
     "fastapi>=0.109.0,<0.116.0",
     "uvicorn[standard]>=0.27.0",
-    # Miner cli
-    "chutes>=0.4.8",
+    "httpx",
     "pillow",
 ]
 
@@ -34,6 +31,19 @@ test = [
     "pytest-cov>=4.1.0",
     "pytest-mock>=3.12.0",
     "aiosqlite>=0.19.0",
+]
+# GPU eval server only (the box that downloads + runs miner models for duels).
+# Validators that just dispatch duels do not need these.
+eval = [
+    "torch",
+    "diffusers>=0.31.0",
+    "transformers",
+    "accelerate",
+    "safetensors",
+    "lpips",                    # perceptual (spatial) metric
+    "opencv-python-headless",   # optical-flow (motion) metric
+    "open_clip_torch",          # CLIP (semantic) metric
+    "numpy",
 ]
 
 [project.scripts]

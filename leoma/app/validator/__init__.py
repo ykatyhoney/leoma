@@ -1,6 +1,6 @@
-"""Validator service entry points (sampler + self-evaluator + weight-setter)."""
+"""Validator service entry points (king-of-the-hill duel + weight-setter)."""
 
-from leoma.app.validator.main import main, main_sync, run_epoch, step
+from leoma.app.validator.main import main, main_sync
 
 
-__all__ = ["run_epoch", "step", "main", "main_sync"]
+__all__ = ["main", "main_sync"]

@@ -362,8 +362,6 @@ class Settings:
         self.netuid = _read_int("NETUID", 99)
         self.epoch_len = _read_int("EPOCH_LEN", 180)
         self.request_timeout = _read_int("REQUEST_TIMEOUT", 300)
-        self.chutes_api_url = _read_str("CHUTES_API_URL", "https://api.chutes.ai")
-        self.chutes_api_key = _read_optional_str("CHUTES_API_KEY")
         self.wallet_name = _read_str("WALLET_NAME", "default")
         self.hotkey_name = _read_str("HOTKEY_NAME", "default")
         self.network = _read_str("NETWORK", "finney")
@@ -376,6 +374,15 @@ class Settings:
         self.source_bucket = _read_str("HIPPIUS_SOURCE_BUCKET", "videos")
         self.object_storage_backend = "r2"
 
+        # ── Hippius Hub (OCI model registry) — miners upload weights here and
+        #    validators download them by immutable digest. Distinct from the
+        #    HIPPIUS_VIDEOS_* S3 creds above (those are for the video corpus).
+        self.hippius_hub_token = _read_optional_str("HIPPIUS_HUB_TOKEN")
+        self.hippius_hub_username = _read_optional_str("HIPPIUS_HUB_USERNAME")
+        self.hippius_hub_password = _read_optional_str("HIPPIUS_HUB_PASSWORD")
+        # Local cache for downloaded model snapshots (keyed by repo@digest).
+        self.model_cache_dir = _read_str("LEOMA_MODEL_CACHE_DIR", "/tmp/leoma/hippius_models")
+
         self.r2_endpoint_raw = "https://cce499ad4f3a4703b069771d8ff4215a.r2.cloudflarestorage.com"
         self.r2_region = "auto"
         self.r2_source_bucket = "leoma-videos"
@@ -384,14 +391,10 @@ class Settings:
         self.r2_videos_write_access_key = _read_optional_str("R2_VIDEOS_WRITE_ACCESS_KEY")
         self.r2_videos_write_secret_key = _read_optional_str("R2_VIDEOS_WRITE_SECRET_KEY")
 
-        # ── Decentralized sampling / per-validator buckets ──
-        # Block-based rotation: only one validator samples per window. task_id = block // interval.
+        # ── King-of-the-hill: this validator's own state bucket ──
+        # SAMPLING_ROTATION_INTERVAL is retained only for the (unused) allowlist snapshot.
         self.sampling_rotation_interval = _read_int("SAMPLING_ROTATION_INTERVAL", 100)
-        # The permissioned-validator allowlist is owner-managed in the DB (leoma validator add/remove),
-        # not an env var. The validators table IS the permissioned set.
-        # Static JSON map of every peer's result bucket (incl. self): read creds shared peer-to-peer.
-        self.peer_validators = _read_str("PEER_VALIDATORS", "")
-        # This validator's own R2 result bucket (write creds). Endpoint/region default to R2_ENDPOINT.
+        # This validator's own R2 bucket (write creds) for durable king state.
         self.r2_own_endpoint = _read_str("R2_OWN_ENDPOINT", self.r2_endpoint_raw)
         self.r2_own_region = _read_str("R2_OWN_REGION", self.r2_region)
         self.r2_own_bucket = _read_optional_str("R2_OWN_BUCKET")
@@ -406,16 +409,8 @@ class Settings:
         self.min_video_size = _read_int("MIN_VIDEO_SIZE", 1_000_000)
         self.max_video_size = _read_int("MAX_VIDEO_SIZE", 200_000_000)
         self.clip_duration = _read_int("CLIP_DURATION", 5)
-        self.chute_cache_ttl = _read_int("CHUTE_CACHE_TTL", 300)
         self.max_concurrent_miners = _read_int("MAX_CONCURRENT_MINERS", 5)
-        self.database_url = _read_optional_str("DATABASE_URL")
-        self.postgres_host = _read_str("POSTGRES_HOST", "localhost")
-        self.postgres_port = _read_str("POSTGRES_PORT", "5432")
-        self.postgres_user = _read_str("POSTGRES_USER", "leoma")
-        self.postgres_password = _read_str("POSTGRES_PASSWORD", "leoma")
-        self.postgres_db = _read_str("POSTGRES_DB", "leoma")
         self.hf_token = _read_optional_str("HF_TOKEN")
-        self.model_hash_cache_ttl = _read_int("MODEL_HASH_CACHE_TTL", 3600)
         self.corpus_min_duration = _read_int("CORPUS_MIN_DURATION", 5)
         self.corpus_max_duration = _read_int("CORPUS_MAX_DURATION", 300)
         self.corpus_target_resolution = _read_str("CORPUS_TARGET_RESOLUTION", "720")
@@ -428,8 +423,6 @@ settings = _settings_instance
 NETUID = settings.netuid
 EPOCH_LEN = settings.epoch_len
 REQUEST_TIMEOUT = settings.request_timeout
-CHUTES_API_URL = settings.chutes_api_url
-CHUTES_API_KEY = settings.chutes_api_key
 WALLET_NAME = settings.wallet_name
 HOTKEY_NAME = settings.hotkey_name
 NETWORK = settings.network
@@ -439,6 +432,10 @@ HIPPIUS_VIDEOS_READ_ACCESS_KEY = settings.hippius_videos_read_access_key
 HIPPIUS_VIDEOS_READ_SECRET_KEY = settings.hippius_videos_read_secret_key
 HIPPIUS_VIDEOS_WRITE_ACCESS_KEY = settings.hippius_videos_write_access_key
 HIPPIUS_VIDEOS_WRITE_SECRET_KEY = settings.hippius_videos_write_secret_key
+HIPPIUS_HUB_TOKEN = settings.hippius_hub_token
+HIPPIUS_HUB_USERNAME = settings.hippius_hub_username
+HIPPIUS_HUB_PASSWORD = settings.hippius_hub_password
+MODEL_CACHE_DIR = settings.model_cache_dir
 OBJECT_STORAGE_BACKEND = settings.object_storage_backend
 SOURCE_BUCKET = (
     settings.r2_source_bucket
@@ -453,16 +450,8 @@ VIDEO_RESOLUTION_TOLERANCE = settings.video_resolution_tolerance
 MIN_VIDEO_SIZE = settings.min_video_size
 MAX_VIDEO_SIZE = settings.max_video_size
 CLIP_DURATION = settings.clip_duration
-CHUTE_CACHE_TTL = settings.chute_cache_ttl
 MAX_CONCURRENT_MINERS = settings.max_concurrent_miners
-DATABASE_URL = settings.database_url
-POSTGRES_HOST = settings.postgres_host
-POSTGRES_PORT = settings.postgres_port
-POSTGRES_USER = settings.postgres_user
-POSTGRES_PASSWORD = settings.postgres_password
-POSTGRES_DB = settings.postgres_db
 HF_TOKEN = settings.hf_token
-MODEL_HASH_CACHE_TTL = settings.model_hash_cache_ttl
 CORPUS_MIN_DURATION = settings.corpus_min_duration
 CORPUS_MAX_DURATION = settings.corpus_max_duration
 CORPUS_TARGET_RESOLUTION = settings.corpus_target_resolution
