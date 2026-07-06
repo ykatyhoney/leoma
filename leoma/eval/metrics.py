@@ -4,10 +4,15 @@ Each metric scores how far a generated clip is from the **real ground-truth
 continuation** — lower = better. king and challenger are scored with the same
 metric on the same clips, and the per-clip distances feed the paired bootstrap.
 
-``mse`` and ``ssim`` are pure-numpy (deterministic, dependency-light, and unit
-testable). ``lpips`` is the perceptual metric that best tracks human video
+Metrics span two axes:
+  - spatial fidelity (per-frame): ``mse`` < ``ssim`` < ``lpips`` in sophistication
+  - temporal fidelity (motion):   ``temporal`` (frame-to-frame change vs reality)
+``mse``/``ssim``/``temporal`` are pure-numpy (deterministic, dependency-light,
+unit-testable). ``lpips`` is the perceptual metric that best tracks human video
 quality but needs torch; it is imported lazily so this module stays import-safe
-without a GPU. Select via ``get_metric(name)`` (name comes from config/env).
+without a GPU. ``make_composite`` / ``"composite:lpips=1.0,temporal=0.5"`` blends
+several into the single per-clip scalar the duel needs. Select via
+``get_metric(name)`` (name comes from ``LEOMA_DUEL_METRIC``).
 """
 from __future__ import annotations
 
@@ -72,6 +77,23 @@ def ssim_distance(gen: np.ndarray, truth: np.ndarray) -> float:
     return float(1.0 - np.mean(sims))
 
 
+def temporal_distance(gen: np.ndarray, truth: np.ndarray) -> float:
+    """Motion-fidelity distance: how well the generation's frame-to-frame change
+    matches the real continuation's.
+
+    MSE/SSIM/LPIPS are spatial (per-frame) — they don't see whether the *motion*
+    is right, so a frozen or flickering generation can still score well. This
+    compares the temporal derivatives (Δframe) of gen vs truth, penalizing both
+    too-static and too-jittery motion. 0 = identical motion dynamics.
+    """
+    g, t = _align(gen, truth)
+    if g.shape[0] < 2:
+        return 0.0
+    dg = np.diff(g, axis=0)  # (T-1, H, W): per-pixel motion of the generation
+    dt = np.diff(t, axis=0)  # ... of the real continuation
+    return float(np.mean((dg - dt) ** 2))
+
+
 def lpips_distance(gen: np.ndarray, truth: np.ndarray) -> float:
     """Learned perceptual distance (LPIPS). Lazily loads torch + the lpips net."""
     from leoma.eval._lpips import lpips_video_distance  # lazy heavy import
@@ -82,14 +104,52 @@ def lpips_distance(gen: np.ndarray, truth: np.ndarray) -> float:
 _METRICS: dict[str, Metric] = {
     "mse": mse,
     "ssim": ssim_distance,
+    "temporal": temporal_distance,
     "lpips": lpips_distance,
 }
 
 DEFAULT_METRIC = "lpips"
 
 
+def make_composite(weights: dict) -> Metric:
+    """Build a single per-clip metric that blends several registered metrics.
+
+    ``weights`` maps metric name -> weight, e.g. ``{"lpips": 1.0, "temporal": 0.5}``
+    scores spatial *and* motion fidelity in the one scalar the duel bootstrap
+    needs. NOTE: the metrics live on different numeric scales, so the weights set
+    both the relative importance AND the scale normalization — calibrate them on
+    real data (this is part of the delta/alpha calibration step).
+    """
+    if not weights:
+        raise ValueError("composite needs at least one weighted metric")
+    parts = [(get_metric(name), float(w)) for name, w in weights.items()]
+
+    def composite(gen: np.ndarray, truth: np.ndarray) -> float:
+        return float(sum(w * fn(gen, truth) for fn, w in parts))
+
+    return composite
+
+
 def get_metric(name: str | None) -> Metric:
-    key = (name or DEFAULT_METRIC).strip().lower()
+    """Resolve a metric by name.
+
+    Besides the registered names, accepts a composite spec
+    ``"composite:lpips=1.0,temporal=0.5"`` so a blended metric is selectable
+    purely from config (``LEOMA_DUEL_METRIC``).
+    """
+    key = (name or DEFAULT_METRIC).strip()
+    if key.lower().startswith("composite:"):
+        spec = key.split(":", 1)[1]
+        weights: dict = {}
+        for part in spec.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            metric_name, _, w = part.partition("=")
+            weights[metric_name.strip().lower()] = float(w) if w else 1.0
+        return make_composite(weights)
+
+    key = key.lower()
     if key not in _METRICS:
-        raise ValueError(f"unknown reference metric {name!r}; choices: {sorted(_METRICS)}")
+        raise ValueError(f"unknown reference metric {name!r}; choices: {sorted(_METRICS)} or 'composite:...'")
     return _METRICS[key]

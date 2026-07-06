@@ -5,7 +5,13 @@ Unit tests for the duel runner orchestration (numpy fakes, no torch/diffusers).
 import numpy as np
 import pytest
 
-from leoma.eval.metrics import mse, ssim_distance, get_metric
+from leoma.eval.metrics import (
+    mse,
+    ssim_distance,
+    temporal_distance,
+    make_composite,
+    get_metric,
+)
 from leoma.eval.video_runner import Clip, GenParams, run_duel
 
 
@@ -112,3 +118,64 @@ class TestMetrics:
     def test_get_metric_default_is_lpips(self):
         # lpips is the default; resolves to a callable (torch loaded lazily on call).
         assert callable(get_metric(None))
+
+
+class TestTemporalMetric:
+    def test_identical_motion_is_zero(self):
+        rng = np.random.default_rng(0)
+        a = rng.integers(0, 255, size=(5, 6, 6, 3)).astype("uint8")
+        assert temporal_distance(a, a) == 0.0
+
+    def test_frozen_generation_penalized(self):
+        # Real clip moves; a frozen generation (all frames equal) has no motion,
+        # so its temporal distance to the moving truth is > 0.
+        rng = np.random.default_rng(1)
+        truth = rng.integers(0, 255, size=(5, 6, 6, 3)).astype("uint8")
+        frozen = np.repeat(truth[:1], 5, axis=0)
+        assert temporal_distance(frozen, truth) > 0.0
+
+    def test_single_frame_is_zero(self):
+        a = np.zeros((1, 4, 4, 3), dtype="uint8")
+        assert temporal_distance(a, a) == 0.0
+
+    def test_motion_axis_is_distinct_from_spatial(self):
+        # Two generations with the SAME per-frame content set but different motion:
+        # one matches the truth's frame order, the other reverses it. MSE (spatial,
+        # orderless per frame here) ties, temporal distinguishes.
+        rng = np.random.default_rng(2)
+        truth = rng.integers(0, 255, size=(4, 5, 5, 3)).astype("uint8")
+        reversed_gen = truth[::-1].copy()
+        # spatial content identical set; temporal (motion direction) differs
+        assert temporal_distance(reversed_gen, truth) > 0.0
+
+
+class TestComposite:
+    def test_blend_sums_weighted_parts(self):
+        rng = np.random.default_rng(3)
+        gen = rng.integers(0, 255, size=(4, 5, 5, 3)).astype("uint8")
+        truth = rng.integers(0, 255, size=(4, 5, 5, 3)).astype("uint8")
+        blended = make_composite({"mse": 1.0, "temporal": 0.5})
+        expected = mse(gen, truth) + 0.5 * temporal_distance(gen, truth)
+        assert blended(gen, truth) == pytest.approx(expected)
+
+    def test_composite_via_get_metric_spec(self):
+        m = get_metric("composite:mse=1.0,temporal=0.5")
+        rng = np.random.default_rng(4)
+        gen = rng.integers(0, 255, size=(3, 4, 4, 3)).astype("uint8")
+        truth = rng.integers(0, 255, size=(3, 4, 4, 3)).astype("uint8")
+        expected = mse(gen, truth) + 0.5 * temporal_distance(gen, truth)
+        assert m(gen, truth) == pytest.approx(expected)
+
+    def test_composite_default_weight_is_one(self):
+        m = get_metric("composite:mse,ssim")
+        rng = np.random.default_rng(5)
+        gen = rng.integers(0, 255, size=(3, 4, 4, 3)).astype("uint8")
+        truth = rng.integers(0, 255, size=(3, 4, 4, 3)).astype("uint8")
+        assert m(gen, truth) == pytest.approx(mse(gen, truth) + ssim_distance(gen, truth))
+
+    def test_empty_composite_raises(self):
+        with pytest.raises(ValueError):
+            make_composite({})
+
+    def test_temporal_selectable_by_name(self):
+        assert get_metric("temporal") is temporal_distance
