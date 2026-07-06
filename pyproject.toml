@@ -40,7 +40,9 @@ eval = [
     "transformers",
     "accelerate",
     "safetensors",
-    "lpips",
+    "lpips",                    # perceptual (spatial) metric
+    "opencv-python-headless",   # optical-flow (motion) metric
+    "open_clip_torch",          # CLIP (semantic) metric
     "numpy",
 ]
 

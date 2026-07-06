@@ -4,15 +4,17 @@ Each metric scores how far a generated clip is from the **real ground-truth
 continuation** — lower = better. king and challenger are scored with the same
 metric on the same clips, and the per-clip distances feed the paired bootstrap.
 
-Metrics span two axes:
+Metrics span three axes:
   - spatial fidelity (per-frame): ``mse`` < ``ssim`` < ``lpips`` in sophistication
-  - temporal fidelity (motion):   ``temporal`` (frame-to-frame change vs reality)
+  - temporal fidelity (motion):   ``temporal`` (numpy) < ``flow`` (optical flow)
+  - semantic fidelity:            ``clip`` (embedding cosine distance to reality)
+
 ``mse``/``ssim``/``temporal`` are pure-numpy (deterministic, dependency-light,
-unit-testable). ``lpips`` is the perceptual metric that best tracks human video
-quality but needs torch; it is imported lazily so this module stays import-safe
-without a GPU. ``make_composite`` / ``"composite:lpips=1.0,temporal=0.5"`` blends
-several into the single per-clip scalar the duel needs. Select via
-``get_metric(name)`` (name comes from ``LEOMA_DUEL_METRIC``).
+unit-testable). The learned/heavier metrics are imported lazily so this module
+stays import-safe without their deps: ``lpips`` (torch), ``flow`` (OpenCV, CPU
+and deterministic), ``clip`` (torch + open_clip). ``make_composite`` /
+``"composite:lpips=1.0,flow=0.5"`` blends several into the single per-clip scalar
+the duel needs. Select via ``get_metric(name)`` (from ``LEOMA_DUEL_METRIC``).
 """
 from __future__ import annotations
 
@@ -101,11 +103,27 @@ def lpips_distance(gen: np.ndarray, truth: np.ndarray) -> float:
     return lpips_video_distance(gen, truth)
 
 
+def flow_distance(gen: np.ndarray, truth: np.ndarray) -> float:
+    """Optical-flow motion distance vs the real continuation. Lazily loads OpenCV."""
+    from leoma.eval._flow import flow_video_distance  # lazy heavy import
+
+    return flow_video_distance(gen, truth)
+
+
+def clip_distance(gen: np.ndarray, truth: np.ndarray) -> float:
+    """CLIP semantic distance vs the real continuation. Lazily loads torch + open_clip."""
+    from leoma.eval._clip import clip_video_distance  # lazy heavy import
+
+    return clip_video_distance(gen, truth)
+
+
 _METRICS: dict[str, Metric] = {
     "mse": mse,
     "ssim": ssim_distance,
     "temporal": temporal_distance,
+    "flow": flow_distance,
     "lpips": lpips_distance,
+    "clip": clip_distance,
 }
 
 DEFAULT_METRIC = "lpips"
