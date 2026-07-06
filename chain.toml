@@ -1,0 +1,32 @@
+# Leoma — pinned video-generation architecture + genesis king.
+#
+# Every miner submits WEIGHTS for the single base architecture pinned here; the
+# validator loads king + challenger with the same pipeline and duels them on
+# held-out clips. To advance a generation, edit this file (and add a custom-code
+# module under [arch].module only if the architecture itself changes).
+#
+# The base is Wan2.1-I2V-14B-480P (480p matches Leoma's 832x480 corpus). The
+# genesis king is the base model itself until a challenger dethrones it;
+# seed_digest is pinned once the exact base revision is chosen (see [seed]).
+[chain]
+name = "leoma"
+seed_repo = "RendixNetwork/leoma-genesis"
+repo_pattern = "^[^/]+/leoma-.+$"
+
+[arch]
+# The pinned base I2V/TI2V model — the reference architecture all challengers
+# fine-tune. Miners submit only weights compatible with this config.
+base_repo = "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"
+# diffusers pipeline class used to load + generate with king and challenger.
+pipeline = "WanImageToVideoPipeline"
+# Optional custom-code module (empty for a stock diffusers pipeline).
+module = ""
+# Config keys locked to the base arch's values; a challenger whose config.json
+# diverges on any of these is rejected (finalized alongside the Phase 2 runner).
+extra_lock_keys = []
+
+[seed]
+# Genesis king backend + immutable digest. Empty digest => seeded from the base
+# repo's default revision on first run (finalize with the pinned digest).
+repo_backend = "hf"
+seed_digest = ""

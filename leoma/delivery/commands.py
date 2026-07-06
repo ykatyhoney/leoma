@@ -311,95 +311,94 @@ def get_rank():
 @cli.group()
 def miner():
     """Miner management commands.
-    
-    Commands for deploying I2V models to Chutes and committing
-    model info to the blockchain.
+
+    Commands for uploading model weights to Hippius Hub and committing
+    the model reveal to the blockchain for validator discovery.
     """
 
 
 @miner.command("push")
-@click.option("--model-name", required=True, help="HuggingFace repository ID (e.g., user/model-name)")
-@click.option("--model-revision", required=True, help="HuggingFace commit SHA")
-@click.option("--chutes-api-key", help="Chutes API key (optional, from env CHUTES_API_KEY)")
-@click.option("--chute-user", help="Chutes username (optional, from env CHUTE_USER)")
-def miner_push(model_name, model_revision, chutes_api_key, chute_user):
-    """Deploy I2V model to Chutes.
-    
-    Generates a Chute configuration for the I2V model and deploys it.
-    
+@click.option("--model-dir", required=True, help="Local folder with the model weights (safetensors + config)")
+@click.option("--repo", required=True, help="Hippius Hub repo id (must start with 'leoma' and end with your hotkey), e.g. user/leoma-<name>-<hotkey>")
+@click.option("--revision", default=None, help="Optional revision/branch label for the upload")
+@click.option("--message", "commit_message", default=None, help="Optional upload commit message")
+def miner_push(model_dir, repo, revision, commit_message):
+    """Upload model weights to Hippius Hub.
+
+    Uploads the safetensors + config from a local folder to Hippius Hub and
+    prints the immutable repo@digest to commit.
+
     Example:
-    
-        leoma miner push --model-name user/model --model-revision abc123 --chutes-api-key api-key --chute-user myuser
+
+        leoma miner push --model-dir ./out --repo user/leoma-mymodel-5GRW...
     """
     import json
     from leoma.bootstrap import emit_log as log, emit_header as log_header
     from leoma.app.miner.main import push_command
-    
+
     async def run():
-        log_header("Deploying to Chutes")
-        log(f"Repository: {model_name}", "info")
-        log(f"Revision: {model_revision[:16]}...", "info")
-        
+        log_header("Uploading to Hippius Hub")
+        log(f"Model dir: {model_dir}", "info")
+        log(f"Repo: {repo}", "info")
+
         result = await push_command(
-            model_name=model_name,
-            model_revision=model_revision,
-            chutes_api_key=chutes_api_key,
-            chute_user=chute_user,
+            model_dir=model_dir,
+            repo=repo,
+            revision=revision,
+            commit_message=commit_message,
         )
-        
+
         print(json.dumps(result, indent=2))
-        
+
         if result.get("success"):
-            log_header("Deployment Complete")
-            log(f"Chute ID: {result.get('chute_id')}", "success")
+            log_header("Upload Complete")
+            log(f"Immutable ref: {result.get('immutable_ref')}", "success")
+            log("Next: leoma miner commit --repo <repo> --digest <digest>", "info")
         else:
-            log(f"Deployment failed: {result.get('error')}", "error")
-    
+            log(f"Upload failed: {result.get('error')}", "error")
+
     _run_async(run())
 
 
 @miner.command("commit")
-@click.option("--model-name", required=True, help="HuggingFace repository ID")
-@click.option("--model-revision", required=True, help="HuggingFace commit SHA")
-@click.option("--chute-id", required=True, help="Chutes deployment ID")
+@click.option("--repo", required=True, help="Hippius Hub repo id (from push output)")
+@click.option("--digest", required=True, help="Immutable digest, e.g. sha256:<64hex> (from push output)")
 @click.option("--coldkey", help="Wallet coldkey name (optional, from env WALLET_NAME)")
 @click.option("--hotkey", help="Wallet hotkey name (optional, from env HOTKEY_NAME)")
-def miner_commit(model_name, model_revision, chute_id, coldkey, hotkey):
-    """Commit model info to blockchain.
-    
-    Commits the model repository, revision, and chute ID to the
-    Bittensor chain for validator discovery.
-    
+def miner_commit(repo, digest, coldkey, hotkey):
+    """Commit the model reveal to the blockchain.
+
+    Reveals ``v4|<repo>|<digest>|<hotkey>`` on-chain so validators can discover
+    and download the exact model weights.
+
     Example:
-    
-        leoma miner commit --model-name user/model --model-revision abc123 --chute-id xyz789 --coldkey default --hotkey default
+
+        leoma miner commit --repo user/leoma-mymodel-5GRW... --digest sha256:abc...
     """
     import json
     from leoma.bootstrap import emit_log as log, emit_header as log_header
     from leoma.app.miner.main import commit_command
-    
+
     async def run():
         log_header("Committing to Chain")
-        log(f"Repository: {model_name}", "info")
-        log(f"Revision: {model_revision[:16]}...", "info")
-        log(f"Chute ID: {chute_id}", "info")
-        
+        log(f"Repo: {repo}", "info")
+        log(f"Digest: {digest[:24]}...", "info")
+
         result = await commit_command(
-            model_name=model_name,
-            model_revision=model_revision,
-            chute_id=chute_id,
+            repo=repo,
+            digest=digest,
             coldkey=coldkey,
             hotkey=hotkey,
         )
-        
+
         print(json.dumps(result, indent=2))
-        
+
         if result.get("success"):
             log_header("Commit Complete")
-            log("Model info committed to chain", "success")
+            log("Model reveal committed to chain", "success")
         else:
             log(f"Commit failed: {result.get('error')}", "error")
-    
+
     _run_async(run())
 
 

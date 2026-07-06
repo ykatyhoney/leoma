@@ -376,6 +376,15 @@ class Settings:
         self.source_bucket = _read_str("HIPPIUS_SOURCE_BUCKET", "videos")
         self.object_storage_backend = "r2"
 
+        # ── Hippius Hub (OCI model registry) — miners upload weights here and
+        #    validators download them by immutable digest. Distinct from the
+        #    HIPPIUS_VIDEOS_* S3 creds above (those are for the video corpus).
+        self.hippius_hub_token = _read_optional_str("HIPPIUS_HUB_TOKEN")
+        self.hippius_hub_username = _read_optional_str("HIPPIUS_HUB_USERNAME")
+        self.hippius_hub_password = _read_optional_str("HIPPIUS_HUB_PASSWORD")
+        # Local cache for downloaded model snapshots (keyed by repo@digest).
+        self.model_cache_dir = _read_str("LEOMA_MODEL_CACHE_DIR", "/tmp/leoma/hippius_models")
+
         self.r2_endpoint_raw = "https://cce499ad4f3a4703b069771d8ff4215a.r2.cloudflarestorage.com"
         self.r2_region = "auto"
         self.r2_source_bucket = "leoma-videos"
@@ -439,6 +448,10 @@ HIPPIUS_VIDEOS_READ_ACCESS_KEY = settings.hippius_videos_read_access_key
 HIPPIUS_VIDEOS_READ_SECRET_KEY = settings.hippius_videos_read_secret_key
 HIPPIUS_VIDEOS_WRITE_ACCESS_KEY = settings.hippius_videos_write_access_key
 HIPPIUS_VIDEOS_WRITE_SECRET_KEY = settings.hippius_videos_write_secret_key
+HIPPIUS_HUB_TOKEN = settings.hippius_hub_token
+HIPPIUS_HUB_USERNAME = settings.hippius_hub_username
+HIPPIUS_HUB_PASSWORD = settings.hippius_hub_password
+MODEL_CACHE_DIR = settings.model_cache_dir
 OBJECT_STORAGE_BACKEND = settings.object_storage_backend
 SOURCE_BUCKET = (
     settings.r2_source_bucket

@@ -45,6 +45,29 @@ def parse_commit(commit_value: str) -> Dict[str, Any]:
     return parsed or {}
 
 
+def validate_repo_name(
+    model_name: str,
+    hotkey: Optional[str] = None,
+) -> Tuple[bool, Optional[str]]:
+    """Validate a model repo id against the naming rules.
+
+    The repo name (part after the last "/") must start with "leoma"
+    (case-insensitive) and, when a hotkey is provided, end with that hotkey
+    (case-insensitive). Shared by the miner (name its upload correctly) and the
+    validator (accept a challenger reveal). Returns (is_valid, error_reason).
+    """
+    repo_name_lower = _repo_name_from_model_name(model_name).lower()
+
+    if not repo_name_lower.startswith(MODEL_NAME_PREFIX.lower()):
+        return False, "model_name_must_start_with_leoma"
+
+    if hotkey and hotkey.strip():
+        if not repo_name_lower.endswith(hotkey.strip().lower()):
+            return False, "model_name_must_end_with_hotkey"
+
+    return True, None
+
+
 def validate_commit_fields(
     commit: Dict[str, Any],
     hotkey: Optional[str] = None,
@@ -61,19 +84,7 @@ def validate_commit_fields(
         if not commit.get(field, ""):
             return False, error_reason
 
-    model_name = (commit.get("model_name") or "").strip()
-    repo_name = _repo_name_from_model_name(model_name)
-    repo_name_lower = repo_name.lower()
-
-    if not repo_name_lower.startswith(MODEL_NAME_PREFIX.lower()):
-        return False, "model_name_must_start_with_leoma"
-
-    if hotkey and hotkey.strip():
-        hotkey_lower = hotkey.strip().lower()
-        if not repo_name_lower.endswith(hotkey_lower):
-            return False, "model_name_must_end_with_hotkey"
-
-    return True, None
+    return validate_repo_name((commit.get("model_name") or "").strip(), hotkey=hotkey)
 
 
 def validate_commit_count(
