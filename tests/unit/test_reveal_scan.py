@@ -45,7 +45,7 @@ class TestScanReveals:
         assert scan_reveals(commits) == []
 
     def test_legacy_json_skipped(self):
-        legacy = '{"model_name": "user/leoma-old", "model_revision": "abc", "chute_id": "x"}'
+        legacy = '{"model_name": "user/leoma-old", "model_revision": "abc", "endpoint_id": "x"}'
         assert scan_reveals({HK1: [(120, legacy)]}) == []
 
     def test_bad_repo_name_dropped(self):

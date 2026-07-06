@@ -111,7 +111,7 @@ class TestRevealV4:
         [
             "",
             "garbage",
-            '{"model_name": "user/leoma-old", "model_revision": "x", "chute_id": "y"}',  # legacy JSON
+            '{"model_name": "user/leoma-old", "model_revision": "x", "endpoint_id": "y"}',  # legacy JSON
             f"v3|{SHA256_DIGEST}|{REPO}|{SHA256_DIGEST}|{HOTKEY}",  # legacy v3 shape
             f"v4|{REPO}|{SHA256_DIGEST}",                            # too few parts
             f"v4|{REPO}|{SHA256_DIGEST}|{HOTKEY}|extra",             # too many parts

@@ -1,10 +1,9 @@
 """Validator-side discovery of miner model submissions from on-chain reveals.
 
-Replaces the Chutes-resolution step: instead of resolving a miner-hosted chute,
-the validator reads the revealed commitments from chain, parses each into an
+The validator reads the revealed commitments from chain, parses each into an
 immutable ``(repo, digest)`` model reference, and queues the challenger for
-evaluation. The validator downloads the weights itself (``model_store``) — no
-miner endpoint is ever contacted.
+evaluation. It downloads the weights itself (``model_store``) — no miner-hosted
+endpoint is ever contacted.
 """
 from __future__ import annotations
 
@@ -38,7 +37,7 @@ def scan_reveals(
       - drop blacklisted hotkeys,
       - require the payload's author hotkey to match the chain signer (chain wins),
       - enforce the repo naming rule (starts "leoma", ends with the hotkey),
-      - skip legacy/malformed/non-v4 payloads (e.g. the old JSON chute commit).
+      - skip legacy/malformed/non-v4 payloads (e.g. the old JSON commit format).
 
     Entries are returned in ascending commit-block order (older submissions
     first), so a stable, deterministic queue across validators.

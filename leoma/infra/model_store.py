@@ -4,7 +4,7 @@ Miners upload their video-generation model weights (safetensors + config) to
 Hippius Hub — a content-addressed OCI registry — and commit a compact
 ``v4|<repo>|<digest>|<hotkey>`` reveal on-chain. Validators read the reveal,
 resolve it to an immutable ``repo@digest`` reference, and download the exact
-bytes themselves (no miner-hosted endpoint, no Chutes).
+bytes themselves (no miner-hosted inference endpoint).
 
 ``hippius_hub`` is imported lazily inside the functions that need it so that
 ``ModelRef`` and the reveal parsing/serialisation (the parts exercised by unit
@@ -198,9 +198,8 @@ def build_reveal_v4(challenger_ref: ModelRef, author_hotkey: str) -> str:
 def parse_reveal_v4(payload: str) -> tuple[ModelRef, str]:
     """Returns (ModelRef(challenger_repo, challenger_digest), author_hotkey).
 
-    Raises ValueError for any non-v4 / malformed payload (e.g. the legacy JSON
-    ``{model_name, model_revision, chute_id}`` commitment), so the scanner can
-    treat those as skippable.
+    Raises ValueError for any non-v4 / malformed payload (e.g. a legacy JSON
+    commitment), so the scanner can treat those as skippable.
     """
     parts = (payload or "").strip().split("|")
     if len(parts) != 4 or parts[0] != REVEAL_V4_PREFIX:

@@ -17,14 +17,10 @@ dependencies = [
     "click",
     "pydantic>=2.0.0,<3",
     "yt-dlp",
-    # Database
-    "asyncpg>=0.29.0,<0.30",
-    "sqlalchemy[asyncio]>=2.0.0,<3",
-    # API (pin minor for reproducible builds; run pip audit before production)
+    # Eval server HTTP (validator dispatches duels here)
     "fastapi>=0.109.0,<0.116.0",
     "uvicorn[standard]>=0.27.0",
-    # Miner cli
-    "chutes>=0.4.8",
+    "httpx",
     "pillow",
 ]
 

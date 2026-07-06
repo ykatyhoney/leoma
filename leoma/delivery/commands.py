@@ -16,32 +16,14 @@ def _run_async(coroutine) -> None:
     asyncio.run(coroutine)
 
 
-def _api_url() -> str:
-    """Return configured API base URL."""
-    import os
-
-    return os.environ.get("API_URL", "https://api.leoma.ai")
-
-
 @click.group()
 @click.version_option(version=__version__, prog_name="leoma")
 def cli():
     """Leoma - Image-to-Video Generation Subnet
-    
-    A TI2V subnet where miners run I2V generators and validators
-    challenge them using GPT-4o pass/fail evaluation.
-    """
 
-
-@cli.command()
-def api():
-    """Start the API service (with background tasks).
-    
-    Runs FastAPI + miner validation, score calculation, and rank update tasks.
-    Requires DATABASE_URL (or POSTGRES_*). Listens on API_HOST:API_PORT (default 0.0.0.0:8000).
+    A king-of-the-hill TI2V subnet: miners upload model weights to Hippius Hub,
+    validators download them and duel challenger vs king on held-out clips.
     """
-    from leoma.delivery.http.server import main as api_main
-    api_main()
 
 
 @cli.command()
@@ -65,18 +47,6 @@ def servers():
     """
 
 
-@servers.command("sampler")
-def start_sampler():
-    """Start the validator sampler + self-evaluator (separate process).
-
-    On this validator's rotation turn (GET /rotation): samples valid miners, uploads the task
-    artifacts to its own bucket (R2_OWN_BUCKET), self-evaluates them (no cross-validation),
-    publishes verdicts to its bucket, dual-reports to the dashboard, and announces the task.
-    """
-    from leoma.app.sampler.loop import run_sampler_loop
-    _run_async(run_sampler_loop())
-
-
 @servers.command("validator")
 def start_validator():
     """Start the king-of-the-hill validator (duel + weight-setter).
@@ -98,119 +68,6 @@ def start_eval_server():
     """
     from leoma.eval_server import main as eval_main
     eval_main()
-
-
-@cli.group()
-def db():
-    """Database management commands.
-    
-    Commands for initializing and managing the PostgreSQL database.
-    """
-
-
-@db.command("init")
-def db_init():
-    """Initialize database tables.
-    
-    Creates all tables from the ORM (leoma.infra.db.tables). Use for fresh installs.
-    """
-    from leoma.bootstrap import emit_log as log, emit_header as log_header
-    from leoma.infra.db.pool import init_database, create_tables, close_database
-    
-    async def run():
-        log_header("Database Initialization")
-        await init_database()
-        await create_tables()
-        await close_database()
-        log("Database initialization complete", "success")
-    
-    _run_async(run())
-
-
-@cli.group()
-def blacklist():
-    """Blacklist management commands (via API)."""
-
-
-@blacklist.command("list")
-def blacklist_list():
-    """Show blacklisted miner hotkeys."""
-    from leoma.bootstrap import emit_log as log, emit_header as log_header
-    
-    async def run():
-        log_header("Blacklist")
-        
-        api_url = _api_url()
-        
-        from leoma.infra.remote_api import APIClient
-        
-        client = APIClient(api_url=api_url)
-        try:
-            hotkeys = await client.get_blacklisted_miners()
-            
-            if not hotkeys:
-                log("Blacklist is empty", "info")
-            else:
-                for hotkey in hotkeys:
-                    log(f"  {hotkey}", "info")
-                log(f"Total: {len(hotkeys)} miners", "info")
-        finally:
-            await client.close()
-    
-    _run_async(run())
-
-
-@blacklist.command("add")
-@click.argument("hotkey")
-@click.option("--reason", "-r", default=None, help="Reason for blacklisting")
-def blacklist_add(hotkey: str, reason: str):
-    """Add a miner to the blacklist (requires admin wallet)."""
-    from leoma.bootstrap import emit_log as log
-    from leoma.bootstrap import WALLET_NAME, HOTKEY_NAME
-    
-    async def run():
-        api_url = _api_url()
-        
-        from leoma.infra.remote_api import create_api_client_from_wallet
-        
-        client = create_api_client_from_wallet(
-            wallet_name=WALLET_NAME,
-            hotkey_name=HOTKEY_NAME,
-            api_url=api_url,
-        )
-        try:
-            await client.add_to_blacklist(hotkey=hotkey, reason=reason)
-            log(f"Added {hotkey} to blacklist", "success")
-        finally:
-            await client.close()
-    
-    _run_async(run())
-
-
-@blacklist.command("remove")
-@click.argument("hotkey")
-def blacklist_remove(hotkey: str):
-    """Remove a miner from the blacklist (requires admin wallet)."""
-    from leoma.bootstrap import emit_log as log
-    from leoma.bootstrap import WALLET_NAME, HOTKEY_NAME
-    
-    async def run():
-        api_url = _api_url()
-        
-        from leoma.infra.remote_api import create_api_client_from_wallet
-        
-        client = create_api_client_from_wallet(
-            wallet_name=WALLET_NAME,
-            hotkey_name=HOTKEY_NAME,
-            api_url=api_url,
-        )
-        try:
-            await client.remove_from_blacklist(hotkey)
-            log(f"Removed {hotkey} from blacklist", "success")
-        finally:
-            await client.close()
-
-    _run_async(run())
 
 
 @cli.group()
@@ -266,41 +123,6 @@ def corpus_expand(count, concurrent, query):
             if len(results["errors"]) > 5:
                 log(f"  ... and {len(results['errors']) - 5} more errors", "warn")
     
-    _run_async(run())
-
-
-@cli.command("get-rank")
-def get_rank():
-    """Print miner rank list from the API (same data as the dashboard).
-    
-    Requires API_URL. Use GET /scores/rank under the hood.
-    """
-    from leoma.bootstrap import emit_log as log, emit_header as log_header
-    from leoma.infra.remote_api import APIClient
-
-    async def run():
-        api_url = _api_url()
-        log_header("Miner rank")
-        client = APIClient(api_url=api_url)
-        try:
-            data = await client.get_rank()
-            ranks = data.get("ranks") or []
-            if not ranks:
-                log("No ranks yet", "info")
-                return
-            for r in ranks:
-                hotkey = r.get("miner_hotkey", "?")[:12]
-                uid = r.get("uid", "?")
-                rank = r.get("rank", "?")
-                passed_count = r.get("passed_count", 0)
-                pass_rate = r.get("pass_rate", 0.0)
-                eligible = r.get("eligible", False)
-                block = r.get("block")
-                block_str = str(block) if block is not None else "—"
-                log(f"  #{rank}  UID {uid}  block {block_str}  {hotkey}...  {passed_count} passes ({pass_rate:.1%})  eligible={eligible}", "info")
-        finally:
-            await client.close()
-
     _run_async(run())
 
 

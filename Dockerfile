@@ -1,6 +1,6 @@
 FROM python:3.12-slim
 
-# ffprobe/ffmpeg for video processing (evaluator, owner-sampler); curl for healthchecks; build-essential for compiling Python deps if needed.
+# ffprobe/ffmpeg for video processing (eval server); curl for healthchecks; build-essential for compiling Python deps if needed.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg curl build-essential \
     && rm -rf /var/lib/apt/lists/*

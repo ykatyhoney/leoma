@@ -1,10 +1,10 @@
 """Miner command implementations.
 
-Two steps replace the old Chutes deploy:
+Two steps:
   push   — upload the model-weights folder to Hippius Hub -> immutable ModelRef
   commit — reveal ``v4|<repo>|<digest>|<hotkey>`` on-chain for validator discovery
 
-Miners no longer host inference; validators download these weights and run the
+Miners do not host inference; validators download these weights and run the
 model themselves. The Hippius repo name must start with "leoma" and end with the
 miner's hotkey ss58 (the validator enforces this on discovery).
 """
