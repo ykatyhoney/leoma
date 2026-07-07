@@ -1,0 +1,80 @@
+"""Build + publish the public ``dashboard.json`` (Teutonic-style).
+
+The validator has no API, so — like Teutonic — it publishes a single JSON
+snapshot to its own bucket that the website polls. This module builds that
+payload from the in-memory king state (pure, testable) and writes it to the
+bucket. The bucket object must be public-read for the site to fetch it.
+
+Shape (consumed by the leoma-app dashboard):
+  updated_at, chain{name,seed_repo,seed_digest,netuid}, duel_params,
+  king{hotkey,uid,model_repo,model_digest,reign_number,crowned_at,crowned_block,...},
+  king_chain[{...,uid,weight}]   (current king first; weight = equal share, 1/n),
+  stats{accepted,rejected,failed},
+  queue[{hotkey,uid,model_repo,model_digest,block,status}],
+  history[{hotkey,uid,model_repo,verdict,accepted,mu_hat,lcb,...}]  (newest first)
+"""
+from __future__ import annotations
+
+from typing import Optional
+
+from leoma.app.validator import king as K
+from leoma.app.validator.state_store import JsonBucketStore, KingState
+
+KEY_DASHBOARD = "dashboard.json"
+
+
+def _king_entry(entry: dict, uid_map: dict[str, int]) -> dict:
+    hk = entry.get("hotkey", "")
+    return {
+        "hotkey": hk,
+        "uid": uid_map.get(hk),
+        "model_repo": entry.get("model_repo", ""),
+        "model_digest": entry.get("model_digest", ""),
+        "reign_number": entry.get("reign_number"),
+        "crowned_at": entry.get("crowned_at"),
+        "crowned_block": entry.get("crowned_block"),
+        "challenge_id": entry.get("challenge_id"),
+        "previous_repo": entry.get("previous_repo", ""),
+    }
+
+
+def build_dashboard(
+    state: KingState,
+    uid_map: dict[str, int],
+    *,
+    chain_meta: dict,
+    duel_params: dict,
+    updated_at: str,
+    queue: Optional[list[dict]] = None,
+) -> dict:
+    """Assemble the dashboard payload (pure — no I/O, no wall clock)."""
+    # Distinct king hotkeys sharing emission (current king first), and the equal
+    # share among those actually registered on the metagraph.
+    hks = K.king_hotkeys(state.king, state.king_chain)
+    registered = [hk for hk in hks if hk in uid_map]
+    weight = round(1.0 / len(registered), 9) if registered else None
+
+    chain = ([state.king] if state.king else []) + list(state.king_chain or [])
+    king_chain = []
+    for entry in chain:
+        row = _king_entry(entry, uid_map)
+        row["weight"] = weight if entry.get("hotkey", "") in uid_map else None
+        king_chain.append(row)
+
+    king = _king_entry(state.king, uid_map) if state.king else {}
+
+    return {
+        "updated_at": updated_at,
+        "chain": chain_meta,
+        "duel_params": duel_params,
+        "king": king,
+        "king_chain": king_chain,
+        "stats": dict(state.stats),
+        "queue": list(queue or []),
+        "history": list(state.history),
+    }
+
+
+def publish_dashboard(store: JsonBucketStore, payload: dict) -> None:
+    """Write the dashboard snapshot to the bucket (public-read object)."""
+    store.put(KEY_DASHBOARD, payload)

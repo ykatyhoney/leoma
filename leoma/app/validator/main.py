@@ -17,6 +17,7 @@ persists to this validator's own bucket (``state_store``).
 import os
 import json
 import asyncio
+from datetime import datetime, timezone
 from typing import Optional
 
 import bittensor as bt
@@ -30,9 +31,10 @@ from leoma.bootstrap import (
 )
 from leoma.bootstrap import emit_log as log, emit_header as log_header, log_exception
 from leoma.infra.storage_backend import create_own_write_client, ensure_bucket_exists
-from leoma.infra.chain_config import SEED_REPO, SEED_DIGEST
+from leoma.infra.chain_config import NAME as CHAIN_NAME, SEED_REPO, SEED_DIGEST
 from leoma.app.validator.reveal_scan import scan_reveals, ChallengerEntry
 from leoma.app.validator.state_store import JsonBucketStore, KingState
+from leoma.app.validator.dashboard import build_dashboard, publish_dashboard
 from leoma.app.validator import king as K
 
 EVAL_SERVER_URL = os.environ.get("EVAL_SERVER_URL", "http://localhost:9000")
@@ -159,6 +161,78 @@ def ensure_genesis_king(state: KingState, block: int) -> None:
     log(f"Seeded genesis king from {SEED_REPO}@{SEED_DIGEST[:16]}...", "success")
 
 
+def _duel_history_entry(entry: ChallengerEntry, verdict: dict, uid_map: dict[str, int]) -> dict:
+    """A dashboard history row from a completed duel verdict."""
+    return {
+        "challenge_id": verdict.get("challenge_id") or f"block-{entry.block}",
+        "hotkey": entry.hotkey,
+        "uid": uid_map.get(entry.hotkey),
+        "model_repo": entry.model_repo,
+        "model_digest": entry.model_digest,
+        "accepted": bool(verdict.get("accepted")),
+        "verdict": verdict.get("verdict", "unknown"),
+        "mu_hat": verdict.get("mu_hat"),
+        "lcb": verdict.get("lcb"),
+        "delta": verdict.get("delta_threshold"),
+        "avg_king_distance": verdict.get("avg_king_distance"),
+        "avg_challenger_distance": verdict.get("avg_challenger_distance"),
+        "metric": DUEL_METRIC,
+        "n_clips": verdict.get("n_clips"),
+        "block": entry.block,
+        "timestamp": verdict.get("timestamp"),
+    }
+
+
+def _build_queue(state: KingState, entries: list[ChallengerEntry], uid_map: dict[str, int]) -> list[dict]:
+    """Pending-challenger view for the dashboard (excludes the reigning king)."""
+    queue = []
+    for e in entries:
+        if _is_current_king(state, e):
+            continue
+        seen = _seen_key(e.hotkey, e.model_digest) in state.seen_hotkeys
+        queue.append({
+            "hotkey": e.hotkey,
+            "uid": uid_map.get(e.hotkey),
+            "model_repo": e.model_repo,
+            "model_digest": e.model_digest,
+            "block": e.block,
+            "status": "seen" if seen else "unseen",
+        })
+    return queue
+
+
+def _publish_dashboard(
+    state: KingState,
+    uid_map: dict[str, int],
+    store: JsonBucketStore,
+    queue: list[dict],
+) -> None:
+    """Build + publish the public dashboard.json snapshot (best-effort)."""
+    try:
+        payload = build_dashboard(
+            state,
+            uid_map,
+            chain_meta={
+                "name": CHAIN_NAME,
+                "seed_repo": SEED_REPO,
+                "seed_digest": SEED_DIGEST,
+                "netuid": NETUID,
+            },
+            duel_params={
+                "metric": DUEL_METRIC,
+                "n_clips": DUEL_N_CLIPS,
+                "delta_threshold": DELTA_THRESHOLD,
+                "alpha": ALPHA,
+                "n_bootstrap": N_BOOTSTRAP,
+            },
+            updated_at=datetime.now(timezone.utc).isoformat(),
+            queue=queue,
+        )
+        publish_dashboard(store, payload)
+    except Exception as e:
+        log(f"Dashboard publish failed: {e}", "warn")
+
+
 async def process_challengers(
     subtensor: bt.AsyncSubtensor,
     wallet: bt.Wallet,
@@ -181,6 +255,17 @@ async def process_challengers(
             )
             state.seen_hotkeys.add(key)
             state.stats["accepted"] = state.stats.get("accepted", 0) + 1
+            state.record_duel({
+                "challenge_id": "first",
+                "hotkey": entry.hotkey,
+                "uid": uid_map.get(entry.hotkey),
+                "model_repo": entry.model_repo,
+                "model_digest": entry.model_digest,
+                "accepted": True,
+                "verdict": "challenger",
+                "block": entry.block,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
             state.flush(store)
             log(f"Crowned first king {entry.hotkey[:12]}... ({entry.model_repo})", "success")
             await maybe_set_weights(subtensor, wallet, state, uid_map, store, force=True)
@@ -198,6 +283,7 @@ async def process_challengers(
             return  # server busy; retry later, keep entry unseen
 
         state.seen_hotkeys.add(key)
+        state.record_duel(_duel_history_entry(entry, verdict, uid_map))
         if verdict.get("accepted"):
             state.king, state.king_chain = K.crown(
                 state.king, state.king_chain, hotkey=entry.hotkey, model_repo=entry.model_repo,
@@ -231,6 +317,9 @@ async def tick(
 
     # Periodic weight refresh (also keeps the king chain aligned as UIDs change).
     await maybe_set_weights(subtensor, wallet, state, uid_map, store)
+
+    # Publish the public dashboard snapshot for the website.
+    _publish_dashboard(state, uid_map, store, _build_queue(state, entries, uid_map))
 
 
 async def main() -> None:

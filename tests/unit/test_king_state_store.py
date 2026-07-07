@@ -102,3 +102,20 @@ class TestKingState:
         assert st.next_eval_id() == "eval-0002"
         st.flush(s)
         assert KingState.load(s).counter == 2
+
+    def test_history_roundtrip_and_newest_first(self):
+        s = _store()
+        st = KingState()
+        st.record_duel({"hotkey": "A", "verdict": "king"})
+        st.record_duel({"hotkey": "B", "verdict": "challenger"})
+        st.flush(s)
+        loaded = KingState.load(s)
+        assert [h["hotkey"] for h in loaded.history] == ["B", "A"]  # newest first
+
+    def test_history_is_bounded(self):
+        from leoma.app.validator.state_store import HISTORY_LIMIT
+        st = KingState()
+        for i in range(HISTORY_LIMIT + 25):
+            st.record_duel({"hotkey": f"h{i}"})
+        assert len(st.history) == HISTORY_LIMIT
+        assert st.history[0]["hotkey"] == f"h{HISTORY_LIMIT + 24}"  # most recent kept

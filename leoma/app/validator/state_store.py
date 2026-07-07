@@ -21,6 +21,10 @@ KEY_KING = "king/current.json"
 KEY_KING_CHAIN = "state/king_chain.json"
 KEY_VALIDATOR_STATE = "state/validator_state.json"
 KEY_SEEN = "state/seen_hotkeys.json"
+KEY_HISTORY = "state/history.json"
+
+# Recent duel verdicts kept for the dashboard (newest first).
+HISTORY_LIMIT = 200
 
 
 class JsonBucketStore:
@@ -70,6 +74,7 @@ class KingState:
     counter: int = 0
     stats: dict = field(default_factory=lambda: {"accepted": 0, "rejected": 0, "failed": 0})
     seen_hotkeys: set = field(default_factory=set)
+    history: list = field(default_factory=list)  # recent duel verdicts, newest first
 
     # ---- persistence -----------------------------------------------------
     @classmethod
@@ -90,6 +95,9 @@ class KingState:
         seen = store.get(KEY_SEEN)
         if seen:
             self.seen_hotkeys = set(seen.get("hotkeys", []))
+        hist = store.get(KEY_HISTORY)
+        if hist:
+            self.history = hist.get("history", [])
         return self
 
     def flush(self, store: JsonBucketStore) -> None:
@@ -102,6 +110,7 @@ class KingState:
             "stats": self.stats,
         })
         store.put(KEY_SEEN, {"hotkeys": sorted(self.seen_hotkeys)})
+        store.put(KEY_HISTORY, {"history": self.history})
 
     # ---- helpers ---------------------------------------------------------
     def next_eval_id(self) -> str:
@@ -110,3 +119,8 @@ class KingState:
 
     def mark_seen(self, hotkey: str) -> None:
         self.seen_hotkeys.add(hotkey)
+
+    def record_duel(self, entry: dict) -> None:
+        """Prepend a duel verdict to the bounded history (newest first)."""
+        self.history.insert(0, entry)
+        del self.history[HISTORY_LIMIT:]
