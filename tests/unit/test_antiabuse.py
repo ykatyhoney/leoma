@@ -23,7 +23,7 @@ from leoma.app.validator.state_store import JsonBucketStore, KingState
 from leoma.eval.metrics import mse
 from leoma.eval.video_runner import Clip, GenParams, run_duel
 
-from tests.unit.conftest import FakeEvalBox, FakeMinio, make_verdict
+from tests.unit.conftest import FakeEvalBox, FakeMinio
 
 KING_DIGEST = "sha256:" + "k" * 64
 PARAMS = GenParams(num_frames=4, fps=2, width=8, height=8)

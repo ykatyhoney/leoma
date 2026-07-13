@@ -109,12 +109,19 @@ def pinned_spec():
 
 @pytest.fixture
 def duel_ready(monkeypatch):
-    """Give the validator a pinned corpus so the duel path can run."""
+    """Give the validator a pinned corpus so the duel path can run.
+
+    The architecture prescreen is switched off here: it fetches real configs from the
+    Hub, and these tests are about the dispatch/settle policy, not about the lock. The
+    lock has its own tests (``test_arch_lock.py``), and one test below deliberately
+    turns the prescreen back on to prove it is wired in.
+    """
     import leoma.app.validator.main as vmain
 
     spec = pinned_spec()
     monkeypatch.setattr(vmain, "SPEC", spec)
     monkeypatch.setattr(vmain, "CONSENSUS_DIGEST", spec.digest())
+    monkeypatch.setattr(vmain, "PRESCREEN_ENABLED", False)
     return spec
 
 

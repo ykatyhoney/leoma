@@ -57,11 +57,17 @@ from leoma.app.validator.failures import (
     classify_remote,
 )
 from leoma.app.validator import rate_limit as RL
+from leoma.app.validator.prescreen import prescreen
 from leoma.app.validator.state_store import MAX_DUEL_ATTEMPTS
 from leoma.app.validator import king as K
 
 EVAL_SERVER_URL = os.environ.get("EVAL_SERVER_URL", "http://localhost:9000")
 CHALLENGE_POLL_INTERVAL = int(os.environ.get("LEOMA_CHALLENGE_POLL_INTERVAL", "60"))
+
+# The pre-dispatch architecture check. On by default: it is the difference between a
+# bad model costing ~5 seconds and costing hours of GPU with the lock held. Off only
+# as an operator escape hatch if the Hub's config endpoint is misbehaving.
+PRESCREEN_ENABLED = os.environ.get("LEOMA_PRESCREEN", "1") != "0"
 
 # The duel parameters (metric, n_clips, delta, alpha, bootstrap, generation knobs)
 # are NOT read from the environment any more. They are the consensus surface, and
@@ -737,6 +743,23 @@ async def process_challengers(
             )
             state.degraded = "no_seed_digest"
             return
+
+        # Configs only (~200 KB), on this box, before the GPU is touched. A
+        # wrong-architecture model costs seconds here instead of hours of download +
+        # load, during which the eval server's lock is held and every honest
+        # challenger waits behind it.
+        if PRESCREEN_ENABLED:
+            try:
+                await asyncio.to_thread(prescreen, entry.model_repo, entry.model_digest)
+            except Exception as e:  # noqa: BLE001
+                failure = classify(e)
+                if failure.is_local:
+                    await _local_fault(state, failure)
+                    return
+                if failure.is_permanent:
+                    RL.record_strike(state.duels, entry.hotkey, failure.reason)
+                await _note_failure(state, store, uid_map, entry, key, failure, block)
+                continue
 
         try:
             block_hash = await subtensor.get_block_hash(entry.block)
