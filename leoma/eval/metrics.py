@@ -41,14 +41,51 @@ def _as_float_gray(frames: np.ndarray) -> np.ndarray:
     return arr
 
 
+class ShortGeneration(ValueError):
+    """The generation has fewer frames than the ground truth."""
+
+
+def require_frames(gen: np.ndarray, truth: np.ndarray) -> None:
+    """A generation shorter than the truth is REJECTED, never truncated-to-fit.
+
+    This is the root of the freeze/1-frame cheat, and it is the single
+    highest-leverage guard in the scoring stack.
+
+    ``_align`` used to truncate BOTH arrays to ``min(T_gen, T_truth)``. So a
+    1-frame generation was compared against a 1-frame *truth* — and frame 0 of the
+    truth is exactly **the conditioning frame the model was handed**. A model that
+    emitted a single frame therefore scored near-perfectly on *every* metric,
+    including the production default (lpips):
+
+        flow / clip / temporal -> 0.0   (degenerate early-returns)
+        mse / ssim / lpips     -> ~0    (truth truncated to the input frame)
+
+    Requiring at least as many frames as the truth removes the exploit at its
+    source; the degeneracy and freeze-baseline gates are defence in depth on top.
+
+    A LONGER generation is fine — it is truncated to the truth's length.
+    """
+    n_gen = int(np.asarray(gen).shape[0]) if np.asarray(gen).ndim >= 3 else 1
+    n_truth = int(np.asarray(truth).shape[0]) if np.asarray(truth).ndim >= 3 else 1
+    if n_truth == 0:
+        raise ValueError("no frames to compare")
+    if n_gen < n_truth:
+        raise ShortGeneration(
+            f"generation too short: {n_gen} frames < {n_truth} ground-truth frames. "
+            "A generation shorter than the truth cannot be scored (it would be graded "
+            "against the conditioning frame it was given)."
+        )
+
+
 def _align(gen: np.ndarray, truth: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Truncate both to the shortest common frame count; require equal H,W."""
+    """Align a generation to the truth. The generation may not be SHORTER."""
+    require_frames(gen, truth)
     g = _as_float_gray(gen)
     t = _as_float_gray(truth)
-    n = min(g.shape[0], t.shape[0])
+    n = t.shape[0]          # the truth's length is authoritative
     if n == 0:
         raise ValueError("no frames to compare")
-    g, t = g[:n], t[:n]
+    g, t = g[:n], t[:n]     # a longer generation is truncated; a shorter one already raised
     if g.shape[1:] != t.shape[1:]:
         raise ValueError(f"frame size mismatch: {g.shape[1:]} vs {t.shape[1:]}")
     return g, t
@@ -90,14 +127,18 @@ def temporal_distance(gen: np.ndarray, truth: np.ndarray) -> float:
     """
     g, t = _align(gen, truth)
     if g.shape[0] < 2:
-        return 0.0
+        # Used to return 0.0 — a PERFECT score for a single-frame generation.
+        raise ShortGeneration("temporal distance needs at least 2 frames")
     dg = np.diff(g, axis=0)  # (T-1, H, W): per-pixel motion of the generation
     dt = np.diff(t, axis=0)  # ... of the real continuation
     return float(np.mean((dg - dt) ** 2))
 
 
+# The lazy metrics guard BEFORE their heavy import, so the anti-cheat check is
+# unit-testable on a box with no torch / no OpenCV installed.
 def lpips_distance(gen: np.ndarray, truth: np.ndarray) -> float:
     """Learned perceptual distance (LPIPS). Lazily loads torch + the lpips net."""
+    require_frames(gen, truth)
     from leoma.eval._lpips import lpips_video_distance  # lazy heavy import
 
     return lpips_video_distance(gen, truth)
@@ -105,6 +146,7 @@ def lpips_distance(gen: np.ndarray, truth: np.ndarray) -> float:
 
 def flow_distance(gen: np.ndarray, truth: np.ndarray) -> float:
     """Optical-flow motion distance vs the real continuation. Lazily loads OpenCV."""
+    require_frames(gen, truth)
     from leoma.eval._flow import flow_video_distance  # lazy heavy import
 
     return flow_video_distance(gen, truth)
@@ -112,6 +154,7 @@ def flow_distance(gen: np.ndarray, truth: np.ndarray) -> float:
 
 def clip_distance(gen: np.ndarray, truth: np.ndarray) -> float:
     """CLIP semantic distance vs the real continuation. Lazily loads torch + open_clip."""
+    require_frames(gen, truth)
     from leoma.eval._clip import clip_video_distance  # lazy heavy import
 
     return clip_video_distance(gen, truth)

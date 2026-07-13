@@ -54,9 +54,15 @@ def flow_video_distance(gen: np.ndarray, truth: np.ndarray) -> float:
     """Mean optical-flow endpoint error between generation and truth motion."""
     g = _to_gray_uint8(gen)
     t = _to_gray_uint8(truth)
-    n = min(g.shape[0], t.shape[0])
+    if g.shape[0] < t.shape[0]:
+        raise ValueError(
+            f"generation too short: {g.shape[0]} frames < {t.shape[0]} ground-truth frames"
+        )
+    n = t.shape[0]
     if n < 2:
-        return 0.0
+        # Used to return 0.0 — i.e. a PERFECT score for a model that emits a
+        # single frame. Never reward a degenerate generation.
+        raise ValueError("optical flow needs at least 2 frames")
     g, t = g[:n], t[:n]
     if g.shape[1:] != t.shape[1:]:
         raise ValueError(f"frame size mismatch: {g.shape[1:]} vs {t.shape[1:]}")

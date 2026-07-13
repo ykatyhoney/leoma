@@ -140,6 +140,61 @@ async def dispatch_duel(
     return verdict
 
 
+# bittensor 9.12.2's set_weights returns (success: bool, message: str). Its
+# rate-limit path returns this literal WITHOUT ever submitting an extrinsic.
+_RATE_LIMIT_TOKENS = (
+    "no attempt made",
+    "too soon",
+    "rate limit",
+    "settingweightstoofast",
+)
+
+
+def _unpack_set_weights(result) -> tuple[bool, str]:
+    """Tolerate (bool, str), a bare bool, or an ExtrinsicResponse-like object."""
+    if isinstance(result, tuple) and len(result) == 2:
+        return bool(result[0]), str(result[1])
+    if hasattr(result, "success"):
+        return bool(result.success), str(getattr(result, "message", "") or "")
+    return bool(result), ""
+
+
+def _is_rate_limited(message: str) -> bool:
+    lowered = (message or "").lower()
+    return any(token in lowered for token in _RATE_LIMIT_TOKENS)
+
+
+async def _chain_says_too_soon(subtensor: bt.AsyncSubtensor, wallet: bt.Wallet) -> bool:
+    """Ask the CHAIN whether it is too soon to set weights.
+
+    The chain is the queue, so the chain is also the weight clock. Trusting our
+    own ``last_weight_block`` is what made "state says the weights landed but they
+    didn't" possible; asking the chain makes that structurally impossible.
+    Degrades to False (i.e. attempt the set) if the node doesn't expose these.
+    """
+    try:
+        uid = await subtensor.get_uid_for_hotkey_on_subnet(wallet.hotkey.ss58_address, NETUID)
+        if uid is None:
+            return False
+        since = await subtensor.blocks_since_last_update(NETUID, uid)
+        limit = await subtensor.weights_rate_limit(NETUID)
+    except Exception:
+        return False
+    if since is None or limit is None:
+        return False
+    return since <= limit
+
+
+def _weight_failed(state: KingState, block: int, message: str) -> bool:
+    state.weight_failures += 1
+    # Exponential block backoff, capped — a genuine failure should be retried
+    # soon, NOT after a full WEIGHT_INTERVAL.
+    state.next_weight_block = block + min(2**state.weight_failures, 20)
+    state.touch()
+    log(f"[{block}] set_weights FAILED ({state.weight_failures}x): {message}", "error")
+    return False
+
+
 async def maybe_set_weights(
     subtensor: bt.AsyncSubtensor,
     wallet: bt.Wallet,
@@ -149,23 +204,51 @@ async def maybe_set_weights(
     *,
     force: bool = False,
 ) -> bool:
-    """Set equal weights over the king chain (else burn UID 0), rate-limited."""
-    current_block = await subtensor.get_current_block()
-    if not force and current_block - state.last_weight_block < K.WEIGHT_INTERVAL:
-        return False
+    """Set equal weights over the king chain (else burn UID 0), rate-limited.
 
-    uids, weights, label = K.weight_targets(state.king, state.king_chain, uid_map)
-    log(f"[{current_block}] set_weights -> {label}: uids={uids} weights={[round(w,4) for w in weights]}", "info")
+    The return value of ``set_weights`` used to be discarded. bittensor returns
+    ``(success, message)`` and its rate-limit path returns ``False`` *without
+    submitting anything* — so a no-op advanced ``last_weight_block`` as if the
+    weights had landed, blocking any retry for a full WEIGHT_INTERVAL (~1h) and
+    misreporting the state. We now only advance on a real success.
+    """
+    current_block = await subtensor.get_current_block()
+
+    if not force:
+        if current_block < state.next_weight_block:
+            return False  # backing off after a genuine failure
+        if current_block - state.last_weight_block < K.WEIGHT_INTERVAL:
+            return False
+        if await _chain_says_too_soon(subtensor, wallet):
+            return False
+
+    uids, weights, label = K.weight_targets(
+        state.king, state.king_chain, uid_map, burn_uid=K.BURN_UID
+    )
+    log(
+        f"[{current_block}] set_weights -> {label}: uids={uids} "
+        f"weights={[round(w, 4) for w in weights]}",
+        "info",
+    )
     try:
-        await subtensor.set_weights(
+        result = await subtensor.set_weights(
             wallet=wallet, netuid=NETUID, uids=uids, weights=weights, wait_for_inclusion=True
         )
     except Exception as e:
-        log(f"[{current_block}] set_weights failed: {e}", "error")
-        return False
+        return _weight_failed(state, current_block, f"exception: {e}")
+
+    success, message = _unpack_set_weights(result)
+    if not success:
+        if _is_rate_limited(message):
+            # A no-op, not a failure: do NOT advance last_weight_block.
+            log(f"[{current_block}] set_weights rate-limited ({message}); retrying next tick", "warn")
+            return False
+        return _weight_failed(state, current_block, message)
 
     state.last_weight_block = current_block
     state.last_winner_hotkey = label
+    state.weight_failures = 0
+    state.next_weight_block = 0
     state.touch()
     await state.flush(store)
     return True
@@ -463,6 +546,17 @@ async def main() -> None:
             raise SystemExit(1)
 
     log(f"Loaded king: {(state.king or {}).get('model_repo', 'none')} chain={len(state.king_chain)}", "info")
+
+    # Re-assert weights immediately on startup. Without this, a restarted
+    # validator with a recently-persisted last_weight_block sits idle for up to a
+    # full WEIGHT_INTERVAL (~1h) before it sets weights again.
+    try:
+        block = await subtensor.get_current_block()
+        ensure_genesis_king(state, block)
+        uid_map = await refresh_uid_map(subtensor)
+        await maybe_set_weights(subtensor, wallet, state, uid_map, store, force=True)
+    except Exception as e:
+        log(f"Startup weight-set failed (will retry on the first tick): {e}", "warn")
 
     while True:
         try:

@@ -100,10 +100,17 @@ class TestMetrics:
         a = rng.integers(0, 255, size=(3, 6, 6, 3)).astype("uint8")
         assert ssim_distance(a, a) == pytest.approx(0.0, abs=1e-9)
 
-    def test_align_truncates_to_shortest(self):
-        a = np.zeros((5, 4, 4, 3), dtype="uint8")
-        b = np.zeros((2, 4, 4, 3), dtype="uint8")
-        assert mse(a, b) == 0.0  # compares first 2 frames
+    def test_longer_generation_is_truncated_to_the_truth(self):
+        """A LONGER generation is fine — truncate it. Only a SHORTER one is a cheat."""
+        gen = np.zeros((5, 4, 4, 3), dtype="uint8")
+        truth = np.zeros((2, 4, 4, 3), dtype="uint8")
+        assert mse(gen, truth) == 0.0
+
+    def test_shorter_generation_raises(self):
+        gen = np.zeros((2, 4, 4, 3), dtype="uint8")
+        truth = np.zeros((5, 4, 4, 3), dtype="uint8")
+        with pytest.raises(ValueError, match="too short"):
+            mse(gen, truth)
 
     def test_size_mismatch_raises(self):
         a = np.zeros((2, 4, 4, 3), dtype="uint8")
@@ -134,9 +141,13 @@ class TestTemporalMetric:
         frozen = np.repeat(truth[:1], 5, axis=0)
         assert temporal_distance(frozen, truth) > 0.0
 
-    def test_single_frame_is_zero(self):
-        a = np.zeros((1, 4, 4, 3), dtype="uint8")
-        assert temporal_distance(a, a) == 0.0
+    def test_single_frame_generation_raises(self):
+        """This test used to assert the EXPLOIT: a 1-frame generation scored 0.0
+        (perfect). A degenerate generation must never be rewarded."""
+        truth = np.zeros((8, 4, 4, 3), dtype="uint8")
+        one_frame = np.zeros((1, 4, 4, 3), dtype="uint8")
+        with pytest.raises(ValueError, match="too short"):
+            temporal_distance(one_frame, truth)
 
     def test_motion_axis_is_distinct_from_spatial(self):
         # Two generations with the SAME per-frame content set but different motion:
