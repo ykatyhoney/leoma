@@ -531,7 +531,21 @@ async def process_challengers(
             log("Eval server busy; remaining challengers deferred to next tick", "warn")
             break
         except Exception as e:  # noqa: BLE001 — deliberate: classify, never crash the tick
-            await _note_failure(state, store, uid_map, entry, key, classify(e), block)
+            failure = classify(e)
+
+            if failure.is_local:
+                # OUR fault: a corpus that doesn't match the pinned manifest, an eval
+                # box on a stale chain.toml. It would fail identically for every
+                # challenger, so it is not evidence about this one — and charging it
+                # to the ledger would, after four attempts, quarantine every honest
+                # miner on the subnet for our own misconfiguration. Stop dueling,
+                # say so loudly, and burn until an operator fixes it.
+                log(f"LOCAL FAULT ({failure.reason}) — this validator cannot duel: "
+                    f"{failure.detail}", "error")
+                state.degraded = failure.reason
+                break
+
+            await _note_failure(state, store, uid_map, entry, key, failure, block)
             continue  # <<< THE FIX: one bad challenger no longer blocks the rest
 
         # A completed duel clears the artifact's failure history.

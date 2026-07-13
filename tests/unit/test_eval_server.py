@@ -39,7 +39,7 @@ def _stream_events(client, eval_id):
 
 
 def test_health():
-    c = TestClient(create_app(runner=lambda req, emit: {"accepted": False}))
+    c = TestClient(create_app(runner=lambda req, emit, cancel: {"accepted": False}))
     body = c.get("/health").json()
     assert body["status"] == "ok"
     assert body["busy"] is False
@@ -49,14 +49,14 @@ def test_health_publishes_the_digests_a_validator_preflights_on():
     """A stale eval box is the likeliest consensus failure there is — an operator
     who redeployed three machines out of four. The validator checks these two
     digests before handing over an hours-long duel."""
-    c = TestClient(create_app(runner=lambda req, emit: {"accepted": False}))
+    c = TestClient(create_app(runner=lambda req, emit, cancel: {"accepted": False}))
     body = c.get("/health").json()
     assert body["consensus_digest"].startswith("sha256:")
     assert body["eval_code_digest"].startswith("sha256:")
 
 
 def test_full_duel_flow():
-    def runner(req, emit):
+    def runner(req, emit, cancel):
         emit({"phase": "materialize", "which": "king"})
         emit({"phase": "duel", "n_clips": req.spec.duel.n_clips})
         return {"accepted": True, "verdict": "challenger", "lcb": 0.09,
@@ -79,7 +79,7 @@ def test_full_duel_flow():
 
 
 def test_error_in_runner_becomes_error_event():
-    def runner(req, emit):
+    def runner(req, emit, cancel):
         raise RuntimeError("boom")
 
     c = TestClient(create_app(runner=runner))
@@ -93,7 +93,7 @@ def test_error_in_runner_becomes_error_event():
 def test_single_flight_409_while_busy():
     release = threading.Event()
 
-    def blocking_runner(req, emit):
+    def blocking_runner(req, emit, cancel):
         release.wait(timeout=5)
         return {"accepted": False, "verdict": "king"}
 
@@ -114,7 +114,7 @@ def test_single_flight_409_while_busy():
 
 
 def test_unknown_eval_id_404():
-    c = TestClient(create_app(runner=lambda req, emit: {"accepted": False}))
+    c = TestClient(create_app(runner=lambda req, emit, cancel: {"accepted": False}))
     assert c.get("/eval/does-not-exist").status_code == 404
     assert c.get("/eval/does-not-exist/stream").status_code == 404
 
@@ -128,13 +128,13 @@ class TestRequestCarriesTheWholeExam:
     verdict nobody else could reproduce. Now every field is required."""
 
     def test_a_request_without_a_spec_is_rejected(self):
-        c = TestClient(create_app(runner=lambda req, emit: {"accepted": False}))
+        c = TestClient(create_app(runner=lambda req, emit, cancel: {"accepted": False}))
         legacy = {k: v for k, v in REQ.items() if k not in ("spec", "consensus_digest")}
         legacy.update(metric="lpips", n_clips=8)   # the old shape, verbatim
         assert c.post("/eval", json=legacy).status_code == 422
 
     def test_a_spec_missing_one_field_is_rejected_not_defaulted(self):
-        c = TestClient(create_app(runner=lambda req, emit: {"accepted": False}))
+        c = TestClient(create_app(runner=lambda req, emit, cancel: {"accepted": False}))
         broken = dict(REQ)
         broken["spec"] = dict(broken["spec"])
         broken["spec"]["duel"] = {
@@ -146,14 +146,14 @@ class TestRequestCarriesTheWholeExam:
     def test_an_unknown_field_is_rejected(self):
         # A newer validator sending a field this box does not understand must not
         # be silently ignored — that is a divergence the box would never report.
-        c = TestClient(create_app(runner=lambda req, emit: {"accepted": False}))
+        c = TestClient(create_app(runner=lambda req, emit, cancel: {"accepted": False}))
         extra = dict(REQ, some_future_knob=1)
         assert c.post("/eval", json=extra).status_code == 422
 
     def test_the_runner_sees_exactly_what_was_sent(self):
         seen = {}
 
-        def runner(req, emit):
+        def runner(req, emit, cancel):
             seen["digest"] = req.spec.digest()
             seen["metric"] = req.spec.duel.metric
             seen["frames"] = req.spec.gen.num_frames

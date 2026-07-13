@@ -71,6 +71,19 @@ class DegenerateGeneration(ChallengerFault):
     reason = "challenger_degenerate"
 
 
+class DuelCancelled(TransientDuelError):
+    """The duel was stopped — by an operator, or by the watchdog.
+
+    A subclass of :class:`TransientDuelError` on purpose. A cancelled duel says
+    nothing whatsoever about the challenger's model, so it must cost the miner
+    nothing: it retries, and it never counts toward quarantine. The alternative —
+    a watchdog stall quietly striking the miner whose duel happened to be running —
+    would punish miners for our own box's failures.
+    """
+
+    reason = "cancelled"
+
+
 __all__ = [
     "DuelError",
     "TransientDuelError",
@@ -78,4 +91,5 @@ __all__ = [
     "ConsensusConfigError",
     "ChallengerFault",
     "DegenerateGeneration",
+    "DuelCancelled",
 ]

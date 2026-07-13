@@ -223,6 +223,18 @@ def local_snapshot_path(ref: ModelRef) -> str:
     return str(path)
 
 
+def cache_path(ref: ModelRef, *, config_only: bool = False) -> str:
+    """Where this ref's snapshot lives — whether or not it has been downloaded yet.
+
+    Unlike :func:`local_snapshot_path` this does not require the directory to exist,
+    because the caller that needs it most is the download-progress watcher: it polls
+    the directory *while it is being filled*, which is precisely the window in which
+    "does it exist yet" is the wrong question.
+    """
+    base = _cache_snapshot_path(ref)
+    return str(base.with_name(base.name + "_cfg") if config_only else base)
+
+
 def _call_snapshot_download(ref: ModelRef, local_dir: Optional[str], max_workers: Optional[int],
                             *, allow_patterns=ALLOW_PATTERNS) -> str:
     if ref.digest.startswith("hf:"):

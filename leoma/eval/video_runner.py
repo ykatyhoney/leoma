@@ -28,6 +28,7 @@ import numpy as np
 
 from leoma.eval.bootstrap import can_still_win, paired_bootstrap_verdict
 from leoma.eval.digests import digest_frames
+from leoma.eval.errors import DuelCancelled
 from leoma.eval.guards import validate_generation
 from leoma.eval.metrics import Metric, get_metric
 from leoma.app.validator.seeds import clip_generation_seed
@@ -96,6 +97,7 @@ def run_duel(
     n_bootstrap: int,
     on_phase: Optional[Callable[[dict], None]] = None,
     early_stop_max_advantage: Optional[float] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> dict:
     """Score every clip and return the verdict plus per-clip distances.
 
@@ -104,6 +106,10 @@ def run_duel(
     abandons early once the challenger provably can't clear the threshold — the
     verdict stays "king" in that case, so the outcome is unchanged and a validator
     running with early stop still agrees with one running without it.
+
+    ``should_cancel`` is checked **between clips** — the only honest granularity. A
+    single generation is one uninterruptible call into diffusers; pretending we can
+    stop mid-clip would just be a lie that leaves the GPU busy anyway.
     """
     if not clips:
         raise ValueError("no clips to duel on")
@@ -113,6 +119,9 @@ def run_duel(
     per_clip: list[dict] = []
 
     for pos, clip in enumerate(clips):
+        if should_cancel and should_cancel():
+            raise DuelCancelled(f"duel cancelled after {pos} of {len(clips)} clips")
+
         gseed = clip_generation_seed(master_seed, clip.clip_index)
         p = clip.params
         expected = int(np.asarray(clip.truth_frames).shape[0])
@@ -264,6 +273,7 @@ def duel(
     generate_fn: GenerateFn = None,  # type: ignore[assignment]
     on_phase: Optional[Callable[[dict], None]] = None,
     early_stop_max_advantage: Optional[float] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> dict:
     """Production wrapper: bind loaded pipelines + the named metric into ``run_duel``."""
     gen = generate_fn or generate
@@ -279,4 +289,5 @@ def duel(
         n_bootstrap=n_bootstrap,
         on_phase=on_phase,
         early_stop_max_advantage=early_stop_max_advantage,
+        should_cancel=should_cancel,
     )
