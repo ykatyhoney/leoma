@@ -35,10 +35,13 @@ services:
       R2_OWN_REGION: ${R2_OWN_REGION:-auto}
 
   # Eval server: GPU box that downloads king + challenger and runs the duel.
-  # Requires an NVIDIA runtime; install leoma with the [eval] extra in the image.
+  # Built from Dockerfile.eval (CUDA base + the [eval] extra). The slim validator
+  # image has no torch, so it CANNOT run this service.
   eval-server:
-    build: .
-    image: rendixnetwork/leoma:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.eval
+    image: rendixnetwork/leoma:latest-eval
     container_name: leoma-eval-server
     restart: unless-stopped
     command: leoma servers eval-server
@@ -46,12 +49,18 @@ services:
       - .env
     environment:
       PYTHONUNBUFFERED: "1"
+      # 0.0.0.0 is required for cross-container networking; the port is NOT
+      # published to the host. See LEOMA_EVAL_TOKEN in the hardening plan.
       EVAL_SERVER_HOST: "0.0.0.0"
       EVAL_SERVER_PORT: "9000"
       HIPPIUS_HUB_TOKEN: ${HIPPIUS_HUB_TOKEN:-}
-      LEOMA_MODEL_CACHE_DIR: ${LEOMA_MODEL_CACHE_DIR:-/tmp/leoma/hippius_models}
+      LEOMA_MODEL_CACHE_DIR: ${LEOMA_MODEL_CACHE_DIR:-/var/lib/leoma/models}
       R2_VIDEOS_READ_ACCESS_KEY: ${R2_VIDEOS_READ_ACCESS_KEY:-}
       R2_VIDEOS_READ_SECRET_KEY: ${R2_VIDEOS_READ_SECRET_KEY:-}
+    volumes:
+      # Model snapshots are multi-GB; keep them off the container layer so a
+      # restart doesn't re-download the king.
+      - leoma-models:${LEOMA_MODEL_CACHE_DIR:-/var/lib/leoma/models}
     # deploy:  # uncomment on a GPU host
     #   resources:
     #     reservations:
@@ -59,3 +68,6 @@ services:
     #         - driver: nvidia
     #           count: 1
     #           capabilities: [gpu]
+
+volumes:
+  leoma-models:

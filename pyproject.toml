@@ -12,6 +12,9 @@ dependencies = [
     "huggingface-hub",
     "hippius-hub",
     "minio",
+    # numpy is imported at module scope by leoma.eval.metrics / bootstrap /
+    # video_runner, which are on the VALIDATOR path — it is not eval-only.
+    "numpy",
     "openai>=1.0.0,<2",
     "google-genai>=0.3.0",
     "click",
@@ -30,7 +33,6 @@ test = [
     "pytest-asyncio>=0.23.0",
     "pytest-cov>=4.1.0",
     "pytest-mock>=3.12.0",
-    "aiosqlite>=0.19.0",
 ]
 # GPU eval server only (the box that downloads + runs miner models for duels).
 # Validators that just dispatch duels do not need these.
@@ -43,7 +45,6 @@ eval = [
     "lpips",                    # perceptual (spatial) metric
     "opencv-python-headless",   # optical-flow (motion) metric
     "open_clip_torch",          # CLIP (semantic) metric
-    "numpy",
 ]
 
 [project.scripts]
@@ -52,6 +53,11 @@ leoma = "leoma.delivery.commands:cli"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["leoma*"]
+
+# chain.toml is consensus-critical and is read at import — it MUST ship inside the
+# wheel, not just exist in the git checkout.
+[tool.setuptools.package-data]
+leoma = ["chain.toml"]
 
 [build-system]
 requires = ["setuptools>=61.0"]

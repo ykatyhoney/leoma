@@ -19,13 +19,16 @@ on:
     branches:
       - main
       - master
-    # Only rebuild when relevant files change
+    # Only rebuild when relevant files change.
+    # NOTE: this used to watch 'leoma.py' (deleted) and NOT the package, so
+    # changes to the actual code never triggered a rebuild.
     paths:
-      - 'leoma.py'
+      - 'leoma/**'
       - 'pyproject.toml'
       - 'Dockerfile'
+      - 'Dockerfile.eval'
       - '.github/workflows/docker-publish.yml'
-  
+
   # Allow manual trigger for testing
   workflow_dispatch:
 
@@ -38,17 +41,25 @@ env:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
-    
+
     permissions:
       contents: read
       packages: write
 
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Slim CPU validator image.
+          - dockerfile: Dockerfile
+            suffix: ""
+          # CUDA eval-server image (installs the [eval] extra).
+          - dockerfile: Dockerfile.eval
+            suffix: "-eval"
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -64,6 +75,8 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: |
+            suffix=${{ matrix.suffix }},onlatest=true
           tags: |
             # Tag as 'latest' for default branch
             type=raw,value=latest,enable={{is_default_branch}}
@@ -79,14 +92,15 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
+          file: ${{ matrix.dockerfile }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           # Cache layers for faster builds
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          # Build for both AMD64 and ARM64
-          platforms: linux/amd64,linux/arm64
+          # amd64 only: the eval image is CUDA, and no validator runs on arm64.
+          platforms: linux/amd64
 
       - name: Generate build summary
         run: |

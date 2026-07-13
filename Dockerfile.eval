@@ -1,0 +1,43 @@
+# Leoma EVAL SERVER image (CUDA).
+#
+# This is the GPU box: it downloads king + challenger weights from Hippius Hub,
+# loads the pinned diffusers I2V pipeline, generates video on the held-out clips
+# and scores each generation against the real continuation.
+#
+# It needs the [eval] extra (torch / diffusers / lpips / opencv / open_clip).
+# The validator image (Dockerfile) deliberately does NOT.
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+# python3.12 + ffmpeg (ground-truth decode) + curl (healthcheck).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      software-properties-common \
+ && add-apt-repository -y ppa:deadsnakes/ppa \
+ && apt-get update && apt-get install -y --no-install-recommends \
+      python3.12 python3.12-venv python3.12-dev \
+      ffmpeg curl build-essential \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN python3.12 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
+
+WORKDIR /app
+RUN pip install --no-cache-dir uv
+
+COPY pyproject.toml README.md ./
+COPY leoma ./leoma
+
+# The [eval] extra is the whole point of this image.
+RUN uv pip install --no-cache '.[eval]'
+
+# Fail at BUILD time if the eval stack can't import (torch/diffusers/chain.toml).
+RUN python -c "import leoma.eval_server, leoma.eval.metrics, leoma.infra.chain_config as c; print('eval image OK, pipeline =', c.ARCH_PIPELINE)"
+
+EXPOSE 9000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+  CMD curl -fsS http://127.0.0.1:9000/health || exit 1
+
+CMD ["leoma", "servers", "eval-server"]
