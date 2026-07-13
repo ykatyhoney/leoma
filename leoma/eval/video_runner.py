@@ -189,16 +189,32 @@ def run_duel(
 _TORCH_DTYPES = {"bfloat16": "bfloat16", "float16": "float16", "float32": "float32"}
 
 
-def load_video_pipeline(snapshot_dir: str, *, gen, device: Optional[str] = None):
+#: The king's loaded pipeline, cached across duels: {cache_key: pipeline}.
+#:
+#: The king is the SAME model for every challenger in the queue, and loading a 14B
+#: pipeline off disk into VRAM costs minutes. Re-loading it per duel is pure waste.
+#: Exactly one entry — this is a "keep the king warm" cache, not an LRU; two 14B
+#: pipelines is already most of an H100.
+_king_cache: dict[str, object] = {}
+
+
+def load_video_pipeline(snapshot_dir: str, *, gen, device: Optional[str] = None, cache_key: str = ""):
     """Load the pinned diffusers I2V pipeline for a materialized model snapshot.
 
-    The pipeline class comes from the **request's** :class:`~leoma.eval.spec.ArchSpec`,
-    not from this box's environment, and an unresolvable class is a hard error.
-    The old code fell back to ``AutoPipelineForImage2Video`` when the pinned class
-    couldn't be resolved — which meant the "pinned" pipeline was not actually
-    pinned: a box with the wrong diffusers version would quietly load a *different*
-    pipeline and generate different video from the same weights.
+    The pipeline class comes from the pinned :class:`~leoma.eval.spec.ArchSpec`, and
+    an unresolvable class is a **hard error**. The old code fell back to
+    ``AutoPipelineForImage2Video`` when the pinned class couldn't be resolved — which
+    meant the "pinned" pipeline was not actually pinned: a box with the wrong
+    diffusers version would quietly load a *different* pipeline and generate
+    different video from the same weights.
+
+    ``cache_key`` (the king's ``repo@digest``) keeps the reigning king's pipeline
+    warm between duels. It is safe precisely because the ref is immutable: the same
+    digest can only ever produce the same weights.
     """
+    if cache_key and cache_key in _king_cache:
+        return _king_cache[cache_key]
+
     import torch
     import diffusers
 
@@ -220,7 +236,52 @@ def load_video_pipeline(snapshot_dir: str, *, gen, device: Optional[str] = None)
 
     pipe = pipeline_cls.from_pretrained(snapshot_dir, torch_dtype=dtype)
     pipe = pipe.to(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+
+    if cache_key:
+        # A new king deposed the old one: drop the stale pipeline before holding two.
+        for stale in [k for k in _king_cache if k != cache_key]:
+            release_pipeline(_king_cache.pop(stale))
+        _king_cache[cache_key] = pipe
+
     return pipe
+
+
+def release_pipeline(pipeline) -> None:
+    """Free a pipeline's VRAM. The first teardown in the codebase.
+
+    ``grep empty_cache`` across this repo returned **zero hits**. Both 14B pipelines
+    were held co-resident for the whole duel and then simply dropped on the floor —
+    torch frees the tensors when the refcount hits zero, but the *caching allocator*
+    keeps the VRAM reserved, so the next duel's load could OOM against memory that
+    nothing was actually using.
+
+    Safe to call on anything, including ``None``: this runs in ``finally`` blocks on
+    the error and cancellation paths, where the pipeline may not exist at all, and a
+    teardown that can itself raise is worse than no teardown.
+    """
+    if pipeline is None:
+        return
+    try:
+        pipeline.to("cpu")
+    except Exception:  # noqa: BLE001 — a failed move must not mask the real error
+        pass
+    del pipeline
+    try:
+        import gc
+
+        import torch
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def release_king_cache() -> None:
+    """Drop the cached king pipeline (used when the box is shutting a duel down hard)."""
+    for key in list(_king_cache):
+        release_pipeline(_king_cache.pop(key))
 
 
 def generate(pipeline, clip: Clip, seed: int) -> np.ndarray:

@@ -12,6 +12,7 @@ tests and by the on-chain scan) import cleanly without the package installed.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -254,28 +255,135 @@ def _call_snapshot_download(ref: ModelRef, local_dir: Optional[str], max_workers
     ))
 
 
+#: Written into a snapshot directory once its download has *finished*.
+#:
+#: The cache check used to be "does ``config.json`` exist, and is there a
+#: ``*.safetensors`` at the top level" — a **transformers** layout. A diffusers
+#: snapshot has neither: no root ``config.json`` (it has ``model_index.json``), and
+#: the weights live in ``transformer/``, ``vae/``, ``text_encoder/`` subfolders. So
+#: the check **never hit**, and every single duel `rmtree`d the cache and
+#: re-downloaded the king's ~30-70 GB of weights. The king is the same model for
+#: every challenger in the queue; it was being pulled again for each one.
+#:
+#: A completion marker fixes the deeper bug too: an *interrupted* download left a
+#: directory that looked exactly like a valid cache. Presence of files was never
+#: evidence that all the files were there.
+COMPLETION_MARKER = ".leoma_complete.json"
+
+#: Snapshots to keep on disk. The king plus an in-flight challenger is the working
+#: set; anything beyond that is history. At ~30-70 GB per snapshot, "never evict"
+#: fills any disk.
+MAX_CACHED_SNAPSHOTS = int(os.environ.get("LEOMA_MAX_CACHED_SNAPSHOTS", "4"))
+
+#: Free bytes to keep available. A download that fills the disk takes the box down
+#: with it, and a 70 GB pull needs the headroom *before* it starts, not after.
+MIN_FREE_BYTES = int(os.environ.get("LEOMA_MIN_FREE_BYTES", str(150 * 1024**3)))
+
+
+def _marker_path(target: Path) -> Path:
+    return target / COMPLETION_MARKER
+
+
+def is_complete(target: str | os.PathLike[str]) -> bool:
+    """Has this snapshot finished downloading?
+
+    Layout-agnostic on purpose: it asks about the *download*, not about the model.
+    A check that inspects file names has to know whether it is looking at a
+    transformers repo or a diffusers one — and gets it wrong the moment the pinned
+    architecture changes.
+    """
+    return _marker_path(Path(target)).is_file()
+
+
+def _mark_complete(target: Path, ref: ModelRef) -> None:
+    payload = {
+        "ref": ref.immutable_ref,
+        "files": len(list_snapshot_files(target)),
+        "bytes": snapshot_size(target),
+    }
+    _marker_path(target).write_text(json.dumps(payload, indent=2))
+
+
+def _cached_snapshots(root: Path) -> list[tuple[float, Path]]:
+    """Completed snapshots on disk, oldest use first. Incomplete ones are junk."""
+    found: list[tuple[float, Path]] = []
+    if not root.exists():
+        return found
+    for marker in root.glob(f"*/snapshots/*/{COMPLETION_MARKER}"):
+        try:
+            found.append((marker.stat().st_mtime, marker.parent))
+        except OSError:
+            continue
+    return sorted(found)
+
+
+def evict_snapshots(keep: Iterable[str] = (), *, root: Optional[str] = None) -> list[str]:
+    """Evict cached snapshots (LRU) until we are under budget. Returns what went.
+
+    Runs **inline, immediately before a download** rather than on a timer. Disk
+    pressure only matters at the moment we are about to consume disk, and a sweeper
+    process is one more thing to deploy, monitor, and get wrong. The keep-set is the
+    working set (king + the challenger we are about to duel), which must never be
+    evicted no matter how cold it looks.
+    """
+    base = Path(root or MODEL_CACHE_DIR)
+    protected = {str(Path(k).resolve()) for k in keep}
+    evicted: list[str] = []
+
+    snapshots = _cached_snapshots(base)
+    for _, path in snapshots:
+        if str(path.resolve()) in protected:
+            continue
+        over_count = len([p for _, p in _cached_snapshots(base)]) > MAX_CACHED_SNAPSHOTS
+        try:
+            free = shutil.disk_usage(base).free
+        except OSError:
+            free = MIN_FREE_BYTES
+        if not over_count and free >= MIN_FREE_BYTES:
+            break
+        shutil.rmtree(path, ignore_errors=True)
+        evicted.append(str(path))
+
+    return evicted
+
+
 def materialize_model(ref: ModelRef, local_dir: Optional[str] = None, max_workers: Optional[int] = None,
-                      *, config_only: bool = False) -> str:
+                      *, config_only: bool = False, keep: Iterable[str] = ()) -> str:
     """Download or reuse an immutable Hippius Hub snapshot; returns the local dir.
 
-    ``config_only=True`` skips the large ``*.safetensors`` files — use for the
-    validator's per-challenger arch/lock validation which only needs config.json.
-    Cache dir is suffixed with ``_cfg`` so a config-only fetch doesn't pollute a
-    later full-fetch's cache state.
+    ``repo@digest`` is immutable, so a **complete** snapshot is valid forever: if the
+    marker is there, the bytes are the right bytes and there is nothing to re-check.
+
+    ``config_only=True`` skips the large ``*.safetensors`` files — used by the
+    validator's pre-dispatch arch/lock check, which only needs the configs. The cache
+    dir is suffixed with ``_cfg`` so a config-only fetch can never be mistaken for a
+    full one.
     """
     if config_only:
         base = Path(local_dir) if local_dir else _cache_snapshot_path(ref)
         target = base.with_name(base.name + "_cfg")
     else:
         target = Path(local_dir) if local_dir else _cache_snapshot_path(ref)
-    if target.exists() and (target / "config.json").exists():
-        if config_only or any(target.glob("*.safetensors")):
-            return str(target)
+
+    if is_complete(target):
+        return str(target)
+
+    # Not complete: either absent, or the debris of an interrupted download. Either
+    # way it cannot be trusted, and a partial snapshot that *looks* usable is worse
+    # than none at all.
     if target.exists():
         shutil.rmtree(target)
+
+    # Make room before we pull tens of gigabytes, not after.
+    if not config_only:
+        evict_snapshots(keep=[*keep, str(target)])
+
     target.parent.mkdir(parents=True, exist_ok=True)
     patterns = CONFIG_ONLY_PATTERNS if config_only else ALLOW_PATTERNS
-    return _call_snapshot_download(ref, str(target), max_workers, allow_patterns=patterns)
+    result = _call_snapshot_download(ref, str(target), max_workers, allow_patterns=patterns)
+
+    _mark_complete(Path(result), ref)
+    return result
 
 
 def list_snapshot_files(snapshot: str | os.PathLike[str]) -> list[str]:
@@ -300,10 +408,34 @@ def snapshot_size(snapshot: str | os.PathLike[str], files: Optional[Iterable[str
 
 
 def sha256_safetensors(path: str | os.PathLike[str]) -> str:
+    """Content hash of a snapshot's weights — used to detect a copy of the king.
+
+    The old implementation globbed ``*.safetensors`` **non-recursively**. A diffusers
+    snapshot keeps its weights in ``transformer/``, ``vae/`` and ``text_encoder/``
+    subfolders, so it matched **zero files** and returned the sha256 of the empty
+    string: the same constant, for every model on earth. As a copy-detector it would
+    have flagged every model as identical to every other one.
+
+    Now: recursive, path-sensitive (so the same bytes under a different filename hash
+    differently), and it **raises** rather than hashing nothing — returning a valid
+    -looking digest for a snapshot with no weights is how the original bug hid.
+    """
     import hashlib
 
+    root = Path(path)
+    weights = sorted(p for p in root.rglob("*.safetensors") if p.is_file())
+    if not weights:
+        raise FileNotFoundError(
+            f"no .safetensors found anywhere under {root}. Refusing to return a digest "
+            "of nothing — that is indistinguishable from a real one."
+        )
+
     h = hashlib.sha256()
-    for p in sorted(Path(path).glob("*.safetensors")):
+    for p in weights:
+        # Hash the PATH as well as the bytes: two snapshots that contain the same
+        # tensors under different component names are not the same model.
+        h.update(str(p.relative_to(root)).replace(os.sep, "/").encode())
+        h.update(b"\0")
         with open(p, "rb") as f:
             while chunk := f.read(1 << 20):
                 h.update(chunk)

@@ -450,7 +450,7 @@ def run_eval_job(req: EvalRequest, emit: Emit, should_cancel: ShouldCancel = lam
     """
     from leoma.infra.model_store import ModelRef, cache_path, materialize_model
     from leoma.infra.storage_backend import create_source_read_client
-    from leoma.eval.video_runner import GenParams, load_video_pipeline, duel
+    from leoma.eval.video_runner import GenParams, load_video_pipeline, duel, release_pipeline
     from leoma.eval.codehash import eval_code_digest
     from leoma.eval.dataset import build_duel_clips, corpus_audit, fetch_manifest
     from leoma.eval.determinism import apply_determinism, runtime_env
@@ -464,6 +464,10 @@ def run_eval_job(req: EvalRequest, emit: Emit, should_cancel: ShouldCancel = lam
     king_ref = ModelRef(req.king_repo, req.king_digest)
     chall_ref = ModelRef(req.challenger_repo, req.challenger_digest)
 
+    # The working set: never evict the two models this duel is about, however cold
+    # the king's snapshot looks after a long reign.
+    keep = [cache_path(king_ref), cache_path(chall_ref)]
+
     def _materialize(ref, which: str) -> str:
         emit({"phase": "materialize", "which": which, "ref": ref.immutable_ref})
         stop = threading.Event()
@@ -472,51 +476,60 @@ def run_eval_job(req: EvalRequest, emit: Emit, should_cancel: ShouldCancel = lam
         )
         watcher.start()
         try:
-            return materialize_model(ref)
+            return materialize_model(ref, keep=keep)
         finally:
             stop.set()
 
     king_dir = _materialize(king_ref, "king")
     chall_dir = _materialize(chall_ref, "challenger")
 
-    emit({"phase": "load", "which": "king"})
-    king_pipe = load_video_pipeline(king_dir, gen=spec.gen)
-    emit({"phase": "load", "which": "challenger"})
-    chall_pipe = load_video_pipeline(chall_dir, gen=spec.gen)
+    chall_pipe = None
+    try:
+        emit({"phase": "load", "which": "king"})
+        # Keyed by the king's immutable ref: the same king faces every challenger in
+        # the queue, and re-loading 28 GB into VRAM for each one is pure waste.
+        king_pipe = load_video_pipeline(king_dir, gen=spec.gen, cache_key=king_ref.immutable_ref)
+        emit({"phase": "load", "which": "challenger"})
+        chall_pipe = load_video_pipeline(chall_dir, gen=spec.gen)
 
-    master_seed = eval_seed(req.block_hash, req.hotkey, spec.duel.base_seed)
-    params = GenParams.from_spec(spec.gen)
+        master_seed = eval_seed(req.block_hash, req.hotkey, spec.duel.base_seed)
+        params = GenParams.from_spec(spec.gen)
 
-    emit({"phase": "sample_clips", "n_clips": spec.duel.n_clips, "seed": master_seed})
-    client = create_source_read_client()
-    manifest = fetch_manifest(client, spec.corpus)
-    clips, entries = build_duel_clips(
-        manifest,
-        client=client,
-        bucket=spec.corpus.bucket,
-        master_seed=master_seed,
-        n_clips=spec.duel.n_clips,
-        gen=params,
-        prompt_mode=spec.gen.prompt_mode,
-        fixed_prompt=spec.gen.prompt,
-        on_progress=lambda done, total, entry: emit({
-            "phase": "clip_ready", "done": done, "total": total, "clip_id": entry.clip_id,
-        }),
-    )
+        emit({"phase": "sample_clips", "n_clips": spec.duel.n_clips, "seed": master_seed})
+        client = create_source_read_client()
+        manifest = fetch_manifest(client, spec.corpus)
+        clips, entries = build_duel_clips(
+            manifest,
+            client=client,
+            bucket=spec.corpus.bucket,
+            master_seed=master_seed,
+            n_clips=spec.duel.n_clips,
+            gen=params,
+            prompt_mode=spec.gen.prompt_mode,
+            fixed_prompt=spec.gen.prompt,
+            on_progress=lambda done, total, entry: emit({
+                "phase": "clip_ready", "done": done, "total": total, "clip_id": entry.clip_id,
+            }),
+        )
 
-    emit({"phase": "duel", "n_clips": len(clips), "metric": spec.duel.metric})
-    verdict = duel(
-        king_pipe, chall_pipe, clips,
-        master_seed=master_seed,
-        metric=spec.duel.metric,
-        metric_device=spec.duel.metric_device,
-        delta_threshold=spec.duel.delta_threshold,
-        alpha=spec.duel.alpha,
-        n_bootstrap=spec.duel.n_bootstrap,
-        on_phase=emit,
-        early_stop_max_advantage=spec.early_stop_max_advantage,
-        should_cancel=should_cancel,
-    )
+        emit({"phase": "duel", "n_clips": len(clips), "metric": spec.duel.metric})
+        verdict = duel(
+            king_pipe, chall_pipe, clips,
+            master_seed=master_seed,
+            metric=spec.duel.metric,
+            metric_device=spec.duel.metric_device,
+            delta_threshold=spec.duel.delta_threshold,
+            alpha=spec.duel.alpha,
+            n_bootstrap=spec.duel.n_bootstrap,
+            on_phase=emit,
+            early_stop_max_advantage=spec.early_stop_max_advantage,
+            should_cancel=should_cancel,
+        )
+    finally:
+        # The challenger is done with either way — success, error, or cancellation.
+        # Without this its VRAM stayed reserved by torch's caching allocator, and the
+        # NEXT duel could OOM against memory nothing was using. The king stays warm.
+        release_pipeline(chall_pipe)
 
     verdict["king_digest"] = req.king_digest
     verdict["challenger_digest"] = req.challenger_digest
