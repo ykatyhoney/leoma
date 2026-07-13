@@ -40,6 +40,14 @@ from leoma.app.validator.state_store import (
     StoreUnavailable,
 )
 from leoma.app.validator.dashboard import build_dashboard, publish_dashboard
+from leoma.app.validator.failures import (
+    DuelFailure,
+    EvalBusy,
+    EvalJobFailed,
+    classify,
+    classify_remote,
+)
+from leoma.app.validator.state_store import MAX_DUEL_ATTEMPTS
 from leoma.app.validator import king as K
 
 EVAL_SERVER_URL = os.environ.get("EVAL_SERVER_URL", "http://localhost:9000")
@@ -76,11 +84,14 @@ async def dispatch_duel(
     entry: ChallengerEntry,
     king: dict,
     block_hash: str,
-) -> Optional[dict]:
+) -> dict:
     """POST a duel to the eval server and stream its verdict.
 
-    Returns the verdict dict, or None when the server is busy (409) so the
-    caller retries later. Raises on an eval-server error event.
+    Raises ``EvalBusy`` when the server is already running a duel (409), and
+    ``EvalJobFailed`` on a terminal error — including a stream that ends without
+    a verdict. It used to return ``None`` for BOTH cases, so "the server is busy"
+    was indistinguishable from "the duel broke", and the caller treated a broken
+    duel as a reason to stop processing everyone else.
     """
     import httpx
 
@@ -101,8 +112,7 @@ async def dispatch_duel(
     async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.post(f"{EVAL_SERVER_URL}/eval", json=payload)
         if resp.status_code == 409:
-            log("Eval server busy; will retry", "warn")
-            return None
+            raise EvalBusy("eval server is already running a duel")
         resp.raise_for_status()
         eval_id = resp.json()["eval_id"]
 
@@ -116,7 +126,17 @@ async def dispatch_duel(
                 if phase == "verdict":
                     verdict = event
                 elif phase == "error":
-                    raise RuntimeError(f"eval server error: {event.get('error')}")
+                    raise EvalJobFailed(
+                        str(event.get("error") or "eval server error"),
+                        reason=str(event.get("reason") or ""),
+                    )
+
+    if verdict is None:
+        # The stream ended with neither a verdict nor an error. That is a broken
+        # duel, not a busy server — surface it as an explicit transient failure.
+        raise EvalJobFailed(
+            "eval stream ended without a terminal verdict", reason="stream_no_terminal"
+        )
     return verdict
 
 
@@ -240,6 +260,71 @@ async def _publish_dashboard(
         log(f"Dashboard publish failed: {e}", "warn")
 
 
+def _error_history_entry(
+    entry: ChallengerEntry,
+    failure: DuelFailure,
+    uid_map: dict[str, int],
+    row: dict,
+) -> dict:
+    """A dashboard history row for a QUARANTINED challenger.
+
+    The frontend has typed `DuelHistoryEntry.error` since day one and it never
+    had a producer: dispatch failures were only logged, so the dashboard could
+    never explain why a miner's model was ignored.
+    """
+    return {
+        "challenge_id": f"block-{entry.block}",
+        "hotkey": entry.hotkey,
+        "uid": uid_map.get(entry.hotkey),
+        "model_repo": entry.model_repo,
+        "model_digest": entry.model_digest,
+        "accepted": False,
+        "verdict": "error",
+        "error": (failure.detail or "")[:500],
+        "error_reason": failure.reason,
+        "attempts": row.get("attempts"),
+        "metric": DUEL_METRIC,
+        "block": entry.block,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+async def _note_failure(
+    state: KingState,
+    store: JsonBucketStore,
+    uid_map: dict[str, int],
+    entry: ChallengerEntry,
+    key: str,
+    failure: DuelFailure,
+    block: int,
+) -> None:
+    """Record a failed attempt; quarantine + surface it when the budget is spent."""
+    row = state.record_failure(key, block=block, failure=failure)
+
+    if not row["quarantined"]:
+        state.stats["transient_errors"] = state.stats.get("transient_errors", 0) + 1
+        state.touch()
+        log(
+            f"Duel failed ({failure.reason}) for {entry.hotkey[:12]}...: "
+            f"attempt {row['attempts']}/{MAX_DUEL_ATTEMPTS}, retry at block {row['next_retry_block']}",
+            "warn",
+        )
+    else:
+        # stats.failed counts QUARANTINED challengers, once each. Retries go to
+        # transient_errors so the dashboard number doesn't inflate with backoff.
+        state.stats["failed"] = state.stats.get("failed", 0) + 1
+        state.touch()
+        state.record_duel(_error_history_entry(entry, failure, uid_map, row))
+        state.mark_seen(key)  # never retried
+        log(
+            f"Challenger {entry.hotkey[:12]}... QUARANTINED "
+            f"({row['quarantine_reason']}: {failure.reason})",
+            "error",
+        )
+
+    await state.flush(store)
+
+
 async def process_challengers(
     subtensor: bt.AsyncSubtensor,
     wallet: bt.Wallet,
@@ -247,51 +332,61 @@ async def process_challengers(
     uid_map: dict[str, int],
     store: JsonBucketStore,
     entries: list[ChallengerEntry],
+    block: int,
 ) -> None:
-    """Duel each new challenger; crown the winners and refresh weights."""
+    """Duel each new challenger; crown the winners and refresh weights.
+
+    A failing challenger must NEVER block the ones behind it. This loop used to
+    ``return`` on any duel error, so one challenger whose repo 404s (or whose
+    weights crash the pipeline) permanently blocked every later challenger — a
+    free griefing vector. Now:
+
+      * BUSY  -> ``break``    (a property of the SERVER: continuing would just 409)
+      * error -> ``continue`` (a property of the CHALLENGER: everyone else proceeds)
+    """
     for entry in entries:
         key = _seen_key(entry.hotkey, entry.model_digest)
+
         if key in state.seen_hotkeys or _is_current_king(state, entry):
             continue
+        if state.is_quarantined(key):
+            continue  # this artifact can never be evaluated
+        if block < state.next_retry_block(key):
+            continue  # backoff has not elapsed
+
         if not state.king:
-            # No king to duel against and no seed configured; the first valid
-            # challenger takes the crown unopposed.
-            state.king, state.king_chain = K.crown(
-                None, state.king_chain, hotkey=entry.hotkey, model_repo=entry.model_repo,
-                model_digest=entry.model_digest, block=entry.block, challenge_id="first",
+            # No king AND no chain.toml seed_digest. We refuse to crown an
+            # unevaluated model — the burn path already exists and is correct
+            # (king_hotkeys -> [] -> weight_targets -> burn UID 0). The old code
+            # short-circuited it by crowning the first reveal it happened to see.
+            log(
+                "No king and no chain.toml seed_digest — refusing to crown an "
+                "unevaluated challenger. Burning to UID 0 until seed_digest is pinned.",
+                "error",
             )
-            state.mark_seen(key)
-            state.stats["accepted"] = state.stats.get("accepted", 0) + 1
-            state.touch()
-            state.record_duel({
-                "challenge_id": "first",
-                "hotkey": entry.hotkey,
-                "uid": uid_map.get(entry.hotkey),
-                "model_repo": entry.model_repo,
-                "model_digest": entry.model_digest,
-                "accepted": True,
-                "verdict": "challenger",
-                "block": entry.block,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            })
-            await state.flush(store)
-            log(f"Crowned first king {entry.hotkey[:12]}... ({entry.model_repo})", "success")
-            await maybe_set_weights(subtensor, wallet, state, uid_map, store, force=True)
-            continue
+            state.degraded = "no_seed_digest"
+            break
 
-        block_hash = await subtensor.get_block_hash(entry.block)
-        log(f"Dueling challenger {entry.hotkey[:12]}... vs king {state.king.get('hotkey','')[:12] or 'base'}...", "info")
         try:
+            block_hash = await subtensor.get_block_hash(entry.block)
+            log(
+                f"Dueling challenger {entry.hotkey[:12]}... vs king "
+                f"{state.king.get('hotkey','')[:12] or 'base'}...",
+                "info",
+            )
             verdict = await dispatch_duel(entry, state.king, block_hash)
-        except Exception as e:
-            log(f"Duel dispatch failed for {entry.hotkey[:12]}...: {e}", "error")
-            return  # leave unseen so it retries next tick
+        except EvalBusy:
+            log("Eval server busy; remaining challengers deferred to next tick", "warn")
+            break
+        except Exception as e:  # noqa: BLE001 — deliberate: classify, never crash the tick
+            await _note_failure(state, store, uid_map, entry, key, classify(e), block)
+            continue  # <<< THE FIX: one bad challenger no longer blocks the rest
 
-        if verdict is None:
-            return  # server busy; retry later, keep entry unseen
-
+        # A completed duel clears the artifact's failure history.
+        state.clear_attempts(key)
         state.mark_seen(key)
         state.record_duel(_duel_history_entry(entry, verdict, uid_map))
+
         if verdict.get("accepted"):
             state.king, state.king_chain = K.crown(
                 state.king, state.king_chain, hotkey=entry.hotkey, model_repo=entry.model_repo,
@@ -321,9 +416,11 @@ async def tick(
     ensure_genesis_king(state, block)
 
     commits = await subtensor.get_all_revealed_commitments(NETUID, block=block)
-    entries = scan_reveals(commits)
+    # Hotkeys with several quarantined artifacts are dropped at scan time — this
+    # finally wires reveal_scan's long-dead `blacklist=` hook.
+    entries = scan_reveals(commits, blacklist=state.banned_hotkeys())
     if entries:
-        await process_challengers(subtensor, wallet, state, uid_map, store, entries)
+        await process_challengers(subtensor, wallet, state, uid_map, store, entries, block)
 
     # Periodic weight refresh (also keeps the king chain aligned as UIDs change).
     await maybe_set_weights(subtensor, wallet, state, uid_map, store)

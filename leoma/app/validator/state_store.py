@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -35,6 +36,16 @@ from typing import Any, Optional
 from leoma.bootstrap import emit_log as log
 
 SCHEMA_VERSION = 2
+
+# ── attempt-ledger policy ───────────────────────────────────────────────────
+MAX_DUEL_ATTEMPTS = int(os.environ.get("LEOMA_MAX_DUEL_ATTEMPTS", "4"))
+# Block-based backoff, ~12s/block: 1m, 5m, 20m, 80m.
+BACKOFF_BLOCKS = (5, 25, 100, 400)
+# A PERMANENT failure must be seen this many times before quarantine — cheap
+# insurance against a flaky 404 locking out a legitimate miner.
+PERMANENT_SIGHTINGS = int(os.environ.get("LEOMA_PERMANENT_SIGHTINGS", "2"))
+# Hotkeys with this many DISTINCT quarantined digests are dropped at scan time.
+BAN_AFTER_QUARANTINED = int(os.environ.get("LEOMA_BAN_AFTER_QUARANTINED", "3"))
 
 # Canonical, atomically-written state object.
 KEY_STATE = "state/state.json"
@@ -313,3 +324,88 @@ class KingState:
         self.history.insert(0, entry)
         del self.history[HISTORY_LIMIT:]
         self._dirty = True
+
+    # ── attempt ledger ────────────────────────────────────────────────────
+    # The chain re-supplies the work item every tick; the ledger supplies the
+    # memory. Keyed by "<hotkey>|<digest>": repo@digest is immutable, so "this
+    # artifact cannot be evaluated" is a permanent, ARTIFACT-scoped fact — a
+    # miner who fixes the model gets a brand-new key and a clean slate.
+    # Quarantine is never a ban on a person.
+
+    def attempt_row(self, key: str) -> dict:
+        row = self.attempts.get(key)
+        if row is None:
+            row = {
+                "attempts": 0,
+                "first_block": 0,
+                "last_block": 0,
+                "next_retry_block": 0,
+                "last_class": "",
+                "last_reason": "",
+                "last_error": "",
+                "quarantined": False,
+                "quarantine_reason": None,
+            }
+            self.attempts[key] = row
+            self._dirty = True
+        return row
+
+    def next_retry_block(self, key: str) -> int:
+        row = self.attempts.get(key)
+        return int(row.get("next_retry_block", 0)) if row else 0
+
+    def is_quarantined(self, key: str) -> bool:
+        row = self.attempts.get(key)
+        return bool(row and row.get("quarantined"))
+
+    def record_failure(
+        self,
+        key: str,
+        *,
+        block: int,
+        failure,
+        max_attempts: int = MAX_DUEL_ATTEMPTS,
+        permanent_after: int = PERMANENT_SIGHTINGS,
+    ) -> dict:
+        """Record a failed attempt; quarantine when appropriate. Returns the row."""
+        row = self.attempt_row(key)
+        row["attempts"] = int(row.get("attempts", 0)) + 1
+        if not row["first_block"]:
+            row["first_block"] = block
+        row["last_block"] = block
+        row["last_class"] = getattr(failure.kind, "value", str(failure.kind))
+        row["last_reason"] = failure.reason
+        row["last_error"] = (failure.detail or "")[:500]
+
+        backoff = BACKOFF_BLOCKS[min(row["attempts"] - 1, len(BACKOFF_BLOCKS) - 1)]
+        row["next_retry_block"] = block + backoff
+
+        if failure.is_permanent and row["attempts"] >= permanent_after:
+            # Require two sightings: cheap insurance against a flaky 404.
+            row["quarantined"] = True
+            row["quarantine_reason"] = "permanent"
+        elif row["attempts"] >= max_attempts:
+            row["quarantined"] = True
+            row["quarantine_reason"] = "exhausted"
+
+        self._dirty = True
+        return row
+
+    def clear_attempts(self, key: str) -> None:
+        if self.attempts.pop(key, None) is not None:
+            self._dirty = True
+
+    def banned_hotkeys(self, *, ban_after: int = BAN_AFTER_QUARANTINED) -> set:
+        """Hotkeys with >= ban_after DISTINCT quarantined digests.
+
+        This — not the per-digest quarantine — is what feeds
+        ``scan_reveals(blacklist=)``, which is hotkey-keyed by construction.
+        It is a spam guard, not a punishment for one bad artifact.
+        """
+        counts: dict[str, int] = {}
+        for key, row in self.attempts.items():
+            if not row.get("quarantined"):
+                continue
+            hotkey = key.split("|", 1)[0]
+            counts[hotkey] = counts.get(hotkey, 0) + 1
+        return {hk for hk, n in counts.items() if n >= ban_after}
