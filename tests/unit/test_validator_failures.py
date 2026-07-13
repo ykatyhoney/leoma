@@ -27,7 +27,7 @@ from leoma.app.validator.state_store import (
     KingState,
 )
 
-from tests.unit.conftest import FakeMinio
+from tests.unit.conftest import FakeEvalBox, FakeMinio, make_verdict
 
 BUCKET = "own"
 KING_DIGEST = "sha256:" + "k" * 64
@@ -148,61 +148,53 @@ class TestAttemptLedger:
 
 
 class TestProcessChallengers:
+    """The duel is now dispatched, not awaited: the validator posts the job, persists
+    an in-flight slot, and collects the verdict on a LATER tick. So these drive ticks.
+    """
+
     async def test_one_failing_challenger_does_not_block_the_rest(self, monkeypatch, duel_ready):
         """THE headline: `return` -> `continue`. A bad model must not wedge the queue."""
-        dueled: list[str] = []
-
-        async def fake_dispatch(entry, king, block_hash):
+        def outcome(entry):
             if entry.hotkey == "5bad":
-                raise RuntimeError("RepositoryNotFoundError: repo missing")
-            dueled.append(entry.hotkey)
-            return {"accepted": False, "verdict": "king", "lcb": -0.01, "n_clips": 32}
+                return RuntimeError("RepositoryNotFoundError: repo missing")
+            return {"status": "done", "verdict": make_verdict(duel_ready, accepted=False)}
 
-        monkeypatch.setattr(vmain, "dispatch_duel", fake_dispatch)
-
+        box = FakeEvalBox(monkeypatch, outcome, duel_ready)
         st, store = _state_with_king(), _store()
         entries = [_entry("bad", 100), _entry("good1", 101), _entry("good2", 102)]
 
-        await vmain.process_challengers(
-            _FakeSubtensor(), object(), st, {}, store, entries, block=200
-        )
+        await box.drive(st, store, entries, block=200)
 
         # The two challengers BEHIND the failing one were still evaluated.
-        assert dueled == ["5good1", "5good2"]
+        assert box.dispatched == ["5good1", "5good2"]
         assert st.stats["rejected"] == 2
         # The bad one recorded a failure but is not yet quarantined (1 sighting).
         assert st.attempts["5bad|" + entries[0].model_digest]["attempts"] == 1
 
     async def test_busy_breaks_and_consumes_no_attempt(self, monkeypatch, duel_ready):
         """BUSY is a property of the SERVER: stop, but don't punish anyone."""
-        async def fake_dispatch(entry, king, block_hash):
-            raise EvalBusy("busy")
-
-        monkeypatch.setattr(vmain, "dispatch_duel", fake_dispatch)
+        box = FakeEvalBox(monkeypatch, lambda e: EvalBusy("busy"), duel_ready)
         st, store = _state_with_king(), _store()
         entries = [_entry("a", 100), _entry("b", 101)]
 
-        await vmain.process_challengers(
-            _FakeSubtensor(), object(), st, {}, store, entries, block=200
-        )
+        await box.drive(st, store, entries, block=200)
+
         assert st.attempts == {}          # no attempt consumed
         assert st.seen_hotkeys == set()   # nobody marked seen
+        assert st.inflight is None
 
     async def test_permanent_failure_quarantines_and_records_an_error_row(self, monkeypatch, duel_ready):
-        async def fake_dispatch(entry, king, block_hash):
-            raise RuntimeError("does not appear to have a file named model_index.json")
-
-        monkeypatch.setattr(vmain, "dispatch_duel", fake_dispatch)
+        box = FakeEvalBox(
+            monkeypatch,
+            lambda e: RuntimeError("does not appear to have a file named model_index.json"),
+            duel_ready,
+        )
         st, store = _state_with_king(), _store()
         e = _entry("bad")
         key = vmain._seen_key(e.hotkey, e.model_digest)
 
-        # two sightings -> quarantine
-        for block in (200, 900):
-            st.attempts.pop(key, {}) if False else None
-            await vmain.process_challengers(
-                _FakeSubtensor(), object(), st, {}, store, [e], block=block
-            )
+        for block in (200, 900):          # two sightings -> quarantine
+            await box.drive(st, store, [e], block=block, ticks=1)
 
         assert st.is_quarantined(key) is True
         assert st.stats["failed"] == 1              # counted once, on quarantine
@@ -214,76 +206,182 @@ class TestProcessChallengers:
         assert row["error"]
 
     async def test_backoff_defers_until_the_retry_block(self, monkeypatch, duel_ready):
-        calls: list[str] = []
+        attempted: list[str] = []
 
-        async def fake_dispatch(entry, king, block_hash):
-            calls.append(entry.hotkey)
-            raise RuntimeError("CUDA out of memory")
+        def outcome(entry):
+            attempted.append(entry.hotkey)
+            return RuntimeError("CUDA out of memory")
 
-        monkeypatch.setattr(vmain, "dispatch_duel", fake_dispatch)
+        box = FakeEvalBox(monkeypatch, outcome, duel_ready)
         st, store = _state_with_king(), _store()
         e = _entry("a")
 
-        await vmain.process_challengers(_FakeSubtensor(), object(), st, {}, store, [e], block=100)
-        assert len(calls) == 1
+        await box.drive(st, store, [e], block=100, ticks=1)
+        assert len(attempted) == 1
 
         # still inside the backoff window -> skipped entirely
-        await vmain.process_challengers(_FakeSubtensor(), object(), st, {}, store, [e], block=101)
-        assert len(calls) == 1
+        await box.drive(st, store, [e], block=101, ticks=1)
+        assert len(attempted) == 1
 
         # past it -> retried
         key = vmain._seen_key(e.hotkey, e.model_digest)
-        await vmain.process_challengers(
-            _FakeSubtensor(), object(), st, {}, store, [e], block=st.next_retry_block(key)
-        )
-        assert len(calls) == 2
+        await box.drive(st, store, [e], block=st.next_retry_block(key), ticks=1)
+        assert len(attempted) == 2
 
     async def test_quarantined_is_skipped_forever(self, monkeypatch, duel_ready):
-        async def fake_dispatch(entry, king, block_hash):
-            raise AssertionError("must not dispatch a quarantined artifact")
-
-        monkeypatch.setattr(vmain, "dispatch_duel", fake_dispatch)
+        box = FakeEvalBox(
+            monkeypatch,
+            lambda e: AssertionError("must not dispatch a quarantined artifact"),
+            duel_ready,
+        )
         st, store = _state_with_king(), _store()
         e = _entry("a")
         key = vmain._seen_key(e.hotkey, e.model_digest)
         st.attempt_row(key)["quarantined"] = True
 
-        await vmain.process_challengers(
-            _FakeSubtensor(), object(), st, {}, store, [e], block=10_000
-        )  # must not raise
+        await box.drive(st, store, [e], block=10_000)
+        assert box.dispatched == []
 
     async def test_successful_duel_clears_the_failure_history(self, monkeypatch, duel_ready):
-        async def fake_dispatch(entry, king, block_hash):
-            return {"accepted": False, "verdict": "king", "lcb": -0.01}
-
-        monkeypatch.setattr(vmain, "dispatch_duel", fake_dispatch)
+        box = FakeEvalBox(
+            monkeypatch,
+            lambda e: {"status": "done", "verdict": make_verdict(duel_ready, accepted=False)},
+            duel_ready,
+        )
         st, store = _state_with_king(), _store()
         e = _entry("a")
         key = vmain._seen_key(e.hotkey, e.model_digest)
         st.record_failure(key, block=1, failure=DuelFailure(ErrorClass.TRANSIENT, "oom", "x"))
 
-        await vmain.process_challengers(
-            _FakeSubtensor(), object(), st, {}, store, [e], block=10_000
-        )
+        await box.drive(st, store, [e], block=10_000)
         assert key not in st.attempts
 
     async def test_no_king_no_seed_burns_and_crowns_nobody(self, monkeypatch, duel_ready):
         """The unopposed-crown path is gone: never crown an unevaluated model."""
-        async def fake_dispatch(entry, king, block_hash):
-            raise AssertionError("must not dispatch without a king")
-
-        monkeypatch.setattr(vmain, "dispatch_duel", fake_dispatch)
+        box = FakeEvalBox(
+            monkeypatch, lambda e: AssertionError("must not dispatch without a king"), duel_ready
+        )
         st, store = KingState(), _store()      # NO king, NO seed
         e = _entry("first")
 
-        await vmain.process_challengers(
-            _FakeSubtensor(), object(), st, {}, store, [e], block=100
-        )
+        await box.drive(st, store, [e], block=100)
 
         assert st.king == {}                    # nobody crowned
         assert st.degraded == "no_seed_digest"
         assert st.stats["accepted"] == 0
+        assert box.dispatched == []
         # and the burn path is what weight_targets will produce:
         from leoma.app.validator import king as K
         uids, weights, label = K.weight_targets(st.king, st.king_chain, {"5first": 1})
         assert uids == [K.BURN_UID] and weights == [1.0] and label.startswith("burn:")
+
+
+class TestTheTickIsBounded:
+    """A duel used to be awaited INLINE — a tick could take hours, during which the
+    validator set no weights (the chain concludes it is dead) and published no
+    dashboard. Now it dispatches, persists a slot, and returns in seconds."""
+
+    async def test_dispatch_returns_immediately_with_the_duel_still_running(self, monkeypatch, duel_ready):
+        box = FakeEvalBox(
+            monkeypatch, lambda e: {"status": "running", "phase": "materialize"}, duel_ready
+        )
+        st, store = _state_with_king(), _store()
+        e = _entry("a")
+
+        await box.drive(st, store, [e], block=200, ticks=1)
+
+        assert st.inflight is not None
+        assert st.inflight["hotkey"] == "5a"
+        assert st.inflight["king_digest"] == KING_DIGEST
+        assert st.seen_hotkeys == set()      # not settled yet — no verdict, no crown
+
+    async def test_a_running_duel_is_not_dispatched_twice(self, monkeypatch, duel_ready):
+        box = FakeEvalBox(monkeypatch, lambda e: {"status": "running"}, duel_ready)
+        st, store = _state_with_king(), _store()
+        entries = [_entry("a", 100), _entry("b", 101)]
+
+        await box.drive(st, store, entries, block=200, ticks=5)
+
+        assert box.dispatched == ["5a"], "the GPU can only run one duel at a time"
+
+    async def test_the_slot_survives_a_restart_and_is_settled_later(self, monkeypatch, duel_ready):
+        """Restart-safe: a validator that restarts mid-duel RE-ATTACHES. Before, the
+        eval box would finish a duel nobody would ever read, and 409 everyone else
+        for the entire time it took."""
+        outcomes = iter([
+            {"status": "running", "phase": "duel"},
+            {"status": "done", "verdict": make_verdict(duel_ready, accepted=True)},
+        ])
+        box = FakeEvalBox(monkeypatch, lambda e: next(outcomes), duel_ready)
+        st, store = _state_with_king(), _store()
+        e = _entry("a")
+
+        await box.drive(st, store, [e], block=200, ticks=1)
+        slot = dict(st.inflight)
+        await st.flush(store)
+
+        # ... the validator restarts here. The slot comes back from the bucket.
+        revived = await KingState.load(store)
+        assert revived.inflight == slot
+
+        box.jobs[slot["eval_id"]] = {"status": "done", "verdict": make_verdict(duel_ready, accepted=True)}
+        await box.drive(revived, store, [e], block=300, ticks=1)
+
+        assert revived.inflight is None
+        assert revived.king["hotkey"] == "5a"      # the duel we left running still counted
+
+    async def test_a_lost_job_is_transient_and_never_blamed_on_the_miner(self, monkeypatch, duel_ready):
+        """The eval box restarted and forgot the job. That is ours, not the miner's."""
+        box = FakeEvalBox(monkeypatch, lambda e: {"status": "running"}, duel_ready)
+        st, store = _state_with_king(), _store()
+        e = _entry("a")
+        await box.drive(st, store, [e], block=200, ticks=1)
+
+        eval_id = st.inflight["eval_id"]
+        box.jobs[eval_id] = EvalJobFailed("gone", reason="eval_job_lost")
+
+        await box.drive(st, store, [e], block=201, ticks=1)
+
+        key = vmain._seen_key(e.hotkey, e.model_digest)
+        assert st.inflight is None
+        assert not st.is_quarantined(key)                 # retried, not punished
+        assert st.attempts[key]["last_class"] == "transient"
+
+    async def test_a_verdict_against_a_DEPOSED_king_is_discarded(self, monkeypatch, duel_ready):
+        """The king changed while the duel was in flight. The verdict measured the
+        challenger against a king that no longer reigns — acting on it would crown
+        someone who never beat the incumbent."""
+        box = FakeEvalBox(monkeypatch, lambda e: {"status": "running"}, duel_ready)
+        st, store = _state_with_king(), _store()
+        e = _entry("a")
+        await box.drive(st, store, [e], block=200, ticks=1)
+
+        # A different challenger takes the crown mid-duel.
+        st.king = {"hotkey": "5NEW", "model_repo": "u/leoma-new",
+                   "model_digest": "sha256:" + "n" * 64, "reign_number": 2}
+
+        box.jobs[st.inflight["eval_id"]] = {
+            "status": "done", "verdict": make_verdict(duel_ready, accepted=True)
+        }
+        await box.drive(st, store, [e], block=201, ticks=1)
+
+        assert st.king["hotkey"] == "5NEW"           # the stale verdict did NOT crown 5a
+        key = vmain._seen_key(e.hotkey, e.model_digest)
+        assert key not in st.seen_hotkeys            # and 5a will be re-dueled, fairly
+
+    async def test_a_verdict_that_ran_a_DIFFERENT_exam_is_refused(self, monkeypatch, duel_ready):
+        """verify_echo, at the crowning gate. A box that quietly used its own metric
+        must never take the crown."""
+        tampered = make_verdict(duel_ready, accepted=True)
+        tampered["echo"]["duel"]["metric"] = "mse"
+
+        box = FakeEvalBox(monkeypatch, lambda e: {"status": "done", "verdict": tampered}, duel_ready)
+        st, store = _state_with_king(), _store()
+        e = _entry("a")
+
+        await box.drive(st, store, [e], block=200, ticks=2)
+
+        assert st.king["hotkey"] == "5KING"          # not crowned
+        key = vmain._seen_key(e.hotkey, e.model_digest)
+        assert st.degraded == "consensus_echo_mismatch"
+        assert key not in st.seen_hotkeys

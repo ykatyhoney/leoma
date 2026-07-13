@@ -14,6 +14,7 @@ challenger nothing and stop the validator instead.
 import pytest
 
 import leoma.app.validator.main as vmain
+from tests.unit.conftest import FakeEvalBox, FakeMinio
 from leoma.app.validator.failures import (
     ErrorClass,
     EvalJobFailed,
@@ -21,7 +22,7 @@ from leoma.app.validator.failures import (
     classify_remote,
 )
 from leoma.app.validator.reveal_scan import ChallengerEntry
-from leoma.app.validator.state_store import KingState, MAX_DUEL_ATTEMPTS
+from leoma.app.validator.state_store import JsonBucketStore, KingState, MAX_DUEL_ATTEMPTS
 from leoma.eval.errors import (
     ConsensusConfigError,
     CorpusIntegrityError,
@@ -37,17 +38,16 @@ def _entry(hotkey="5a", digest="sha256:" + "a" * 64, block=1):
     )
 
 
+def _store() -> JsonBucketStore:
+    return JsonBucketStore(FakeMinio(), "own", backoff=0)
+
+
 def _state():
     return KingState(
         king={"hotkey": "5KING", "model_repo": "u/leoma-king",
               "model_digest": "sha256:" + "k" * 64, "block": 0, "reign_number": 1},
         king_chain=[],
     )
-
-
-class FakeSubtensor:
-    async def get_block_hash(self, block):
-        return f"0x{block:064x}"
 
 
 class TestClassification:
@@ -90,21 +90,17 @@ class TestTheLedgerIsNeverCharged:
         """THE bug this class exists for. Four transient failures = 'exhausted' =
         quarantined. With a broken corpus every duel fails, so every miner on the
         subnet gets locked out — for our mistake."""
-        state = _state()
-        store = object()
-
-        async def broken_corpus(entry, king, block_hash):
-            raise CorpusIntegrityError("clip-0007: decoded ground truth does not match")
-
-        monkeypatch.setattr(vmain, "dispatch_duel", broken_corpus)
-
+        state, store = _state(), _store()
+        box = FakeEvalBox(
+            monkeypatch,
+            lambda e: CorpusIntegrityError("clip-0007: decoded ground truth does not match"),
+            duel_ready,
+        )
         entries = [_entry(hotkey=f"5m{i}", digest="sha256:" + f"{i:064x}") for i in range(3)]
 
         # Run enough ticks to exhaust the attempt budget several times over.
         for block in range(1, MAX_DUEL_ATTEMPTS * 3):
-            await vmain.process_challengers(
-                FakeSubtensor(), None, state, {}, store, entries, block
-            )
+            await box.drive(state, store, entries, block=block, ticks=1)
 
         assert state.attempts == {}, "a local fault was charged to the challengers' ledger"
         assert state.banned_hotkeys() == set()
@@ -113,15 +109,15 @@ class TestTheLedgerIsNeverCharged:
             assert not state.is_quarantined(key)
 
     async def test_it_stops_dueling_and_says_why(self, monkeypatch, duel_ready):
-        state = _state()
-
-        async def stale_box(entry, king, block_hash):
-            raise EvalJobFailed("box pins a different surface", reason="consensus_mismatch")
-
-        monkeypatch.setattr(vmain, "dispatch_duel", stale_box)
+        state, store = _state(), _store()
+        box = FakeEvalBox(
+            monkeypatch,
+            lambda e: EvalJobFailed("box pins a different surface", reason="consensus_mismatch"),
+            duel_ready,
+        )
         entries = [_entry(hotkey=f"5m{i}", digest="sha256:" + f"{i:064x}") for i in range(3)]
 
-        await vmain.process_challengers(FakeSubtensor(), None, state, {}, object(), entries, 1)
+        await box.drive(state, store, entries, block=1, ticks=1)
 
         # Degraded, and it did not even try the other two — they would hit the same wall.
         assert state.degraded == "consensus_mismatch"
@@ -130,23 +126,16 @@ class TestTheLedgerIsNeverCharged:
     async def test_a_genuinely_bad_model_IS_still_quarantined(self, monkeypatch, duel_ready):
         """The other half: LOCAL must not become a blanket amnesty. A model that is
         actually broken still gets quarantined, and the miners behind it still run."""
-        state = _state()
-        flushed = []
-
-        class Store:
-            async def put(self, key, value):
-                flushed.append(key)
-
-        async def bad_model(entry, king, block_hash):
-            raise EvalJobFailed("repo does not exist", reason="model_not_found")
-
-        monkeypatch.setattr(vmain, "dispatch_duel", bad_model)
+        state, store = _state(), _store()
+        box = FakeEvalBox(
+            monkeypatch,
+            lambda e: EvalJobFailed("repo does not exist", reason="model_not_found"),
+            duel_ready,
+        )
         entry = _entry()
 
         for block in (1, 100):   # two sightings -> permanent quarantine
-            await vmain.process_challengers(
-                FakeSubtensor(), None, state, {}, Store(), [entry], block
-            )
+            await box.drive(state, store, [entry], block=block, ticks=1)
 
         key = vmain._seen_key(entry.hotkey, entry.model_digest)
         assert state.is_quarantined(key)

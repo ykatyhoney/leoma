@@ -79,3 +79,37 @@ class TestBuildDashboard:
         # `transient_errors` is tracked separately from `failed` so that retries
         # of a flaky duel don't inflate the failure count on the dashboard.
         assert d["stats"] == {"accepted": 0, "rejected": 0, "failed": 0, "transient_errors": 0}
+
+
+class TestLivePanel:
+    """The dashboard used to go dark for the whole length of a duel — hours in which
+    the most interesting thing in the subnet was happening and the site showed
+    nothing at all. The in-flight slot is exactly the data it needed."""
+
+    def _dash(self, state):
+        return build_dashboard(
+            state, {"5a": 7},
+            chain_meta={"name": "leoma"}, duel_params={"metric": "lpips"},
+            updated_at="2026-07-13T00:00:00Z",
+        )
+
+    def test_the_running_duel_is_published(self):
+        st = KingState()
+        st.inflight = {
+            "eval_id": "eval-abc", "hotkey": "5a", "model_repo": "u/leoma-a",
+            "model_digest": "sha256:" + "a" * 64, "dispatched_block": 900,
+        }
+        live = self._dash(st)["live"]
+        assert live["eval_id"] == "eval-abc"
+        assert live["hotkey"] == "5a"
+        assert live["uid"] == 7
+        assert live["dispatched_block"] == 900
+
+    def test_no_duel_means_no_live_panel(self):
+        assert self._dash(KingState())["live"] is None
+
+    def test_the_reason_the_subnet_is_burning_is_published(self):
+        """Without this an operator sees 100% burning to UID 0 and no reason anywhere."""
+        st = KingState()
+        st.degraded = "corpus_unpinned"
+        assert self._dash(st)["degraded"] == "corpus_unpinned"

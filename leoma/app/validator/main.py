@@ -15,7 +15,6 @@ persists to this validator's own bucket (``state_store``).
 """
 
 import os
-import json
 import asyncio
 from datetime import datetime, timezone
 from typing import Optional
@@ -68,9 +67,12 @@ CHALLENGE_POLL_INTERVAL = int(os.environ.get("LEOMA_CHALLENGE_POLL_INTERVAL", "6
 # consensus. LEOMA_DUEL_METRIC / _N_CLIPS / _DELTA_THRESHOLD / _ALPHA / _N_BOOTSTRAP
 # are deliberately gone — setting one no longer does anything, which is the point.
 
-# Eval dispatch: connect fast, but allow a long duel (N clips x 2 generations).
+# Every call to the eval server is now short: dispatch, or poll. Neither waits for a
+# duel. LEOMA_EVAL_TIMEOUT is gone — the validator no longer has to guess how long a
+# 14B video duel takes, which is a guess it could only ever get wrong. The wall-clock
+# bound lives on the eval server, where the phase information actually is.
 _EVAL_CONNECT_TIMEOUT = 30.0
-_EVAL_READ_TIMEOUT = float(os.environ.get("LEOMA_EVAL_TIMEOUT", "3600"))
+_EVAL_POLL_TIMEOUT = 60.0
 
 
 def _seen_key(hotkey: str, digest: str) -> str:
@@ -116,22 +118,21 @@ async def preflight_eval_server(client) -> None:
         )
 
 
-async def dispatch_duel(
-    entry: ChallengerEntry,
-    king: dict,
-    block_hash: str,
-) -> dict:
-    """POST a duel to the eval server and stream its verdict.
+async def start_duel(entry: ChallengerEntry, king: dict, block_hash: str) -> str:
+    """POST a duel and return its ``eval_id``. Returns in **seconds**, not hours.
+
+    The validator used to dispatch a duel and then *stream it to completion* — an
+    ``await`` that blocked the entire tick loop for as long as the duel took. For a
+    32-clip duel of two 14B video models, that is hours in which the validator sets no
+    weights, publishes no dashboard, and looks dead to the chain. The duel was not the
+    only thing that stopped; the validator did.
+
+    Now the tick is bounded: dispatch, persist the slot, return. The verdict is
+    collected on a later tick by :func:`settle_inflight`.
 
     Sends the **whole pinned consensus surface** (``SPEC``) rather than a handful of
-    loose knobs, and verifies the echo before returning — so a verdict produced under
-    different parameters can never reach the crowning code.
-
-    Raises ``EvalBusy`` when the server is already running a duel (409), and
-    ``EvalJobFailed`` on a terminal error — including a stream that ends without a
-    verdict. It used to return ``None`` for BOTH cases, so "the server is busy" was
-    indistinguishable from "the duel broke", and the caller treated a broken duel as
-    a reason to stop processing everyone else.
+    loose knobs. Raises ``EvalBusy`` on 409 (a property of the *server*) and
+    ``EvalJobFailed`` otherwise (a property of the *challenger*, or of us).
     """
     import httpx
 
@@ -145,7 +146,7 @@ async def dispatch_duel(
         "spec": SPEC.model_dump(mode="json"),
         "consensus_digest": CONSENSUS_DIGEST,
     }
-    timeout = httpx.Timeout(_EVAL_READ_TIMEOUT, connect=_EVAL_CONNECT_TIMEOUT)
+    timeout = httpx.Timeout(_EVAL_POLL_TIMEOUT, connect=_EVAL_CONNECT_TIMEOUT)
     async with httpx.AsyncClient(timeout=timeout) as client:
         await preflight_eval_server(client)
 
@@ -153,38 +154,50 @@ async def dispatch_duel(
         if resp.status_code == 409:
             raise EvalBusy("eval server is already running a duel")
         resp.raise_for_status()
-        eval_id = resp.json()["eval_id"]
+        return resp.json()["eval_id"]
 
-        verdict: Optional[dict] = None
-        async with client.stream("GET", f"{EVAL_SERVER_URL}/eval/{eval_id}/stream") as stream:
-            async for line in stream.aiter_lines():
-                if not line.startswith("data: "):
-                    continue
-                event = json.loads(line[6:])
-                phase = event.get("phase")
-                if phase == "verdict":
-                    verdict = event
-                elif phase == "error":
-                    raise EvalJobFailed(
-                        str(event.get("error") or "eval server error"),
-                        reason=str(event.get("reason") or ""),
-                    )
 
-    if verdict is None:
-        # The stream ended with neither a verdict nor an error. That is a broken
-        # duel, not a busy server — surface it as an explicit transient failure.
+async def poll_duel(eval_id: str) -> dict:
+    """Ask the eval server how a dispatched duel is going.
+
+    Returns ``{status, phase, verdict, error, reason}``. ``status`` is one of
+    ``running`` / ``done`` / ``error`` / ``cancelled``.
+
+    A **404** means the eval box no longer knows about this duel — it restarted, or
+    the job aged out. That is transient and ours to retry; it must never be read as a
+    verdict, and it must never be charged to the miner.
+    """
+    import httpx
+
+    timeout = httpx.Timeout(_EVAL_POLL_TIMEOUT, connect=_EVAL_CONNECT_TIMEOUT)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.get(f"{EVAL_SERVER_URL}/eval/{eval_id}")
+        if resp.status_code == 404:
+            raise EvalJobFailed(
+                f"eval server no longer knows about {eval_id} (it restarted, or the job "
+                "aged out). The duel is lost; it will be re-dispatched.",
+                reason="eval_job_lost",
+            )
+        resp.raise_for_status()
+        return resp.json()
+
+
+def _verified_verdict(verdict: Optional[dict]) -> dict:
+    """Fail closed unless the box ran EXACTLY the exam we set.
+
+    This is the check that catches "the field wasn't sent, so the box used its own
+    default" — the entire bug class that made two honest validators disagree. It runs
+    **before crowning**, so a verdict produced under different parameters can never
+    take the crown.
+    """
+    if not verdict:
         raise EvalJobFailed(
-            "eval stream ended without a terminal verdict", reason="stream_no_terminal"
+            "eval server reported success but returned no verdict", reason="stream_no_terminal"
         )
-
-    # Fail closed: the box must have run EXACTLY the exam we set. This is the check
-    # that catches "the field wasn't sent, so the box used its own default" — the
-    # entire bug class that made two honest validators disagree.
     try:
         verify_echo(SPEC, verdict.get("echo"))
     except ConsensusConfigError as e:
         raise EvalJobFailed(str(e), reason="consensus_echo_mismatch") from e
-
     return verdict
 
 
@@ -467,6 +480,138 @@ async def _note_failure(
     await state.flush(store)
 
 
+def _slot_entry(slot: dict) -> ChallengerEntry:
+    """Rebuild the challenger from the persisted slot.
+
+    Deliberately reconstructed from the slot rather than looked up in this tick's
+    reveals: the slot is the authoritative record of *what we dispatched*. A reveal
+    that has since scrolled out of the commitment window must still be settled — the
+    duel ran, and the miner is owed its verdict.
+    """
+    return ChallengerEntry(
+        hotkey=slot["hotkey"],
+        model_repo=slot["model_repo"],
+        model_digest=slot["model_digest"],
+        block=int(slot.get("block", 0)),
+    )
+
+
+async def _local_fault(state: KingState, failure) -> None:
+    """OUR fault: stop dueling, say so loudly, and burn until an operator fixes it.
+
+    A corpus that doesn't match the pinned manifest, an eval box on a stale
+    chain.toml. It would fail identically for *every* challenger — including the
+    reigning king — so it is not evidence about any one of them. And charging it to
+    the ledger would, after four attempts, quarantine every honest miner on the
+    subnet for our own misconfiguration.
+    """
+    log(f"LOCAL FAULT ({failure.reason}) — this validator cannot duel: {failure.detail}", "error")
+    state.degraded = failure.reason
+
+
+async def settle_inflight(
+    subtensor: bt.AsyncSubtensor,
+    wallet: bt.Wallet,
+    state: KingState,
+    uid_map: dict[str, int],
+    store: JsonBucketStore,
+    block: int,
+) -> bool:
+    """Collect a dispatched duel's verdict. Returns True once the slot is free.
+
+    **Restart-safe.** The slot is persisted, so a validator that restarts mid-duel
+    re-attaches to the job it left running instead of orphaning it. Before this, a
+    restart meant the eval box spent hours on a duel nobody would ever read, and
+    answered 409 to everyone else the entire time.
+    """
+    slot = state.inflight
+    if not slot:
+        return True
+
+    entry = _slot_entry(slot)
+    key = _seen_key(entry.hotkey, entry.model_digest)
+
+    try:
+        result = await poll_duel(slot["eval_id"])
+    except Exception as e:  # noqa: BLE001 — classify, never crash the tick
+        failure = classify(e)
+        if failure.is_local:
+            await _local_fault(state, failure)
+            return False        # keep the slot; the duel may still be fine once we are
+        state.inflight = None
+        state.touch()
+        await _note_failure(state, store, uid_map, entry, key, failure, block)
+        return True
+
+    status = result.get("status")
+    if status == "running":
+        log(f"Duel {slot['eval_id']} still running (phase={result.get('phase')})", "info")
+        return False
+
+    # Terminal, one way or another: the slot is free from here on.
+    state.inflight = None
+    state.touch()
+
+    if status != "done":
+        failure = classify_remote(str(result.get("error") or status), str(result.get("reason") or ""))
+        if failure.is_local:
+            await _local_fault(state, failure)
+            await state.flush(store)
+            return True
+        await _note_failure(state, store, uid_map, entry, key, failure, block)
+        return True
+
+    try:
+        verdict = _verified_verdict(result.get("verdict"))
+    except Exception as e:  # noqa: BLE001
+        failure = classify(e)
+        if failure.is_local:
+            await _local_fault(state, failure)
+            await state.flush(store)
+            return True
+        await _note_failure(state, store, uid_map, entry, key, failure, block)
+        return True
+
+    # The king may have changed while this duel was in flight (a crown from a
+    # different challenger, or an operator re-seed). The verdict measured the
+    # challenger against a king that no longer reigns, so it cannot be acted on —
+    # and it must NOT be marked seen, or the challenger would never get a fair duel
+    # against the king it actually has to beat.
+    current_king_digest = (state.king or {}).get("model_digest")
+    if slot.get("king_digest") != current_king_digest:
+        log(
+            f"King changed while {entry.hotkey[:12]}...'s duel was in flight — discarding "
+            "the stale verdict; it will be re-dueled against the current king.",
+            "warn",
+        )
+        await state.flush(store)
+        return True
+
+    # A completed duel clears the artifact's failure history.
+    state.clear_attempts(key)
+    state.mark_seen(key)
+    state.record_duel(_duel_history_entry(entry, verdict, uid_map))
+
+    if verdict.get("accepted"):
+        state.king, state.king_chain = K.crown(
+            state.king, state.king_chain, hotkey=entry.hotkey, model_repo=entry.model_repo,
+            model_digest=entry.model_digest, block=entry.block,
+            challenge_id=verdict.get("challenge_id") or f"block-{entry.block}",
+        )
+        state.stats["accepted"] = state.stats.get("accepted", 0) + 1
+        state.touch()
+        await state.flush(store)
+        log(f"Challenger {entry.hotkey[:12]}... CROWNED (lcb={verdict.get('lcb')})", "success")
+        await maybe_set_weights(subtensor, wallet, state, uid_map, store, force=True)
+    else:
+        state.stats["rejected"] = state.stats.get("rejected", 0) + 1
+        state.touch()
+        await state.flush(store)
+        log(f"Challenger {entry.hotkey[:12]}... rejected (lcb={verdict.get('lcb')})", "info")
+
+    return True
+
+
 async def process_challengers(
     subtensor: bt.AsyncSubtensor,
     wallet: bt.Wallet,
@@ -476,25 +621,35 @@ async def process_challengers(
     entries: list[ChallengerEntry],
     block: int,
 ) -> None:
-    """Duel each new challenger; crown the winners and refresh weights.
+    """Settle the in-flight duel, then dispatch at most one more. Returns in seconds.
 
-    A failing challenger must NEVER block the ones behind it. This loop used to
-    ``return`` on any duel error, so one challenger whose repo 404s (or whose
-    weights crash the pipeline) permanently blocked every later challenger — a
-    free griefing vector. Now:
+    This used to duel every challenger *inline*, streaming each one to completion —
+    so a single tick could take hours, during which the validator set no weights and
+    published no dashboard. The duel wasn't the only thing blocked; the validator was.
+
+    Now the tick is bounded: settle whatever is in flight, dispatch the next one, come
+    back. Everything else in ``tick`` (weights, dashboard) therefore runs *every* tick,
+    even mid-duel.
+
+    A failing challenger must never block the ones behind it, so the dispatch loop
+    still distinguishes:
 
       * BUSY  -> ``break``    (a property of the SERVER: continuing would just 409)
+      * LOCAL -> ``break``    (a property of US: every challenger would fail the same)
       * error -> ``continue`` (a property of the CHALLENGER: everyone else proceeds)
     """
-    # An unpinned corpus is a subnet-wide condition, not a per-challenger one: the
-    # exam itself doesn't exist yet. Refuse every duel and burn, exactly as with a
-    # missing seed_digest — and say so once, not once per challenger.
+    # An unpinned corpus is a subnet-wide condition, not a per-challenger one: the exam
+    # itself does not exist yet. Refuse every duel and burn, exactly as with a missing
+    # seed_digest — and say so once, not once per challenger.
     try:
         SPEC.require_duel_ready()
     except ConsensusConfigError as e:
         log(str(e), "error")
         state.degraded = "corpus_unpinned"
         return
+
+    if not await settle_inflight(subtensor, wallet, state, uid_map, store, block):
+        return  # a duel is still running; the tick moves on to weights + dashboard
 
     for entry in entries:
         key = _seen_key(entry.hotkey, entry.model_digest)
@@ -507,68 +662,53 @@ async def process_challengers(
             continue  # backoff has not elapsed
 
         if not state.king:
-            # No king AND no chain.toml seed_digest. We refuse to crown an
-            # unevaluated model — the burn path already exists and is correct
-            # (king_hotkeys -> [] -> weight_targets -> burn UID 0). The old code
-            # short-circuited it by crowning the first reveal it happened to see.
+            # No king AND no chain.toml seed_digest. We refuse to crown an unevaluated
+            # model — the burn path already exists and is correct (king_hotkeys -> [] ->
+            # weight_targets -> burn UID 0). The old code short-circuited it by crowning
+            # the first reveal it happened to see.
             log(
                 "No king and no chain.toml seed_digest — refusing to crown an "
                 "unevaluated challenger. Burning to UID 0 until seed_digest is pinned.",
                 "error",
             )
             state.degraded = "no_seed_digest"
-            break
+            return
 
         try:
             block_hash = await subtensor.get_block_hash(entry.block)
             log(
-                f"Dueling challenger {entry.hotkey[:12]}... vs king "
+                f"Dispatching duel: {entry.hotkey[:12]}... vs king "
                 f"{state.king.get('hotkey','')[:12] or 'base'}...",
                 "info",
             )
-            verdict = await dispatch_duel(entry, state.king, block_hash)
+            eval_id = await start_duel(entry, state.king, block_hash)
         except EvalBusy:
-            log("Eval server busy; remaining challengers deferred to next tick", "warn")
-            break
+            log("Eval server busy; challengers deferred to next tick", "warn")
+            return
         except Exception as e:  # noqa: BLE001 — deliberate: classify, never crash the tick
             failure = classify(e)
-
             if failure.is_local:
-                # OUR fault: a corpus that doesn't match the pinned manifest, an eval
-                # box on a stale chain.toml. It would fail identically for every
-                # challenger, so it is not evidence about this one — and charging it
-                # to the ledger would, after four attempts, quarantine every honest
-                # miner on the subnet for our own misconfiguration. Stop dueling,
-                # say so loudly, and burn until an operator fixes it.
-                log(f"LOCAL FAULT ({failure.reason}) — this validator cannot duel: "
-                    f"{failure.detail}", "error")
-                state.degraded = failure.reason
-                break
-
+                await _local_fault(state, failure)
+                return
             await _note_failure(state, store, uid_map, entry, key, failure, block)
-            continue  # <<< THE FIX: one bad challenger no longer blocks the rest
+            continue  # one bad challenger no longer blocks the rest
 
-        # A completed duel clears the artifact's failure history.
-        state.clear_attempts(key)
-        state.mark_seen(key)
-        state.record_duel(_duel_history_entry(entry, verdict, uid_map))
-
-        if verdict.get("accepted"):
-            state.king, state.king_chain = K.crown(
-                state.king, state.king_chain, hotkey=entry.hotkey, model_repo=entry.model_repo,
-                model_digest=entry.model_digest, block=entry.block,
-                challenge_id=verdict.get("challenge_id") or f"block-{entry.block}",
-            )
-            state.stats["accepted"] = state.stats.get("accepted", 0) + 1
-            state.touch()
-            await state.flush(store)
-            log(f"Challenger {entry.hotkey[:12]}... CROWNED (lcb={verdict.get('lcb')})", "success")
-            await maybe_set_weights(subtensor, wallet, state, uid_map, store, force=True)
-        else:
-            state.stats["rejected"] = state.stats.get("rejected", 0) + 1
-            state.touch()
-            await state.flush(store)
-            log(f"Challenger {entry.hotkey[:12]}... rejected (lcb={verdict.get('lcb')})", "info")
+        # Persist the slot BEFORE returning: a crash between the POST and the flush
+        # would otherwise orphan a duel that is already burning GPU hours, and the
+        # eval box would 409 everyone until it finished a job nobody was waiting for.
+        state.inflight = {
+            "eval_id": eval_id,
+            "hotkey": entry.hotkey,
+            "model_repo": entry.model_repo,
+            "model_digest": entry.model_digest,
+            "block": entry.block,
+            "king_digest": (state.king or {}).get("model_digest"),
+            "dispatched_block": block,
+        }
+        state.touch()
+        await state.flush(store)
+        log(f"Duel {eval_id} dispatched; the tick continues (weights + dashboard stay live)", "info")
+        return  # one duel at a time — the eval server has one GPU
 
 
 async def tick(
@@ -585,13 +725,15 @@ async def tick(
     # Hotkeys with several quarantined artifacts are dropped at scan time — this
     # finally wires reveal_scan's long-dead `blacklist=` hook.
     entries = scan_reveals(commits, blacklist=state.banned_hotkeys())
-    if entries:
-        await process_challengers(subtensor, wallet, state, uid_map, store, entries, block)
 
-    # Periodic weight refresh (also keeps the king chain aligned as UIDs change).
+    # Bounded: settles the in-flight duel and dispatches at most one more. Always
+    # returns in seconds, even when a multi-hour duel is running on the GPU box.
+    await process_challengers(subtensor, wallet, state, uid_map, store, entries, block)
+
+    # These two now run on EVERY tick, including mid-duel. They used to be starved for
+    # hours behind an inline duel: no weights (the chain concludes the validator is
+    # dead) and a dashboard frozen on whatever was true when the duel started.
     await maybe_set_weights(subtensor, wallet, state, uid_map, store)
-
-    # Publish the public dashboard snapshot for the website.
     await _publish_dashboard(state, uid_map, store, _build_queue(state, entries, uid_map))
 
 
