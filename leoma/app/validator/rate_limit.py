@@ -7,9 +7,15 @@ and each new digest is a brand-new key that buys a **free multi-hour duel** on t
 only GPU in the subnet. Nothing stops one miner from starving everyone else, and it
 costs them nothing but an upload.
 
-The reference subnet's answer (burn the miner's slot) does not transfer: their eval
-is cheap. Ours costs *hours*, so the limiter is tuned to the thing that is actually
-scarce here — GPU time, not slots.
+The reference subnet's answer is a hard 1-hotkey-1-eval burn at enqueue: a hotkey gets
+exactly one evaluation, ever. That is strictly *more* spam-proof than what is here, and
+it is independent of eval cost — so "their eval is cheap and ours isn't" is not the
+reason to prefer the softer gate. The real reason is a deliberate product choice: Leoma
+keys its seen-set on ``hotkey|digest`` so a miner can **iterate** — fix a model and
+resubmit under the same hotkey — which a permanent burn would forbid. The cost of that
+choice is that a hotkey can mint fresh digests, so this limiter (cooldown + per-reign
+cap) is what re-imposes a *cost* gate on top of the *idempotency* gate, tuned to the
+thing that is actually scarce here: GPU time.
 
 Three rules, all pure functions of state the validator already has:
 
