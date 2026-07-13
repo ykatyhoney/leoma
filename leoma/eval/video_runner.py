@@ -98,6 +98,7 @@ def run_duel(
     on_phase: Optional[Callable[[dict], None]] = None,
     early_stop_max_advantage: Optional[float] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
+    freeze_margin_fraction: Optional[float] = None,
 ) -> dict:
     """Score every clip and return the verdict plus per-clip distances.
 
@@ -110,6 +111,9 @@ def run_duel(
     ``should_cancel`` is checked **between clips** — the only honest granularity. A
     single generation is one uninterruptible call into diffusers; pretending we can
     stop mid-clip would just be a lie that leaves the GPU busy anyway.
+
+    ``freeze_margin_fraction`` enables the freeze-baseline gate: the challenger must
+    also beat a frozen conditioning frame, confidently. See ``eval/baselines.py``.
     """
     if not clips:
         raise ValueError("no clips to duel on")
@@ -179,7 +183,91 @@ def run_duel(
     )
     verdict["early_stopped"] = False
     verdict["per_clip"] = per_clip
+
+    # Copy-of-king, caught at duel time — and free.
+    #
+    # The duel is deterministic: the same weights, the same seed and the same clip
+    # produce bit-identical frames. So if the challenger's generations are identical
+    # to the king's on EVERY clip, the challenger IS the king — whatever repo it was
+    # uploaded under and whatever digest it carries. No amount of repackaging survives
+    # this, because it compares what the models *do*, not what they claim to be.
+    #
+    # It also cannot false-positive on an honest model: two independently trained 14B
+    # diffusion models do not produce bit-identical video on 32 clips.
+    if per_clip and all(
+        row["king_frames_digest"] == row["challenger_frames_digest"] for row in per_clip
+    ):
+        verdict["accepted"] = False
+        verdict["verdict"] = "king"
+        verdict["rejected_by"] = "copy_of_king"
+        verdict["reason"] = (
+            "the challenger generated bit-identical video to the king on every clip — "
+            "it is the king's own weights, repackaged. Copying the incumbent is not an "
+            "improvement on it."
+        )
+        if on_phase:
+            on_phase({"phase": "copy_of_king", "clips": len(per_clip)})
+        return verdict
+
+    if freeze_margin_fraction is not None:
+        _apply_freeze_gate(
+            verdict, clips, king_scores, challenger_scores, distance_fn,
+            margin_fraction=freeze_margin_fraction, alpha=alpha,
+            n_bootstrap=n_bootstrap, seed=master_seed, on_phase=on_phase,
+        )
+
     return verdict
+
+
+def _apply_freeze_gate(
+    verdict: dict,
+    clips: Sequence[Clip],
+    king_scores: Sequence[float],
+    challenger_scores: Sequence[float],
+    distance_fn: Metric,
+    *,
+    margin_fraction: float,
+    alpha: float,
+    n_bootstrap: int,
+    seed: int,
+    on_phase: Optional[Callable[[dict], None]] = None,
+) -> None:
+    """A challenger must beat the king AND the freeze cheat. Mutates ``verdict``.
+
+    Deliberately *after* the main verdict, and only ever able to take the crown away —
+    never to grant it. A challenger that loses to the king is already rejected; the
+    gate exists to stop one that *beat* a mediocre king by doing nothing but holding
+    the conditioning frame.
+    """
+    from leoma.eval.baselines import evaluate_freeze_gates
+
+    gates = evaluate_freeze_gates(
+        clips, king_scores, challenger_scores, distance_fn,
+        margin_fraction=margin_fraction, alpha=alpha, n_bootstrap=n_bootstrap, seed=seed,
+    )
+    verdict["gates"] = gates
+
+    if verdict["accepted"] and not gates["challenger_passed"]:
+        verdict["accepted"] = False
+        verdict["verdict"] = "king"
+        verdict["rejected_by"] = "freeze_gate"
+        verdict["reason"] = (
+            "the challenger beat the king but not a frozen conditioning frame "
+            f"(freeze lcb={gates['challenger']['lcb']}, margin={gates['challenger']['margin']}). "
+            "A model that beats a mediocre king by holding still has not learned anything, "
+            "and must not inherit the crown."
+        )
+        if on_phase:
+            on_phase({"phase": "freeze_gate_rejected", "lcb": gates["challenger"]["lcb"]})
+
+    if gates["king_failed"] and on_phase:
+        # An alarm, never an auto-dethrone: see baselines.king_gate_is_advisory().
+        on_phase({
+            "phase": "king_alarm",
+            "reason": "the reigning king is no better than a frozen frame",
+            "avg_king_distance": verdict["avg_king_distance"],
+            "avg_freeze_distance": gates["avg_freeze_distance"],
+        })
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +423,7 @@ def duel(
     on_phase: Optional[Callable[[dict], None]] = None,
     early_stop_max_advantage: Optional[float] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
+    freeze_margin_fraction: Optional[float] = None,
 ) -> dict:
     """Production wrapper: bind loaded pipelines + the named metric into ``run_duel``."""
     gen = generate_fn or generate
@@ -351,4 +440,5 @@ def duel(
         on_phase=on_phase,
         early_stop_max_advantage=early_stop_max_advantage,
         should_cancel=should_cancel,
+        freeze_margin_fraction=freeze_margin_fraction,
     )

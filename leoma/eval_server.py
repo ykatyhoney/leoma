@@ -524,6 +524,7 @@ def run_eval_job(req: EvalRequest, emit: Emit, should_cancel: ShouldCancel = lam
             on_phase=emit,
             early_stop_max_advantage=spec.early_stop_max_advantage,
             should_cancel=should_cancel,
+            freeze_margin_fraction=spec.duel.freeze_margin_fraction,
         )
     finally:
         # The challenger is done with either way — success, error, or cancellation.

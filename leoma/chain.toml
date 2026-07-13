@@ -109,6 +109,22 @@ base_seed = 0
 # stop can only ever yield verdict="king", a validator running with it still agrees
 # with one running without it.
 early_stop_factor = 20.0
+# The freeze-baseline gate. A challenger must beat not only the king but a trivial
+# "hold the conditioning frame" cheat — CONFIDENTLY — or it is rejected even if it beat
+# the king. Scoring closeness-to-the-real-continuation means a model that freezes scores
+# well on any clip that does not move much, so the cheat is materialized as a third
+# duelist and run through the same bootstrap.
+#
+# The margin is a FRACTION of the freeze baseline's own mean distance, so it is
+# dimensionless and survives a metric change (LPIPS, MSE and flow live on wildly
+# different scales; an absolute margin would silently mean something different on each).
+#
+# 0.0 = LCB-only: be confidently better than freezing, with no extra headroom demanded.
+# That is the honest launch setting — we have not yet measured how much headroom a
+# genuinely good model has over the cheat, and a margin guessed too high would reject
+# good models before we ever saw one. The dashboard publishes avg_freeze_distance so
+# the number can be measured rather than invented.
+freeze_margin_fraction = 0.0
 
 [determinism]
 torch_deterministic = true

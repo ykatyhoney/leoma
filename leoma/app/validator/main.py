@@ -50,11 +50,13 @@ from leoma.app.validator.state_store import (
 from leoma.app.validator.dashboard import build_dashboard, publish_dashboard
 from leoma.app.validator.failures import (
     DuelFailure,
+    ErrorClass,
     EvalBusy,
     EvalJobFailed,
     classify,
     classify_remote,
 )
+from leoma.app.validator import rate_limit as RL
 from leoma.app.validator.state_store import MAX_DUEL_ATTEMPTS
 from leoma.app.validator import king as K
 
@@ -82,6 +84,31 @@ def _seen_key(hotkey: str, digest: str) -> str:
 def _is_current_king(state: KingState, entry: ChallengerEntry) -> bool:
     k = state.king or {}
     return k.get("hotkey") == entry.hotkey and k.get("model_digest") == entry.model_digest
+
+
+def _copies_a_king(state: KingState, entry: ChallengerEntry) -> Optional[str]:
+    """Is this a *different* hotkey submitting a king's exact weights? Returns whose.
+
+    ``_is_current_king`` requires the hotkey to match as well as the digest — which is
+    right for "don't re-duel the incumbent against itself", but it left a hole: a
+    **different** hotkey re-committing the king's exact digest was treated as a novel
+    challenger and handed a full multi-hour duel on the subnet's only GPU. It would
+    then tie the king exactly and lose (the threshold requires strictly better), so it
+    could never actually win — but it cost hours of GPU every time, for free, and
+    could be repeated indefinitely.
+
+    The digest is content-addressed, so identical digest means identical bytes. There
+    is nothing to evaluate. Reject before dispatch.
+
+    Prior kings count too: submitting a *previous* king's weights is the same
+    plagiarism, and it has already been beaten by the current king.
+    """
+    for who in ([state.king] if state.king else []) + list(state.king_chain or []):
+        if not who:
+            continue
+        if who.get("model_digest") == entry.model_digest and who.get("hotkey") != entry.hotkey:
+            return str(who.get("hotkey", ""))
+    return None
 
 
 async def refresh_uid_map(subtensor: bt.AsyncSubtensor) -> dict[str, int]:
@@ -350,6 +377,10 @@ def _duel_history_entry(entry: ChallengerEntry, verdict: dict, uid_map: dict[str
         "metric": SPEC.duel.metric,
         "n_clips": verdict.get("n_clips"),
         "block": entry.block,
+        # Why a challenger that beat the king still didn't take the crown: it copied
+        # the king, or it beat a mediocre king only by holding the conditioning frame.
+        "rejected_by": verdict.get("rejected_by"),
+        "gates": verdict.get("gates"),
         # The eval server stamps produced_at OUTSIDE the digested surface, so two
         # validators that agree still produce identical verdict_digests.
         "timestamp": verdict.get("produced_at"),
@@ -587,9 +618,19 @@ async def settle_inflight(
         await state.flush(store)
         return True
 
-    # A completed duel clears the artifact's failure history.
+    # A completed duel clears the artifact's failure history and charges the hotkey's
+    # GPU budget — whatever the outcome. The duel cost hours either way.
     state.clear_attempts(key)
     state.mark_seen(key)
+    RL.record_verdict(state.duels, entry.hotkey, king=state.king, block=block)
+
+    # A gate rejection is a strike; LOSING a duel fairly is not. A miner whose honest
+    # model simply isn't good enough has done nothing wrong, and penalizing them for
+    # trying would deter exactly the people the subnet exists to attract.
+    rejected_by = str(verdict.get("rejected_by") or "")
+    if rejected_by:
+        RL.record_strike(state.duels, entry.hotkey, rejected_by)
+
     state.record_duel(_duel_history_entry(entry, verdict, uid_map))
 
     if verdict.get("accepted"):
@@ -661,6 +702,29 @@ async def process_challengers(
         if block < state.next_retry_block(key):
             continue  # backoff has not elapsed
 
+        # A different hotkey submitting a king's exact weights. Content-addressed
+        # digests mean identical digest = identical bytes: there is nothing to
+        # evaluate, and dispatching it would burn hours of GPU on a model that
+        # already reigns. It could never win anyway (the threshold demands strictly
+        # better, and a copy ties exactly) — it was simply free to repeat.
+        plagiarized = _copies_a_king(state, entry)
+        if plagiarized:
+            failure = DuelFailure(
+                ErrorClass.PERMANENT, "copy_of_king",
+                f"{entry.model_digest} is {plagiarized[:12]}...'s model, repackaged. "
+                "Copying a king is not an improvement on it.",
+            )
+            RL.record_strike(state.duels, entry.hotkey, failure.reason)
+            await _note_failure(state, store, uid_map, entry, key, failure, block)
+            continue
+
+        # The GPU is the scarcest thing in the subnet. A hotkey that has just been
+        # dueled, or has already spent its allowance against this king, waits.
+        limited = RL.check(state.duels, entry.hotkey, king=state.king, block=block)
+        if limited:
+            log(f"Rate-limited {entry.hotkey[:12]}...: {limited}", "info")
+            continue
+
         if not state.king:
             # No king AND no chain.toml seed_digest. We refuse to crown an unevaluated
             # model — the burn path already exists and is correct (king_hotkeys -> [] ->
@@ -724,7 +788,13 @@ async def tick(
     commits = await subtensor.get_all_revealed_commitments(NETUID, block=block)
     # Hotkeys with several quarantined artifacts are dropped at scan time — this
     # finally wires reveal_scan's long-dead `blacklist=` hook.
-    entries = scan_reveals(commits, blacklist=state.banned_hotkeys())
+    # Two distinct reasons a hotkey stops being scanned: several unevaluable artifacts
+    # (it keeps uploading broken models), or several GATE rejections (it keeps uploading
+    # models that should never have been dispatched — copies, wrong architectures).
+    # Neither counts a fair loss.
+    entries = scan_reveals(
+        commits, blacklist=state.banned_hotkeys() | RL.struck_out(state.duels)
+    )
 
     # Bounded: settles the in-flight duel and dispatches at most one more. Always
     # returns in seconds, even when a multi-hour duel is running on the GPU box.

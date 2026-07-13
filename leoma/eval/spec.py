@@ -104,6 +104,9 @@ class DuelSpec(_Pinned):
     #: remaining advantage. Expressed as a multiple so it tracks the metric's scale
     #: through any recalibration instead of being a magic constant.
     early_stop_factor: float = Field(ge=0)
+    #: The freeze-baseline gate's margin, as a fraction of the cheat's own mean score.
+    #: Dimensionless on purpose — see chain.toml.
+    freeze_margin_fraction: float = Field(ge=0)
 
 
 class ArchSpec(_Pinned):

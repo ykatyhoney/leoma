@@ -183,6 +183,10 @@ class KingState:
     #                                   next_retry_block, last_class, last_reason,
     #                                   last_error, quarantined, quarantine_reason}
     attempts: dict = field(default_factory=dict)
+    # Per-hotkey duel budget (cooldown, per-reign cap, strikes). Keyed by HOTKEY, not
+    # by artifact: the seen-set already stops the same artifact being dueled twice, but
+    # a hotkey can mint unlimited fresh digests and each one buys a free multi-hour duel.
+    duels: dict = field(default_factory=dict)
     inflight: Optional[dict] = None          # the single dispatched duel, if any
     weight_failures: int = 0                 # consecutive genuine set_weights failures
     next_weight_block: int = 0               # block-based backoff after a failure
@@ -204,6 +208,7 @@ class KingState:
             "seen": sorted(self.seen_hotkeys),
             "history": self.history,
             "attempts": self.attempts,
+            "duels": self.duels,
             "inflight": self.inflight,
             "weight_failures": self.weight_failures,
             "next_weight_block": self.next_weight_block,
@@ -221,6 +226,9 @@ class KingState:
         self.seen_hotkeys = set(doc.get("seen") or [])
         self.history = doc.get("history") or []
         self.attempts = doc.get("attempts") or {}
+        # Default-on-missing: live validators have existing buckets whose state.json
+        # predates this field, and they must load rather than crash.
+        self.duels = doc.get("duels") or {}
         self.inflight = doc.get("inflight")
         self.weight_failures = doc.get("weight_failures", 0)
         self.next_weight_block = doc.get("next_weight_block", 0)
