@@ -58,6 +58,7 @@ from leoma.app.validator.failures import (
 )
 from leoma.app.validator import rate_limit as RL
 from leoma.app.validator.prescreen import prescreen
+from leoma.app.validator.copy_check import check_model_copy
 from leoma.app.validator.state_store import MAX_DUEL_ATTEMPTS
 from leoma.app.validator import king as K
 
@@ -68,6 +69,11 @@ CHALLENGE_POLL_INTERVAL = int(os.environ.get("LEOMA_CHALLENGE_POLL_INTERVAL", "6
 # bad model costing ~5 seconds and costing hours of GPU with the lock held. Off only
 # as an operator escape hatch if the Hub's config endpoint is misbehaving.
 PRESCREEN_ENABLED = os.environ.get("LEOMA_PRESCREEN", "1") != "0"
+
+# The OCI-layer copy check + earliest-author displacement. On by default: one manifest
+# fetch catches a repackaged copy of the king that the free exact-digest check misses,
+# for the cost of a few KB instead of a multi-hour duel. Fails open if it cannot run.
+COPY_CHECK_ENABLED = os.environ.get("LEOMA_COPY_CHECK", "1") != "0"
 
 # The duel parameters (metric, n_clips, delta, alpha, bootstrap, generation knobs)
 # are NOT read from the environment any more. They are the consensus surface, and
@@ -659,6 +665,50 @@ async def settle_inflight(
     return True
 
 
+async def _crown_earlier(
+    subtensor: bt.AsyncSubtensor,
+    wallet: bt.Wallet,
+    state: KingState,
+    uid_map: dict[str, int],
+    store: JsonBucketStore,
+    entry: ChallengerEntry,
+    key: str,
+    copy: dict,
+    block: int,
+) -> None:
+    """Displace the king with a byte-identical model that was pushed to the registry earlier.
+
+    No duel: the weights are provably identical to the reigning king's, so there is
+    nothing to evaluate — the only question was authorship, and the registry's own push
+    time answered it. The challenger is the original, front-run by whoever got crowned
+    first, and it takes the crown as a synthetic accepted verdict.
+    """
+    log(f"{entry.hotkey[:12]}... has the king's exact weights but an EARLIER registry "
+        f"push — crowning the original author, no duel. {copy['reason']}", "warn")
+
+    verdict = {
+        "accepted": True,
+        "verdict": "crown_earlier",
+        "challenge_id": f"block-{entry.block}",
+        "reason": copy["reason"],
+        "challenger_committed_at": copy.get("challenger_committed_at"),
+        "king_committed_at": copy.get("king_committed_at"),
+        "produced_at": datetime.now(timezone.utc).isoformat(),
+    }
+    state.clear_attempts(key)
+    state.mark_seen(key)
+    RL.record_verdict(state.duels, entry.hotkey, king=state.king, block=block)
+    state.record_duel(_duel_history_entry(entry, verdict, uid_map))
+    state.king, state.king_chain = K.crown(
+        state.king, state.king_chain, hotkey=entry.hotkey, model_repo=entry.model_repo,
+        model_digest=entry.model_digest, block=entry.block, challenge_id=verdict["challenge_id"],
+    )
+    state.stats["accepted"] = state.stats.get("accepted", 0) + 1
+    state.touch()
+    await state.flush(store)
+    await maybe_set_weights(subtensor, wallet, state, uid_map, store, force=True)
+
+
 async def process_challengers(
     subtensor: bt.AsyncSubtensor,
     wallet: bt.Wallet,
@@ -723,6 +773,29 @@ async def process_challengers(
             RL.record_strike(state.duels, entry.hotkey, failure.reason)
             await _note_failure(state, store, uid_map, entry, key, failure, block)
             continue
+
+        # The exact-digest check above misses a copy that changed only its README or
+        # tokenizer: identical WEIGHTS, new top-level digest. This catches it from OCI
+        # layer digests — one manifest fetch, no weight download — and also displaces
+        # the king when the challenger is the byte-identical ORIGINAL, front-run by
+        # whoever got crowned first. Both decisions rest only on registry-observed
+        # push time, so validators agree; a metadata hiccup fails OPEN (returns None).
+        if COPY_CHECK_ENABLED and state.king:
+            try:
+                copy = await asyncio.to_thread(
+                    check_model_copy, entry.model_repo, entry.model_digest,
+                    state.king.get("model_repo", ""), state.king.get("model_digest", ""),
+                )
+            except Exception:  # noqa: BLE001 — the check itself must never crash the tick
+                copy = None
+            if copy and copy["action"] == "reject":
+                failure = DuelFailure(ErrorClass.PERMANENT, "copy_of_king", copy["reason"])
+                RL.record_strike(state.duels, entry.hotkey, failure.reason)
+                await _note_failure(state, store, uid_map, entry, key, failure, block)
+                continue
+            if copy and copy["action"] == "crown_earlier":
+                await _crown_earlier(subtensor, wallet, state, uid_map, store, entry, key, copy, block)
+                return  # the king changed with no duel; re-scan next tick
 
         # The GPU is the scarcest thing in the subnet. A hotkey that has just been
         # dueled, or has already spent its allowance against this king, waits.

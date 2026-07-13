@@ -442,6 +442,89 @@ def sha256_safetensors(path: str | os.PathLike[str]) -> str:
     return h.hexdigest()
 
 
+def fetch_oci_copy_info(ref: "ModelRef") -> Optional[dict]:
+    """Per-layer weight digests + the registry's own push timestamp, from OCI metadata.
+
+    This is what lets the validator catch a *repackaged* copy of the king — identical
+    weights re-uploaded with a changed README or tokenizer, which yields a new
+    top-level manifest digest but the SAME per-layer safetensor digests — for the cost
+    of one manifest fetch (a few KB), with **no weight download at all**. On a
+    content-addressed registry, identical layer digests mean identical bytes.
+
+    Returns ``{"safetensor_layers": {title: digest}, "committed_at": iso|None,
+    "timestamp_source": str|None}``, or **None** when the check cannot be performed
+    (an ``hf:`` ref, the registry is unreachable, the manifest is absent). None means
+    "don't know" — the caller must fail *open*, never blocking a valid submission on a
+    metadata hiccup.
+
+    ``committed_at`` is deliberately the **registry-observed** push time (Harbor's
+    ``push_time`` or the manifest's ``Last-Modified``), never a client-supplied
+    annotation like ``org.opencontainers.image.created`` — a miner can backdate the
+    latter to steal an earlier-author claim. Ported from Teutonic's
+    ``_fetch_model_oci_info``.
+    """
+    if ref.digest.startswith("hf:"):
+        return None
+    try:
+        import httpx
+        from hippius_hub._harbor import harbor_get_artifact, split_repo_id
+        from hippius_hub._oci import manifest_url, oci_headers
+        from hippius_hub.auth import (
+            get_oci_bearer_token,
+            resolve_auth_header,
+            resolve_token_value,
+        )
+        from hippius_hub.constants import resolve_registry
+        from hippius_hub.file_download import _oci_repo_path
+
+        registry = resolve_registry(None)
+        oci_repo = _oci_repo_path(ref.repo, None)
+        raw_token = _resolve_hub_token(f"copy-check manifest {ref.repo}")
+        oci_token = get_oci_bearer_token(oci_repo, resolve_token_value(raw_token), push=False)
+
+        resp = httpx.get(
+            manifest_url(registry, oci_repo, ref.digest),
+            headers=oci_headers(oci_token),
+            timeout=httpx.Timeout(15.0),
+        )
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        manifest = resp.json()
+
+        safetensor_layers: dict[str, str] = {}
+        for layer in manifest.get("layers", []):
+            title = layer.get("annotations", {}).get("org.opencontainers.image.title", "")
+            if title.endswith(".safetensors") and "digest" in layer:
+                safetensor_layers[title] = layer["digest"]
+
+        artifact = None
+        auth_header = resolve_auth_header(raw_token)
+        if auth_header:
+            try:
+                project, repo = split_repo_id(oci_repo)
+                artifact = harbor_get_artifact(auth_header, project, repo, ref.digest, endpoint=None)
+            except Exception:
+                pass  # timestamp metadata is best-effort; layer digests are the load-bearing part
+
+        committed_at = None
+        timestamp_source = None
+        if isinstance(artifact, dict) and artifact.get("push_time"):
+            committed_at, timestamp_source = artifact["push_time"], "harbor_artifact.push_time"
+        elif resp.headers.get("Last-Modified"):
+            committed_at, timestamp_source = resp.headers["Last-Modified"], "manifest_last_modified"
+
+        return {
+            "safetensor_layers": safetensor_layers,
+            "committed_at": committed_at,
+            "timestamp_source": timestamp_source,
+        }
+    except Exception:
+        # Fail OPEN: a metadata hiccup must never block a valid submission. The
+        # caller treats None as "cannot check", not "not a copy".
+        return None
+
+
 def upload_model_folder(
     folder_path: str | os.PathLike[str],
     repo: str,

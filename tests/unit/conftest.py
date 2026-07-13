@@ -122,6 +122,10 @@ def duel_ready(monkeypatch):
     monkeypatch.setattr(vmain, "SPEC", spec)
     monkeypatch.setattr(vmain, "CONSENSUS_DIGEST", spec.digest())
     monkeypatch.setattr(vmain, "PRESCREEN_ENABLED", False)
+    # The OCI copy check reaches the Hippius registry; off by default in these tests,
+    # which are about dispatch/settle policy. It has its own tests in test_copy_check.py,
+    # and one test in test_antiabuse.py turns it back on to prove it is wired.
+    monkeypatch.setattr(vmain, "COPY_CHECK_ENABLED", False)
     return spec
 
 
