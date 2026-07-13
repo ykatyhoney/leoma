@@ -148,7 +148,7 @@ class TestAttemptLedger:
 
 
 class TestProcessChallengers:
-    async def test_one_failing_challenger_does_not_block_the_rest(self, monkeypatch):
+    async def test_one_failing_challenger_does_not_block_the_rest(self, monkeypatch, duel_ready):
         """THE headline: `return` -> `continue`. A bad model must not wedge the queue."""
         dueled: list[str] = []
 
@@ -173,7 +173,7 @@ class TestProcessChallengers:
         # The bad one recorded a failure but is not yet quarantined (1 sighting).
         assert st.attempts["5bad|" + entries[0].model_digest]["attempts"] == 1
 
-    async def test_busy_breaks_and_consumes_no_attempt(self, monkeypatch):
+    async def test_busy_breaks_and_consumes_no_attempt(self, monkeypatch, duel_ready):
         """BUSY is a property of the SERVER: stop, but don't punish anyone."""
         async def fake_dispatch(entry, king, block_hash):
             raise EvalBusy("busy")
@@ -188,7 +188,7 @@ class TestProcessChallengers:
         assert st.attempts == {}          # no attempt consumed
         assert st.seen_hotkeys == set()   # nobody marked seen
 
-    async def test_permanent_failure_quarantines_and_records_an_error_row(self, monkeypatch):
+    async def test_permanent_failure_quarantines_and_records_an_error_row(self, monkeypatch, duel_ready):
         async def fake_dispatch(entry, king, block_hash):
             raise RuntimeError("does not appear to have a file named model_index.json")
 
@@ -213,7 +213,7 @@ class TestProcessChallengers:
         assert row["error_reason"] == "model_invalid"
         assert row["error"]
 
-    async def test_backoff_defers_until_the_retry_block(self, monkeypatch):
+    async def test_backoff_defers_until_the_retry_block(self, monkeypatch, duel_ready):
         calls: list[str] = []
 
         async def fake_dispatch(entry, king, block_hash):
@@ -238,7 +238,7 @@ class TestProcessChallengers:
         )
         assert len(calls) == 2
 
-    async def test_quarantined_is_skipped_forever(self, monkeypatch):
+    async def test_quarantined_is_skipped_forever(self, monkeypatch, duel_ready):
         async def fake_dispatch(entry, king, block_hash):
             raise AssertionError("must not dispatch a quarantined artifact")
 
@@ -252,7 +252,7 @@ class TestProcessChallengers:
             _FakeSubtensor(), object(), st, {}, store, [e], block=10_000
         )  # must not raise
 
-    async def test_successful_duel_clears_the_failure_history(self, monkeypatch):
+    async def test_successful_duel_clears_the_failure_history(self, monkeypatch, duel_ready):
         async def fake_dispatch(entry, king, block_hash):
             return {"accepted": False, "verdict": "king", "lcb": -0.01}
 
@@ -267,7 +267,7 @@ class TestProcessChallengers:
         )
         assert key not in st.attempts
 
-    async def test_no_king_no_seed_burns_and_crowns_nobody(self, monkeypatch):
+    async def test_no_king_no_seed_burns_and_crowns_nobody(self, monkeypatch, duel_ready):
         """The unopposed-crown path is gone: never crown an unevaluated model."""
         async def fake_dispatch(entry, king, block_hash):
             raise AssertionError("must not dispatch without a king")

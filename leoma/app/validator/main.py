@@ -31,7 +31,16 @@ from leoma.bootstrap import (
 )
 from leoma.bootstrap import emit_log as log, emit_header as log_header, log_exception
 from leoma.infra.storage_backend import create_own_write_client, ensure_bucket_exists
-from leoma.infra.chain_config import NAME as CHAIN_NAME, SEED_REPO, SEED_DIGEST
+from leoma.infra.chain_config import (
+    CONSENSUS_DIGEST,
+    NAME as CHAIN_NAME,
+    SEED_REPO,
+    SEED_DIGEST,
+    SPEC,
+)
+from leoma.eval.codehash import eval_code_digest
+from leoma.eval.errors import ConsensusConfigError
+from leoma.eval.spec import verify_echo
 from leoma.app.validator.reveal_scan import scan_reveals, ChallengerEntry
 from leoma.app.validator.state_store import (
     JsonBucketStore,
@@ -53,12 +62,11 @@ from leoma.app.validator import king as K
 EVAL_SERVER_URL = os.environ.get("EVAL_SERVER_URL", "http://localhost:9000")
 CHALLENGE_POLL_INTERVAL = int(os.environ.get("LEOMA_CHALLENGE_POLL_INTERVAL", "60"))
 
-# Duel parameters (must match across validators for consensus).
-DUEL_METRIC = os.environ.get("LEOMA_DUEL_METRIC", "lpips")
-DUEL_N_CLIPS = int(os.environ.get("LEOMA_DUEL_N_CLIPS", "32"))
-DELTA_THRESHOLD = float(os.environ.get("LEOMA_DELTA_THRESHOLD", "0.0025"))
-ALPHA = float(os.environ.get("LEOMA_ALPHA", "0.001"))
-N_BOOTSTRAP = int(os.environ.get("LEOMA_N_BOOTSTRAP", "10000"))
+# The duel parameters (metric, n_clips, delta, alpha, bootstrap, generation knobs)
+# are NOT read from the environment any more. They are the consensus surface, and
+# they live in chain.toml as `SPEC`. An env var is per-box; a per-box exam is not
+# consensus. LEOMA_DUEL_METRIC / _N_CLIPS / _DELTA_THRESHOLD / _ALPHA / _N_BOOTSTRAP
+# are deliberately gone — setting one no longer does anything, which is the point.
 
 # Eval dispatch: connect fast, but allow a long duel (N clips x 2 generations).
 _EVAL_CONNECT_TIMEOUT = 30.0
@@ -80,6 +88,34 @@ async def refresh_uid_map(subtensor: bt.AsyncSubtensor) -> dict[str, int]:
     return {hk: uid for uid, hk in enumerate(hotkeys)}
 
 
+async def preflight_eval_server(client) -> None:
+    """Refuse a box whose pinned exam or scoring code has drifted from ours.
+
+    A stale eval box is the most *likely* consensus failure in the whole system —
+    not an attack, just an operator who redeployed three machines out of four. It
+    produces confident, plausible verdicts that no other validator can reproduce.
+    One cheap GET catches it; the alternative is finding out after an hour of GPU.
+    """
+    resp = await client.get(f"{EVAL_SERVER_URL}/health")
+    resp.raise_for_status()
+    health = resp.json()
+
+    theirs = health.get("consensus_digest")
+    if theirs != CONSENSUS_DIGEST:
+        raise EvalJobFailed(
+            f"eval server pins a different consensus surface (box {theirs}, "
+            f"validator {CONSENSUS_DIGEST}). One of us is running a stale chain.toml.",
+            reason="consensus_mismatch",
+        )
+    their_code = health.get("eval_code_digest")
+    if their_code and their_code != eval_code_digest():
+        raise EvalJobFailed(
+            f"eval server runs different scoring code (box {their_code}, validator "
+            f"{eval_code_digest()}). Its distances would not be reproducible.",
+            reason="code_mismatch",
+        )
+
+
 async def dispatch_duel(
     entry: ChallengerEntry,
     king: dict,
@@ -87,11 +123,15 @@ async def dispatch_duel(
 ) -> dict:
     """POST a duel to the eval server and stream its verdict.
 
+    Sends the **whole pinned consensus surface** (``SPEC``) rather than a handful of
+    loose knobs, and verifies the echo before returning — so a verdict produced under
+    different parameters can never reach the crowning code.
+
     Raises ``EvalBusy`` when the server is already running a duel (409), and
-    ``EvalJobFailed`` on a terminal error — including a stream that ends without
-    a verdict. It used to return ``None`` for BOTH cases, so "the server is busy"
-    was indistinguishable from "the duel broke", and the caller treated a broken
-    duel as a reason to stop processing everyone else.
+    ``EvalJobFailed`` on a terminal error — including a stream that ends without a
+    verdict. It used to return ``None`` for BOTH cases, so "the server is busy" was
+    indistinguishable from "the duel broke", and the caller treated a broken duel as
+    a reason to stop processing everyone else.
     """
     import httpx
 
@@ -102,14 +142,13 @@ async def dispatch_duel(
         "challenger_digest": entry.model_digest,
         "block_hash": block_hash,
         "hotkey": entry.hotkey,
-        "metric": DUEL_METRIC,
-        "n_clips": DUEL_N_CLIPS,
-        "delta_threshold": DELTA_THRESHOLD,
-        "alpha": ALPHA,
-        "n_bootstrap": N_BOOTSTRAP,
+        "spec": SPEC.model_dump(mode="json"),
+        "consensus_digest": CONSENSUS_DIGEST,
     }
     timeout = httpx.Timeout(_EVAL_READ_TIMEOUT, connect=_EVAL_CONNECT_TIMEOUT)
     async with httpx.AsyncClient(timeout=timeout) as client:
+        await preflight_eval_server(client)
+
         resp = await client.post(f"{EVAL_SERVER_URL}/eval", json=payload)
         if resp.status_code == 409:
             raise EvalBusy("eval server is already running a duel")
@@ -137,6 +176,15 @@ async def dispatch_duel(
         raise EvalJobFailed(
             "eval stream ended without a terminal verdict", reason="stream_no_terminal"
         )
+
+    # Fail closed: the box must have run EXACTLY the exam we set. This is the check
+    # that catches "the field wasn't sent, so the box used its own default" — the
+    # entire bug class that made two honest validators disagree.
+    try:
+        verify_echo(SPEC, verdict.get("echo"))
+    except ConsensusConfigError as e:
+        raise EvalJobFailed(str(e), reason="consensus_echo_mismatch") from e
+
     return verdict
 
 
@@ -286,10 +334,18 @@ def _duel_history_entry(entry: ChallengerEntry, verdict: dict, uid_map: dict[str
         "delta": verdict.get("delta_threshold"),
         "avg_king_distance": verdict.get("avg_king_distance"),
         "avg_challenger_distance": verdict.get("avg_challenger_distance"),
-        "metric": DUEL_METRIC,
+        "metric": SPEC.duel.metric,
         "n_clips": verdict.get("n_clips"),
         "block": entry.block,
-        "timestamp": verdict.get("timestamp"),
+        # The eval server stamps produced_at OUTSIDE the digested surface, so two
+        # validators that agree still produce identical verdict_digests.
+        "timestamp": verdict.get("produced_at"),
+        "early_stopped": bool(verdict.get("early_stopped")),
+        # The audit anchors: anyone can now check that two validators graded the
+        # same exam (clip_keys_digest) and reached the same call (verdict_digest).
+        "verdict_digest": verdict.get("verdict_digest"),
+        "consensus_digest": (verdict.get("audit") or {}).get("consensus_digest"),
+        "clip_keys_digest": ((verdict.get("audit") or {}).get("corpus") or {}).get("clip_keys_digest"),
     }
 
 
@@ -329,11 +385,14 @@ async def _publish_dashboard(
                 "netuid": NETUID,
             },
             duel_params={
-                "metric": DUEL_METRIC,
-                "n_clips": DUEL_N_CLIPS,
-                "delta_threshold": DELTA_THRESHOLD,
-                "alpha": ALPHA,
-                "n_bootstrap": N_BOOTSTRAP,
+                "metric": SPEC.duel.metric,
+                "metric_device": SPEC.duel.metric_device,
+                "n_clips": SPEC.duel.n_clips,
+                "delta_threshold": SPEC.duel.delta_threshold,
+                "alpha": SPEC.duel.alpha,
+                "n_bootstrap": SPEC.duel.n_bootstrap,
+                "consensus_digest": CONSENSUS_DIGEST,
+                "corpus_pinned": SPEC.corpus.pinned,
             },
             updated_at=datetime.now(timezone.utc).isoformat(),
             queue=queue,
@@ -366,7 +425,7 @@ def _error_history_entry(
         "error": (failure.detail or "")[:500],
         "error_reason": failure.reason,
         "attempts": row.get("attempts"),
-        "metric": DUEL_METRIC,
+        "metric": SPEC.duel.metric,
         "block": entry.block,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
@@ -427,6 +486,16 @@ async def process_challengers(
       * BUSY  -> ``break``    (a property of the SERVER: continuing would just 409)
       * error -> ``continue`` (a property of the CHALLENGER: everyone else proceeds)
     """
+    # An unpinned corpus is a subnet-wide condition, not a per-challenger one: the
+    # exam itself doesn't exist yet. Refuse every duel and burn, exactly as with a
+    # missing seed_digest — and say so once, not once per challenger.
+    try:
+        SPEC.require_duel_ready()
+    except ConsensusConfigError as e:
+        log(str(e), "error")
+        state.degraded = "corpus_unpinned"
+        return
+
     for entry in entries:
         key = _seen_key(entry.hotkey, entry.model_digest)
 
@@ -523,7 +592,12 @@ async def main() -> None:
     subtensor = bt.AsyncSubtensor(network=NETWORK)
     wallet = bt.Wallet(name=WALLET_NAME, hotkey=HOTKEY_NAME)
     log(f"Wallet: {WALLET_NAME}/{HOTKEY_NAME}  Network: {NETWORK}  NetUID: {NETUID}", "info")
-    log(f"Eval server: {EVAL_SERVER_URL}  metric={DUEL_METRIC} n_clips={DUEL_N_CLIPS} delta={DELTA_THRESHOLD}", "info")
+    log(
+        f"Eval server: {EVAL_SERVER_URL}  metric={SPEC.duel.metric}@{SPEC.duel.metric_device} "
+        f"n_clips={SPEC.duel.n_clips} delta={SPEC.duel.delta_threshold}",
+        "info",
+    )
+    log(f"Consensus digest: {CONSENSUS_DIGEST}  (eval code: {eval_code_digest()})", "info")
 
     own_client = create_own_write_client()
     await ensure_bucket_exists(own_client, R2_OWN_BUCKET)

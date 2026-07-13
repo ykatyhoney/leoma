@@ -41,6 +41,22 @@ def clip_generation_seed(master_seed: int, clip_index: int) -> int:
     return _blake_int(f"seed={master_seed}|clip={clip_index}")
 
 
+#: torch.Generator.manual_seed accepts the full signed 64-bit range.
+TORCH_SEED_MASK = (1 << 63) - 1
+
+
+def torch_seed(seed: int) -> int:
+    """Fold a 64-bit derived seed into torch's accepted range, keeping 63 bits.
+
+    The generation path used to mask with ``0x7FFFFFFF``, throwing away 32 of the
+    64 bits blake2b produced. That was not a correctness bug on its own — the
+    result was still deterministic — but it shrank the noise space to 2^31 and
+    made seed collisions between clips vastly more likely than the derivation
+    intends. torch takes the full 63 bits, so give it the full 63 bits.
+    """
+    return int(seed) & TORCH_SEED_MASK
+
+
 def select_clip_indices(master_seed: int, total_clips: int, n: int) -> list[int]:
     """Deterministically pick ``n`` distinct clip indices out of ``total_clips``.
 

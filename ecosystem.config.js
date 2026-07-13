@@ -22,12 +22,7 @@ module.exports = {
         // Where duels are dispatched (SSH-tunnel to the GPU eval box).
         EVAL_SERVER_URL: "http://localhost:9000",
 
-        // Duel parameters — MUST match across validators for consensus.
-        LEOMA_DUEL_METRIC: "lpips",
-        LEOMA_DUEL_N_CLIPS: "32",
-        LEOMA_DELTA_THRESHOLD: "0.0025",
-        LEOMA_ALPHA: "0.001",
-        LEOMA_N_BOOTSTRAP: "10000",
+        // Duel parameters live in chain.toml (the consensus surface), not here.
         LEOMA_KING_CHAIN_SIZE: "5",
         LEOMA_WEIGHT_INTERVAL: "300",
         LEOMA_BURN_UID: "0",

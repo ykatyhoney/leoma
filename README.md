@@ -49,10 +49,16 @@ per-clip seed**; each generation is scored against the **real continuation** wit
 
 The challenger is crowned only if it is **confidently** better: the per-clip advantage
 `king_distance − challenger_distance` is bootstrapped, and the crown passes iff the lower-confidence
-bound `lcb > delta_threshold`. All duel parameters (`LEOMA_DELTA_THRESHOLD`, `LEOMA_ALPHA`,
-`LEOMA_N_BOOTSTRAP`, `LEOMA_DUEL_METRIC`, `LEOMA_DUEL_N_CLIPS`) **must match across validators** for
-consensus. The block hash is unpredictable until mined, so miners cannot overfit to the test set, yet
-every validator reproduces the identical verdict.
+bound `lcb > delta_threshold`.
+
+Every input that can change a verdict — the corpus, the prompt, the frame count, the resolution, the
+metric, the threshold — is pinned in **`chain.toml`**, hashed into a `consensus_digest` that is sent
+with each eval request and **echoed back in the verdict**. A validator running a different config
+cannot quietly disagree with the rest of the subnet: the mismatch is refused at the door. The held-out
+clips come from a **digest-pinned corpus manifest** (not a live bucket listing), with each clip's
+window and ground-truth hash fixed offline, so two validators provably grade the same exam. The block
+hash is unpredictable until mined, so miners cannot overfit to the test set, yet every validator
+reproduces the identical verdict.
 
 ---
 
@@ -93,6 +99,35 @@ leoma servers eval-server   # FastAPI on EVAL_SERVER_PORT (default 9000)
 
 The validator reaches it over `EVAL_SERVER_URL` (default `http://localhost:9000`, usually an SSH
 tunnel). One duel runs at a time. See `ecosystem.eval.config.js` for a PM2 launcher.
+
+Before a new eval box is allowed to duel, prove it decodes the pinned corpus byte-identically:
+
+```bash
+leoma corpus verify --sample 4
+```
+
+A box whose ffmpeg produces even slightly different pixels measures every distance against different
+ground truth — silently, confidently, and wrongly. This takes a minute and rules that out.
+
+---
+
+## Corpus (subnet operator)
+
+The duel's held-out clips come from a **pinned manifest**, not a live bucket listing. The manifest
+fixes which videos, the window inside each one, and the hash of the decoded ground truth — so every
+validator provably grades the same exam. Building it once, offline, is what removes the whole class of
+"two honest validators disagree" bugs: nothing is scene-detected, listed or skipped at duel time.
+
+```bash
+leoma corpus build-manifest --corpus-id leoma-corpus-v1   # decides windows, hashes truth
+leoma corpus publish-manifest manifest.json               # uploads; prints the digest
+# paste that digest into chain.toml [corpus].manifest_digest, then ship it
+```
+
+**Until `[corpus].manifest_digest` and `[seed].seed_digest` are pinned, validators refuse to duel and
+burn 100% to UID 0.** That is deliberate: an unpinned corpus is not reproducible, and an unevaluated
+first challenger must never be crowned. Rotate the corpus by rebuilding with a new `corpus-id` and
+re-pinning — a version bump, auditable in git.
 
 ---
 

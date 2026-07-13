@@ -14,10 +14,16 @@ bootstrap over the per-clip advantage ``d = king_distance - challenger_distance`
 
 The seed is derived from the block hash + hotkey (see ``app.validator.seeds``),
 so every validator computes the identical verdict from the same scores.
+
+``paired_bootstrap_verdict`` is a **pure function of its arguments** — nothing in
+what it returns depends on when it ran. That is deliberate: the verdict is hashed
+into a ``verdict_digest`` that validators compare against each other, and a
+wall-clock timestamp inside it would make every honest validator's digest differ.
+The eval server stamps ``produced_at`` on the response, *outside* the digested
+surface.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from typing import Sequence
 
 import numpy as np
@@ -69,7 +75,6 @@ def paired_bootstrap_verdict(
         "n_clips": n,
         "avg_king_distance": round(float(king.mean()), 6),
         "avg_challenger_distance": round(float(challenger.mean()), 6),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 

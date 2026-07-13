@@ -243,6 +243,86 @@ async def choose_one_shot_clip_start(
     )
 
 
+# Pinned decode settings for the duel's ground truth. These are part of the
+# consensus surface: every byte of the truth depends on them, and truth_sha256 in
+# the corpus manifest is computed under exactly this command line. Change any of
+# them and every manifest must be rebuilt.
+DECODE_PIX_FMT = "rgb24"
+DECODE_SCALE_FLAGS = "bicubic"
+
+
+def decode_frames_rgb(
+    video_path: str,
+    *,
+    start_seconds: float,
+    duration_seconds: float,
+    fps: int,
+    num_frames: int,
+    width: int,
+    height: int,
+):
+    """Decode a clip window straight to a ``(T, H, W, 3)`` uint8 array.
+
+    One ffmpeg call, raw RGB on stdout. This replaces the old
+    ``extract_clip`` → x264 re-encode → ``extract_frames`` → JPEG → PIL chain,
+    which had three problems, all of them fatal for a ground truth:
+
+    * **it was lossy twice** (x264, then JPEG) — the "real continuation" every
+      distance is measured against was a compressed approximation of itself;
+    * **frame order broke at 100 frames** — ``frame_%02d.jpg`` sorted
+      lexicographically puts ``frame_100`` before ``frame_11``, silently
+      shuffling the truth for any duel longer than 99 frames;
+    * **it leaked** a temp directory per clip.
+
+    Deterministic given the same ffmpeg build: the scaler and pixel format are
+    pinned above. Across *different* builds it may differ — which is exactly why
+    the caller verifies the result against the manifest's ``truth_sha256`` rather
+    than trusting it.
+    """
+    import numpy as np
+
+    command = [
+        "ffmpeg", "-nostdin", "-v", "error",
+        "-ss", f"{float(start_seconds):.3f}",
+        "-i", video_path,
+        "-t", f"{float(duration_seconds):.3f}",
+        "-vf", f"fps={int(fps)},scale={int(width)}:{int(height)}:flags={DECODE_SCALE_FLAGS}",
+        "-frames:v", str(int(num_frames)),
+        "-f", "rawvideo", "-pix_fmt", DECODE_PIX_FMT,
+        "-",
+    ]
+    result = subprocess.run(command, capture_output=True)
+    if result.returncode != 0:
+        raise FFmpegError(f"Failed to decode frames: {_decode_stderr(result.stderr)}")
+
+    frame_bytes = int(width) * int(height) * 3
+    raw = result.stdout
+    got = len(raw) // frame_bytes if frame_bytes else 0
+    if got < int(num_frames):
+        raise FFmpegError(
+            f"decoded {got} frames, need {num_frames} "
+            f"(clip window {start_seconds:.3f}s +{duration_seconds:.3f}s may run past the video)"
+        )
+    usable = raw[: int(num_frames) * frame_bytes]
+    return np.frombuffer(usable, dtype=np.uint8).reshape(int(num_frames), int(height), int(width), 3)
+
+
+def motion_energy(frames) -> float:
+    """Mean absolute inter-frame delta — how much the clip actually *moves*.
+
+    Used at manifest-build time to drop near-static clips. The freeze cheat (emit
+    the conditioning frame forever) only pays on clips that barely move, so the
+    corpus simply does not contain any: remove the surface, don't just detect the
+    attack.
+    """
+    import numpy as np
+
+    arr = np.asarray(frames, dtype=np.float64)
+    if arr.shape[0] < 2:
+        return 0.0
+    return float(np.mean(np.abs(np.diff(arr, axis=0))))
+
+
 async def stitch_videos_side_by_side(left_path: str, right_path: str, output_path: str) -> None:
     result = await _run_process(
         [

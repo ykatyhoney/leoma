@@ -18,15 +18,33 @@ import queue
 import threading
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict
+
+from leoma.eval.spec import ConsensusSpec
 
 
 class EvalRequest(BaseModel):
-    """A duel job posted by a validator."""
+    """A duel job posted by a validator.
+
+    **The request carries the entire consensus surface.** It used to carry a
+    handful of loose knobs (``metric``, ``n_clips``, ``num_frames``…) each with a
+    *default* — so a validator that forgot one, or an eval box running an older
+    build that ignored one, silently ran a different exam and produced a verdict
+    nobody else could reproduce. Worse, the parameters it *didn't* carry (prompt,
+    resolution, negative prompt, fps) came from the eval box's own environment.
+
+    Now the validator sends the pinned :class:`~leoma.eval.spec.ConsensusSpec` and
+    the server executes exactly that. The server reads **nothing** about how to
+    duel from its own environment, and echoes the spec back in the verdict so the
+    validator can verify what it actually ran before crowning anyone.
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
     king_repo: str
     king_digest: str
@@ -34,16 +52,11 @@ class EvalRequest(BaseModel):
     challenger_digest: str
     block_hash: str = ""
     hotkey: str = ""
-    metric: str = "lpips"
-    n_clips: int = Field(default=32, ge=1)
-    delta_threshold: float = 0.0025
-    alpha: float = 0.001
-    n_bootstrap: int = Field(default=10_000, ge=1)
-    base_seed: int = 0
-    # Generation knobs (kept identical for king + challenger).
-    num_frames: int = 81
-    num_inference_steps: int = 30
-    guidance_scale: float = 5.0
+    #: The pinned exam. No defaults — a missing field is a 422, not a guess.
+    spec: ConsensusSpec
+    #: The validator's own digest of ``spec``. Guards against a spec that was
+    #: mangled in transit into something that still parses.
+    consensus_digest: str
 
 
 # A runner turns a request into a verdict, emitting progress events along the way.
@@ -89,7 +102,22 @@ def create_app(runner: Optional[Runner] = None) -> FastAPI:
 
     @app.get("/health")
     def health() -> dict:
-        return {"status": "ok", "busy": lock.locked()}
+        """Enough for a validator to reject a stale box *before* handing it a duel.
+
+        ``consensus_digest`` and ``eval_code_digest`` are the two that matter: a box
+        whose chain.toml or scoring code has drifted will produce distances nobody
+        can reproduce, and an hours-long duel is a very expensive way to find that
+        out. The validator preflights this endpoint instead.
+        """
+        from leoma.infra.chain_config import CONSENSUS_DIGEST
+        from leoma.eval.codehash import eval_code_digest
+
+        return {
+            "status": "ok",
+            "busy": lock.locked(),
+            "consensus_digest": CONSENSUS_DIGEST,
+            "eval_code_digest": eval_code_digest(),
+        }
 
     @app.post("/eval")
     def start_eval(req: EvalRequest):
@@ -129,17 +157,62 @@ def create_app(runner: Optional[Runner] = None) -> FastAPI:
     return app
 
 
+def check_request(req: EvalRequest) -> None:
+    """Refuse a duel this box cannot run reproducibly. Called before any GPU work.
+
+    Three ways a duel is dead on arrival, all of them cheap to detect and
+    catastrophic to miss:
+
+    * the validator's ``consensus_digest`` doesn't match the spec it sent (mangled
+      in transit, or a validator computing digests differently);
+    * this box's ``chain.toml`` pins a *different* exam than the validator's (an
+      operator forgot to redeploy one machine — the most likely failure by far);
+    * the corpus isn't pinned at all.
+
+    Any of them and we stop here, rather than spending an hour of GPU producing a
+    verdict nobody else can reproduce.
+    """
+    from leoma.infra.chain_config import CONSENSUS_DIGEST
+    from leoma.eval.errors import ConsensusConfigError
+
+    if req.spec.digest() != req.consensus_digest:
+        raise ConsensusConfigError(
+            f"request consensus_digest {req.consensus_digest} does not match the spec it "
+            f"carries ({req.spec.digest()}) — the request was altered in transit"
+        )
+    if req.consensus_digest != CONSENSUS_DIGEST:
+        raise ConsensusConfigError(
+            f"this eval box pins a different consensus surface than the validator "
+            f"(box {CONSENSUS_DIGEST}, validator {req.consensus_digest}). One of the two "
+            "is running a stale chain.toml. Refusing the duel rather than producing a "
+            "verdict the rest of the subnet cannot reproduce."
+        )
+    req.spec.require_duel_ready()
+
+
 def run_eval_job(req: EvalRequest, emit: Emit) -> dict:
     """Production duel: download both models, generate on held-out clips, score.
 
+    A **pure executor of the request**. Every parameter comes from ``req.spec``;
+    this function reads nothing about how to duel from its own environment, which
+    is what makes the verdict a function of the chain rather than of the box.
+
     Heavy deps (torch/diffusers, the corpus) are imported here, lazily, so the
-    server module stays import-safe. Raises on any failure (the app turns that
-    into an ``error`` SSE event).
+    server module stays import-safe. Raises on any failure (the app turns that into
+    an ``error`` event).
     """
     from leoma.infra.model_store import ModelRef, materialize_model
+    from leoma.infra.storage_backend import create_source_read_client
     from leoma.eval.video_runner import GenParams, load_video_pipeline, duel
-    from leoma.eval.dataset import build_duel_clips
+    from leoma.eval.codehash import eval_code_digest
+    from leoma.eval.dataset import build_duel_clips, corpus_audit, fetch_manifest
+    from leoma.eval.determinism import apply_determinism, runtime_env
+    from leoma.eval.digests import digest_obj
     from leoma.app.validator.seeds import eval_seed
+
+    check_request(req)
+    spec = req.spec
+    apply_determinism(spec.determinism)
 
     king_ref = ModelRef(req.king_repo, req.king_digest)
     chall_ref = ModelRef(req.challenger_repo, req.challenger_digest)
@@ -150,29 +223,85 @@ def run_eval_job(req: EvalRequest, emit: Emit) -> dict:
     chall_dir = materialize_model(chall_ref)
 
     emit({"phase": "load", "which": "king"})
-    king_pipe = load_video_pipeline(king_dir)
+    king_pipe = load_video_pipeline(king_dir, gen=spec.gen)
     emit({"phase": "load", "which": "challenger"})
-    chall_pipe = load_video_pipeline(chall_dir)
+    chall_pipe = load_video_pipeline(chall_dir, gen=spec.gen)
 
-    master_seed = eval_seed(req.block_hash, req.hotkey, req.base_seed)
-    params = GenParams(
-        num_frames=req.num_frames,
-        num_inference_steps=req.num_inference_steps,
-        guidance_scale=req.guidance_scale,
+    master_seed = eval_seed(req.block_hash, req.hotkey, spec.duel.base_seed)
+    params = GenParams.from_spec(spec.gen)
+
+    emit({"phase": "sample_clips", "n_clips": spec.duel.n_clips, "seed": master_seed})
+    client = create_source_read_client()
+    manifest = fetch_manifest(client, spec.corpus)
+    clips, entries = build_duel_clips(
+        manifest,
+        client=client,
+        bucket=spec.corpus.bucket,
+        master_seed=master_seed,
+        n_clips=spec.duel.n_clips,
+        gen=params,
+        prompt_mode=spec.gen.prompt_mode,
+        fixed_prompt=spec.gen.prompt,
+        # The clip phase is otherwise silent for minutes; this is the watchdog's
+        # evidence that the box is making forward progress rather than hung.
+        on_progress=lambda done, total, entry: emit({
+            "phase": "clip_ready", "done": done, "total": total, "clip_id": entry.clip_id,
+        }),
     )
-    emit({"phase": "sample_clips", "n_clips": req.n_clips, "seed": master_seed})
-    clips = build_duel_clips(master_seed, req.n_clips, params)
 
-    emit({"phase": "duel", "n_clips": len(clips), "metric": req.metric})
+    emit({"phase": "duel", "n_clips": len(clips), "metric": spec.duel.metric})
     verdict = duel(
         king_pipe, chall_pipe, clips,
-        master_seed=master_seed, metric=req.metric,
-        delta_threshold=req.delta_threshold, alpha=req.alpha, n_bootstrap=req.n_bootstrap,
+        master_seed=master_seed,
+        metric=spec.duel.metric,
+        metric_device=spec.duel.metric_device,
+        delta_threshold=spec.duel.delta_threshold,
+        alpha=spec.duel.alpha,
+        n_bootstrap=spec.duel.n_bootstrap,
         on_phase=emit,
+        early_stop_max_advantage=spec.early_stop_max_advantage,
     )
+
     verdict["king_digest"] = req.king_digest
     verdict["challenger_digest"] = req.challenger_digest
     verdict["challenger_repo"] = req.challenger_repo
+
+    # The spec, verbatim. The validator re-parses this and refuses to crown unless
+    # it matches what it sent — which is what makes "field silently defaulted" a
+    # caught error instead of an invisible fork.
+    verdict["echo"] = spec.model_dump(mode="json")
+
+    # Everything a third party needs to replay this duel and get the same numbers.
+    verdict["audit"] = {
+        "master_seed": master_seed,
+        "block_hash": req.block_hash,
+        "hotkey": req.hotkey,
+        "consensus_digest": req.consensus_digest,
+        "eval_code_digest": eval_code_digest(),
+        "corpus": corpus_audit(manifest, entries),
+        "env": runtime_env(),
+    }
+    # Hashes ONLY the consensus surface — the decision, the exam, the parameters.
+    # Deliberately excludes env and produced_at: two validators on different GPUs
+    # SHOULD produce the same verdict_digest when they agree, and a wall-clock or a
+    # GPU name inside it would guarantee they never do.
+    verdict["verdict_digest"] = digest_obj({
+        "accepted": verdict["accepted"],
+        "consensus_digest": req.consensus_digest,
+        "master_seed": master_seed,
+        "king_digest": req.king_digest,
+        "challenger_digest": req.challenger_digest,
+        "clip_keys_digest": verdict["audit"]["corpus"]["clip_keys_digest"],
+        "per_clip": [
+            {
+                "clip_id": c["clip_id"],
+                "king_distance": c["king_distance"],
+                "challenger_distance": c["challenger_distance"],
+            }
+            for c in verdict["per_clip"]
+        ],
+    })
+    verdict["produced_at"] = datetime.now(timezone.utc).isoformat()
     return verdict
 
 

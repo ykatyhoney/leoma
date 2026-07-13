@@ -14,10 +14,13 @@ unit-testable). The learned/heavier metrics are imported lazily so this module
 stays import-safe without their deps: ``lpips`` (torch), ``flow`` (OpenCV, CPU
 and deterministic), ``clip`` (torch + open_clip). ``make_composite`` /
 ``"composite:lpips=1.0,flow=0.5"`` blends several into the single per-clip scalar
-the duel needs. Select via ``get_metric(name)`` (from ``LEOMA_DUEL_METRIC``).
+the duel needs. Select via ``get_metric(name)`` — the name comes from the pinned
+``chain.toml [duel].metric``, never from a per-box env var: which metric is used
+decides who wins, so it is part of the consensus surface.
 """
 from __future__ import annotations
 
+import functools
 from typing import Callable
 
 import numpy as np
@@ -134,30 +137,43 @@ def temporal_distance(gen: np.ndarray, truth: np.ndarray) -> float:
     return float(np.mean((dg - dt) ** 2))
 
 
+# The device the learned metrics score on. CPU in production: it makes the metric
+# an exactly reproducible function of the frames, leaving generation as the only
+# step that can differ between two honest validators. See eval/spec.py.
+DEFAULT_METRIC_DEVICE = "cpu"
+
+#: Metrics whose result depends on where they run. The pure-numpy ones don't.
+DEVICE_AWARE = ("lpips", "clip")
+
+
 # The lazy metrics guard BEFORE their heavy import, so the anti-cheat check is
 # unit-testable on a box with no torch / no OpenCV installed.
-def lpips_distance(gen: np.ndarray, truth: np.ndarray) -> float:
+def lpips_distance(gen: np.ndarray, truth: np.ndarray, *, device: str = DEFAULT_METRIC_DEVICE) -> float:
     """Learned perceptual distance (LPIPS). Lazily loads torch + the lpips net."""
     require_frames(gen, truth)
     from leoma.eval._lpips import lpips_video_distance  # lazy heavy import
 
-    return lpips_video_distance(gen, truth)
+    return lpips_video_distance(gen, truth, device=device)
 
 
 def flow_distance(gen: np.ndarray, truth: np.ndarray) -> float:
-    """Optical-flow motion distance vs the real continuation. Lazily loads OpenCV."""
+    """Optical-flow motion distance vs the real continuation. Lazily loads OpenCV.
+
+    Farneback runs on CPU and is deterministic, so this metric has no device knob —
+    it is already the reproducible thing the GPU metrics have to be configured into.
+    """
     require_frames(gen, truth)
     from leoma.eval._flow import flow_video_distance  # lazy heavy import
 
     return flow_video_distance(gen, truth)
 
 
-def clip_distance(gen: np.ndarray, truth: np.ndarray) -> float:
+def clip_distance(gen: np.ndarray, truth: np.ndarray, *, device: str = DEFAULT_METRIC_DEVICE) -> float:
     """CLIP semantic distance vs the real continuation. Lazily loads torch + open_clip."""
     require_frames(gen, truth)
     from leoma.eval._clip import clip_video_distance  # lazy heavy import
 
-    return clip_video_distance(gen, truth)
+    return clip_video_distance(gen, truth, device=device)
 
 
 _METRICS: dict[str, Metric] = {
@@ -172,7 +188,7 @@ _METRICS: dict[str, Metric] = {
 DEFAULT_METRIC = "lpips"
 
 
-def make_composite(weights: dict) -> Metric:
+def make_composite(weights: dict, *, device: str | None = None) -> Metric:
     """Build a single per-clip metric that blends several registered metrics.
 
     ``weights`` maps metric name -> weight, e.g. ``{"lpips": 1.0, "temporal": 0.5}``
@@ -183,7 +199,7 @@ def make_composite(weights: dict) -> Metric:
     """
     if not weights:
         raise ValueError("composite needs at least one weighted metric")
-    parts = [(get_metric(name), float(w)) for name, w in weights.items()]
+    parts = [(get_metric(name, device=device), float(w)) for name, w in weights.items()]
 
     def composite(gen: np.ndarray, truth: np.ndarray) -> float:
         return float(sum(w * fn(gen, truth) for fn, w in parts))
@@ -191,12 +207,16 @@ def make_composite(weights: dict) -> Metric:
     return composite
 
 
-def get_metric(name: str | None) -> Metric:
-    """Resolve a metric by name.
+def get_metric(name: str | None, *, device: str | None = None) -> Metric:
+    """Resolve a metric by name, optionally binding the device it scores on.
 
     Besides the registered names, accepts a composite spec
-    ``"composite:lpips=1.0,temporal=0.5"`` so a blended metric is selectable
-    purely from config (``LEOMA_DUEL_METRIC``).
+    ``"composite:lpips=1.0,temporal=0.5"`` so a blended metric is selectable purely
+    from the pinned ``[duel].metric``.
+
+    ``device`` binds where the *learned* metrics run (see ``DEVICE_AWARE``). Left
+    as ``None`` the registered function is returned unwrapped, which keeps
+    ``get_metric("lpips") is lpips_distance`` true for callers that don't care.
     """
     key = (name or DEFAULT_METRIC).strip()
     if key.lower().startswith("composite:"):
@@ -208,9 +228,13 @@ def get_metric(name: str | None) -> Metric:
                 continue
             metric_name, _, w = part.partition("=")
             weights[metric_name.strip().lower()] = float(w) if w else 1.0
-        return make_composite(weights)
+        return make_composite(weights, device=device)
 
     key = key.lower()
     if key not in _METRICS:
         raise ValueError(f"unknown reference metric {name!r}; choices: {sorted(_METRICS)} or 'composite:...'")
-    return _METRICS[key]
+
+    fn = _METRICS[key]
+    if device is None or key not in DEVICE_AWARE:
+        return fn
+    return functools.partial(fn, device=device)

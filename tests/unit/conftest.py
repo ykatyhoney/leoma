@@ -81,3 +81,38 @@ class FakeMinio:
 @pytest.fixture
 def fake_minio() -> FakeMinio:
     return FakeMinio()
+
+
+# ---------------------------------------------------------------------------
+# The pinned consensus surface
+# ---------------------------------------------------------------------------
+
+#: The digest a test corpus manifest pretends to have.
+TEST_MANIFEST_DIGEST = "sha256:" + "c" * 64
+
+
+def pinned_spec():
+    """The shipped SPEC, but with the corpus pinned.
+
+    The chain.toml in the repo ships with ``manifest_digest = ""`` — deliberately,
+    because the corpus has not been published yet and a validator must refuse to
+    duel on an unpinned corpus. Tests that exercise the duel path need a spec that
+    is duel-ready, so they pin a fake digest here rather than weakening the shipped
+    default (which is exactly the safety property we want to keep testing).
+    """
+    from leoma.infra.chain_config import SPEC
+
+    return SPEC.model_copy(
+        update={"corpus": SPEC.corpus.model_copy(update={"manifest_digest": TEST_MANIFEST_DIGEST})}
+    )
+
+
+@pytest.fixture
+def duel_ready(monkeypatch):
+    """Give the validator a pinned corpus so the duel path can run."""
+    import leoma.app.validator.main as vmain
+
+    spec = pinned_spec()
+    monkeypatch.setattr(vmain, "SPEC", spec)
+    monkeypatch.setattr(vmain, "CONSENSUS_DIGEST", spec.digest())
+    return spec
