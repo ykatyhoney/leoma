@@ -33,7 +33,12 @@ from leoma.bootstrap import emit_log as log, emit_header as log_header, log_exce
 from leoma.infra.storage_backend import create_own_write_client, ensure_bucket_exists
 from leoma.infra.chain_config import NAME as CHAIN_NAME, SEED_REPO, SEED_DIGEST
 from leoma.app.validator.reveal_scan import scan_reveals, ChallengerEntry
-from leoma.app.validator.state_store import JsonBucketStore, KingState
+from leoma.app.validator.state_store import (
+    JsonBucketStore,
+    KingState,
+    StateInconsistent,
+    StoreUnavailable,
+)
 from leoma.app.validator.dashboard import build_dashboard, publish_dashboard
 from leoma.app.validator import king as K
 
@@ -141,7 +146,8 @@ async def maybe_set_weights(
 
     state.last_weight_block = current_block
     state.last_winner_hotkey = label
-    state.flush(store)
+    state.touch()
+    await state.flush(store)
     return True
 
 
@@ -158,6 +164,7 @@ def ensure_genesis_king(state: KingState, block: int) -> None:
         block=block, challenge_id=K.SEED_CHALLENGE_ID,
     )
     state.king, state.king_chain = king, chain
+    state.touch()
     log(f"Seeded genesis king from {SEED_REPO}@{SEED_DIGEST[:16]}...", "success")
 
 
@@ -201,7 +208,7 @@ def _build_queue(state: KingState, entries: list[ChallengerEntry], uid_map: dict
     return queue
 
 
-def _publish_dashboard(
+async def _publish_dashboard(
     state: KingState,
     uid_map: dict[str, int],
     store: JsonBucketStore,
@@ -228,7 +235,7 @@ def _publish_dashboard(
             updated_at=datetime.now(timezone.utc).isoformat(),
             queue=queue,
         )
-        publish_dashboard(store, payload)
+        await publish_dashboard(store, payload)
     except Exception as e:
         log(f"Dashboard publish failed: {e}", "warn")
 
@@ -253,8 +260,9 @@ async def process_challengers(
                 None, state.king_chain, hotkey=entry.hotkey, model_repo=entry.model_repo,
                 model_digest=entry.model_digest, block=entry.block, challenge_id="first",
             )
-            state.seen_hotkeys.add(key)
+            state.mark_seen(key)
             state.stats["accepted"] = state.stats.get("accepted", 0) + 1
+            state.touch()
             state.record_duel({
                 "challenge_id": "first",
                 "hotkey": entry.hotkey,
@@ -266,7 +274,7 @@ async def process_challengers(
                 "block": entry.block,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             })
-            state.flush(store)
+            await state.flush(store)
             log(f"Crowned first king {entry.hotkey[:12]}... ({entry.model_repo})", "success")
             await maybe_set_weights(subtensor, wallet, state, uid_map, store, force=True)
             continue
@@ -282,7 +290,7 @@ async def process_challengers(
         if verdict is None:
             return  # server busy; retry later, keep entry unseen
 
-        state.seen_hotkeys.add(key)
+        state.mark_seen(key)
         state.record_duel(_duel_history_entry(entry, verdict, uid_map))
         if verdict.get("accepted"):
             state.king, state.king_chain = K.crown(
@@ -291,12 +299,14 @@ async def process_challengers(
                 challenge_id=verdict.get("challenge_id") or f"block-{entry.block}",
             )
             state.stats["accepted"] = state.stats.get("accepted", 0) + 1
-            state.flush(store)
+            state.touch()
+            await state.flush(store)
             log(f"Challenger {entry.hotkey[:12]}... CROWNED (lcb={verdict.get('lcb')})", "success")
             await maybe_set_weights(subtensor, wallet, state, uid_map, store, force=True)
         else:
             state.stats["rejected"] = state.stats.get("rejected", 0) + 1
-            state.flush(store)
+            state.touch()
+            await state.flush(store)
             log(f"Challenger {entry.hotkey[:12]}... rejected (lcb={verdict.get('lcb')})", "info")
 
 
@@ -319,7 +329,7 @@ async def tick(
     await maybe_set_weights(subtensor, wallet, state, uid_map, store)
 
     # Publish the public dashboard snapshot for the website.
-    _publish_dashboard(state, uid_map, store, _build_queue(state, entries, uid_map))
+    await _publish_dashboard(state, uid_map, store, _build_queue(state, entries, uid_map))
 
 
 async def main() -> None:
@@ -338,12 +348,33 @@ async def main() -> None:
     own_client = create_own_write_client()
     await ensure_bucket_exists(own_client, R2_OWN_BUCKET)
     store = JsonBucketStore(own_client, R2_OWN_BUCKET)
-    state = KingState.load(store)
+
+    # A validator that cannot read its state must NOT run: on a chain-derived
+    # system, running on blank state re-duels every past challenger and re-seeds
+    # genesis over the reigning king — and the first flush would then overwrite
+    # the good bucket state with the blank one.
+    try:
+        state = await KingState.load(store)
+    except (StoreUnavailable, StateInconsistent) as e:
+        if os.environ.get("LEOMA_FORCE_FRESH_STATE") == "1":
+            log(f"State unreadable ({e}); LEOMA_FORCE_FRESH_STATE=1 — starting BLANK", "warn")
+            state = KingState()
+        else:
+            log(f"Cannot read validator state: {e}", "critical")
+            log("Refusing to start on unknown state. Restore the bucket, or set "
+                "LEOMA_FORCE_FRESH_STATE=1 to deliberately start blank.", "critical")
+            raise SystemExit(1)
+
     log(f"Loaded king: {(state.king or {}).get('model_repo', 'none')} chain={len(state.king_chain)}", "info")
 
     while True:
         try:
             await tick(subtensor, wallet, state, store)
+        except (StoreUnavailable, StateInconsistent) as e:
+            # Losing the store mid-run means we can no longer persist crowns.
+            log(f"State store unavailable: {e}", "critical")
+            log_exception("State store unavailable — exiting for supervisor restart", e)
+            raise SystemExit(1)
         except Exception as e:
             log(f"Validator tick error: {e}", "error")
             log_exception("Validator tick error", e)

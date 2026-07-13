@@ -12,6 +12,7 @@ dependencies = [
     "huggingface-hub",
     "hippius-hub",
     "minio",
+    "certifi",   # CA bundle for the explicit urllib3 pools (bounded S3 timeouts)
     # numpy is imported at module scope by leoma.eval.metrics / bootstrap /
     # video_runner, which are on the VALIDATOR path — it is not eval-only.
     "numpy",

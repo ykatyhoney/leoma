@@ -76,4 +76,6 @@ class TestBuildDashboard:
         assert d["chain"]["name"] == "leoma"
         assert d["duel_params"]["metric"] == "lpips"
         assert d["updated_at"] == "2026-01-01T00:00:00Z"
-        assert d["stats"] == {"accepted": 0, "rejected": 0, "failed": 0}
+        # `transient_errors` is tracked separately from `failed` so that retries
+        # of a flaky duel don't inflate the failure count on the dashboard.
+        assert d["stats"] == {"accepted": 0, "rejected": 0, "failed": 0, "transient_errors": 0}

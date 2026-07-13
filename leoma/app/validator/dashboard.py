@@ -75,6 +75,6 @@ def build_dashboard(
     }
 
 
-def publish_dashboard(store: JsonBucketStore, payload: dict) -> None:
+async def publish_dashboard(store: JsonBucketStore, payload: dict) -> None:
     """Write the dashboard snapshot to the bucket (public-read object)."""
-    store.put(KEY_DASHBOARD, payload)
+    await store.put(KEY_DASHBOARD, payload)
