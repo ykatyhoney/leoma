@@ -166,8 +166,10 @@ class FakeEvalBox:
         self.dispatched: list[str] = []
         self.polled: list[str] = []
         self.jobs: dict[str, dict] = {}
+        self.cancelled: list[str] = []
         monkeypatch.setattr(vmain, "start_duel", self.start_duel)
         monkeypatch.setattr(vmain, "poll_duel", self.poll_duel)
+        monkeypatch.setattr(vmain, "cancel_duel", self.cancel_duel)
 
     async def start_duel(self, entry, king, block_hash):
         outcome = self._outcome(entry)
@@ -184,6 +186,9 @@ class FakeEvalBox:
         if isinstance(outcome, BaseException):
             raise outcome
         return outcome
+
+    async def cancel_duel(self, eval_id):
+        self.cancelled.append(eval_id)
 
     async def drive(self, state, store, entries, *, block, ticks=None):
         """Run enough ticks to settle + dispatch every challenger."""

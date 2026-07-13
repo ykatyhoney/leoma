@@ -88,6 +88,11 @@ COPY_CHECK_ENABLED = os.environ.get("LEOMA_COPY_CHECK", "1") != "0"
 _EVAL_CONNECT_TIMEOUT = 30.0
 _EVAL_POLL_TIMEOUT = 60.0
 
+# Validator-side backstop for a duel the eval box never finishes reporting. Generous
+# on purpose (~18h at 12s blocks): a real duel of two 14B models can run hours, so this
+# only fires on a box that is genuinely wedged, not on slow-but-alive work.
+MAX_INFLIGHT_BLOCKS = int(os.environ.get("LEOMA_MAX_INFLIGHT_BLOCKS", "5400"))
+
 
 def _seen_key(hotkey: str, digest: str) -> str:
     return f"{hotkey}|{digest}"
@@ -194,6 +199,18 @@ async def start_duel(entry: ChallengerEntry, king: dict, block_hash: str) -> str
             raise EvalBusy("eval server is already running a duel")
         resp.raise_for_status()
         return resp.json()["eval_id"]
+
+
+async def cancel_duel(eval_id: str) -> None:
+    """Best-effort ``DELETE /eval/{id}`` — ask the box to stop burning GPU. Never raises."""
+    import httpx
+
+    timeout = httpx.Timeout(_EVAL_POLL_TIMEOUT, connect=_EVAL_CONNECT_TIMEOUT)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            await client.delete(f"{EVAL_SERVER_URL}/eval/{eval_id}")
+    except Exception:  # noqa: BLE001 — the abandon must proceed whether or not this lands
+        pass
 
 
 async def poll_duel(eval_id: str) -> dict:
@@ -588,7 +605,29 @@ async def settle_inflight(
 
     status = result.get("status")
     if status == "running":
-        log(f"Duel {slot['eval_id']} still running (phase={result.get('phase')})", "info")
+        # The eval server has its own forward-progress watchdog, and normally it fires
+        # first. This is the validator-side backstop for the case that watchdog can't
+        # catch: a box that keeps reporting "running" without ever tripping a phase
+        # budget (a disabled watchdog, a lying box, a partition where poll succeeds but
+        # the box is wedged). Without it, one stuck duel holds the single in-flight slot
+        # forever and no other challenger is ever dispatched. The bound is deliberately
+        # generous — a real 32-clip duel of two 14B models can legitimately run hours —
+        # so this only ever fires on a genuinely hung box.
+        age = block - int(slot.get("dispatched_block", block))
+        if age > MAX_INFLIGHT_BLOCKS:
+            log(f"Duel {slot['eval_id']} has been in flight {age} blocks (> {MAX_INFLIGHT_BLOCKS}) "
+                "— abandoning as a stuck box and re-dispatching next tick", "warn")
+            await cancel_duel(slot["eval_id"])
+            state.inflight = None
+            state.touch()
+            # TRANSIENT, never LOCAL or a strike: a hung box is not the challenger's
+            # fault. Backoff + the 4-attempt budget means a genuinely pathological model
+            # that hangs every time still quarantines, while a one-off box wedge retries.
+            failure = DuelFailure(ErrorClass.TRANSIENT, "inflight_timeout",
+                                  f"duel exceeded {MAX_INFLIGHT_BLOCKS} blocks in flight")
+            await _note_failure(state, store, uid_map, entry, key, failure, block)
+            return True
+        log(f"Duel {slot['eval_id']} still running (phase={result.get('phase')}, age={age} blocks)", "info")
         return False
 
     # Terminal, one way or another: the slot is free from here on.
