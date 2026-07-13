@@ -15,7 +15,7 @@ import leoma.app.validator.main as vmain
 from leoma.app.validator.reveal_scan import ChallengerEntry
 from leoma.app.validator.state_store import JsonBucketStore, KingState
 
-from tests.unit.conftest import FakeEvalBox, FakeMinio, make_verdict
+from tests.unit.conftest import FakeEvalBox, FakeMinio
 
 KING_DIGEST = "sha256:" + "k" * 64
 
