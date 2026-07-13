@@ -118,6 +118,86 @@ CANCEL_GRACE_SECONDS = float(os.environ.get("LEOMA_CANCEL_GRACE", "300"))
 #: SSE poll interval. The event log is a list; checking its length is free.
 STREAM_POLL_SECONDS = 0.05
 
+# ---------------------------------------------------------------------------
+# Fatal-CUDA self-kill
+# ---------------------------------------------------------------------------
+# Once a CUDA context is corrupted — an illegal memory access, a device-side assert,
+# a cuBLAS execution failure — the VRAM allocator and every stream on this process
+# are poisoned. Every subsequent `.from_pretrained` / generate / `empty_cache` will
+# keep raising against the same dead context. The watchdog's `os._exit` only fires
+# after a duel *stalls*; a duel that FAILS FAST on a CUDA fault would release the lock
+# and cheerfully hand the next challenger a poisoned box, mis-rejecting an honest model
+# as broken. For Leoma this is expensive in a way it is not for a text subnet: a
+# poisoned box wastes *hours* of the next duel, not minutes.
+#
+# The only recovery is to exit so the supervisor restarts with a fresh CUDA context.
+# We delay briefly so the in-flight error event reaches the validator (which classifies
+# `cuda_fatal` as TRANSIENT and retries against a — now freshly restarted — box), then
+# `os._exit` to skip atexit hooks that would touch the corrupted GPU and hang.
+# Ported from Teutonic's eval_server self-kill, which cites a real 2.5h box degradation.
+_CUDA_FATAL_TOKENS = (
+    "an illegal memory access",
+    "cudaerrorillegaladdress",
+    "device-side assert",
+    "cuda error: misaligned address",
+    "cuda error: unspecified launch failure",
+    "cuda error: an illegal instruction",
+    "cublas_status_execution_failed",
+    "cublas_status_not_initialized",
+    "cudnn_status_execution_failed",
+    "bus error",
+    "segmentation fault",
+)
+CUDA_FATAL_EXIT_DELAY_S = float(os.environ.get("LEOMA_CUDA_FATAL_DELAY", "3"))
+CUDA_FATAL_EXIT_CODE = int(os.environ.get("LEOMA_CUDA_FATAL_EXIT_CODE", "75"))
+_self_kill_scheduled = threading.Event()
+
+
+def is_cuda_fatal(exc_or_msg) -> bool:
+    """Does this error mean the CUDA context is unrecoverable (not just this duel)?"""
+    return any(tok in str(exc_or_msg or "").lower() for tok in _CUDA_FATAL_TOKENS)
+
+
+def schedule_self_kill(reason: str, *, delay_s: Optional[float] = None) -> None:
+    """Exit the process because CUDA state is poisoned. Idempotent; delayed.
+
+    Safe only because *the chain is the queue*: the restart loses at most the current
+    duel, which the validator re-dispatches next tick. Holding a poisoned box would
+    instead corrupt every future verdict.
+    """
+    if _self_kill_scheduled.is_set():
+        return
+    _self_kill_scheduled.set()
+    delay = CUDA_FATAL_EXIT_DELAY_S if delay_s is None else float(delay_s)
+
+    def _die():
+        try:
+            time.sleep(delay)  # let the SSE error event reach the validator first
+        except Exception:
+            pass
+        os._exit(CUDA_FATAL_EXIT_CODE)
+
+    threading.Thread(target=_die, daemon=True, name="leoma-cuda-fatal-self-kill").start()
+
+
+def _install_cuda_excepthook() -> None:
+    """Self-kill on a CUDA-fatal error that escapes a daemon thread (e.g. a diffusers
+    worker). Without this such an error prints a traceback and the process limps on
+    with a corrupted context, poisoning every later duel."""
+    prior = threading.excepthook
+
+    def _hook(args):
+        try:
+            if is_cuda_fatal(f"{args.exc_type.__name__}: {args.exc_value}"):
+                schedule_self_kill(f"uncaught in thread {getattr(args.thread, 'name', '?')}")
+        finally:
+            prior(args)
+
+    threading.excepthook = _hook
+
+
+_install_cuda_excepthook()
+
 
 @dataclass
 class _Job:
@@ -238,6 +318,12 @@ def create_app(runner: Optional[Runner] = None) -> FastAPI:
             # the worker would otherwise leave the job with NO terminal event, the
             # stream hanging, and the lock held. Every exit is a terminal event.
             job.finish("error", {"error": str(e), "reason": getattr(e, "reason", "")})
+            # A CUDA-fatal error is reported cleanly here AND self-kills: the context
+            # is poisoned, so releasing the lock and serving the next duel would just
+            # hand it a dead GPU. The delay lets this error event reach the validator
+            # (which retries the challenger against the restarted box) before we exit.
+            if is_cuda_fatal(e):
+                schedule_self_kill(f"duel {job.eval_id}: {type(e).__name__}: {e}")
         finally:
             _release(job.eval_id)
 
