@@ -47,7 +47,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
-from leoma.eval.errors import DuelCancelled
+from leoma.eval.errors import DuelCancelled, is_cuda_fatal
 from leoma.eval.spec import ConsensusSpec
 
 
@@ -135,27 +135,14 @@ STREAM_POLL_SECONDS = 0.05
 # `cuda_fatal` as TRANSIENT and retries against a — now freshly restarted — box), then
 # `os._exit` to skip atexit hooks that would touch the corrupted GPU and hang.
 # Ported from Teutonic's eval_server self-kill, which cites a real 2.5h box degradation.
-_CUDA_FATAL_TOKENS = (
-    "an illegal memory access",
-    "cudaerrorillegaladdress",
-    "device-side assert",
-    "cuda error: misaligned address",
-    "cuda error: unspecified launch failure",
-    "cuda error: an illegal instruction",
-    "cublas_status_execution_failed",
-    "cublas_status_not_initialized",
-    "cudnn_status_execution_failed",
-    "bus error",
-    "segmentation fault",
-)
+#
+# is_cuda_fatal() itself lives in eval/errors.py, not here: with concurrent king/
+# challenger generation, the duel runner ALSO needs it (to decide which of two
+# simultaneous exceptions must be the one that propagates), and it must be the same
+# token list on both sides rather than two definitions that can drift apart.
 CUDA_FATAL_EXIT_DELAY_S = float(os.environ.get("LEOMA_CUDA_FATAL_DELAY", "3"))
 CUDA_FATAL_EXIT_CODE = int(os.environ.get("LEOMA_CUDA_FATAL_EXIT_CODE", "75"))
 _self_kill_scheduled = threading.Event()
-
-
-def is_cuda_fatal(exc_or_msg) -> bool:
-    """Does this error mean the CUDA context is unrecoverable (not just this duel)?"""
-    return any(tok in str(exc_or_msg or "").lower() for tok in _CUDA_FATAL_TOKENS)
 
 
 def schedule_self_kill(reason: str, *, delay_s: Optional[float] = None) -> None:
@@ -503,6 +490,27 @@ def check_request(req: EvalRequest) -> None:
     req.spec.require_duel_ready()
 
 
+def _resolve_devices():
+    """Glue: read the concurrency env vars + the real CUDA device count.
+
+    The decision itself (``leoma.eval.devices.resolve_duel_devices``) is pure and
+    unit-tested without a GPU; this function exists only because *something* has to
+    call ``torch.cuda.device_count()``, and that something needs torch installed.
+    """
+    import os
+
+    import torch
+
+    from leoma.eval.devices import resolve_duel_devices
+
+    return resolve_duel_devices(
+        concurrent_enabled=os.environ.get("LEOMA_CONCURRENT_GENERATION", "0") == "1",
+        cuda_device_count=torch.cuda.device_count() if torch.cuda.is_available() else 0,
+        king_device_override=os.environ.get("LEOMA_KING_DEVICE") or None,
+        challenger_device_override=os.environ.get("LEOMA_CHALLENGER_DEVICE") or None,
+    )
+
+
 def _download_watcher(emit: Emit, which: str, path, stop: threading.Event) -> None:
     """Report a download's forward progress so the watchdog can tell slow from hung.
 
@@ -569,14 +577,22 @@ def run_eval_job(req: EvalRequest, emit: Emit, should_cancel: ShouldCancel = lam
     king_dir = _materialize(king_ref, "king")
     chall_dir = _materialize(chall_ref, "challenger")
 
+    # A throughput setting, not a consensus one — see eval/devices.py. Resolved from
+    # this box's own environment, never from the request: if it changed per-request
+    # the cached king pipeline (below) could silently end up on the wrong device.
+    devices = _resolve_devices()
+    emit({"phase": "devices", "concurrent": devices.concurrent, "note": devices.note})
+
     chall_pipe = None
     try:
-        emit({"phase": "load", "which": "king"})
+        emit({"phase": "load", "which": "king", "device": devices.king_device})
         # Keyed by the king's immutable ref: the same king faces every challenger in
         # the queue, and re-loading 28 GB into VRAM for each one is pure waste.
-        king_pipe = load_video_pipeline(king_dir, gen=spec.gen, cache_key=king_ref.immutable_ref)
-        emit({"phase": "load", "which": "challenger"})
-        chall_pipe = load_video_pipeline(chall_dir, gen=spec.gen)
+        king_pipe = load_video_pipeline(
+            king_dir, gen=spec.gen, device=devices.king_device, cache_key=king_ref.immutable_ref
+        )
+        emit({"phase": "load", "which": "challenger", "device": devices.challenger_device})
+        chall_pipe = load_video_pipeline(chall_dir, gen=spec.gen, device=devices.challenger_device)
 
         master_seed = eval_seed(req.block_hash, req.hotkey, spec.duel.base_seed)
         params = GenParams.from_spec(spec.gen)
@@ -611,6 +627,7 @@ def run_eval_job(req: EvalRequest, emit: Emit, should_cancel: ShouldCancel = lam
             early_stop_max_advantage=spec.early_stop_max_advantage,
             should_cancel=should_cancel,
             freeze_margin_fraction=spec.duel.freeze_margin_fraction,
+            concurrent=devices.concurrent,
         )
     finally:
         # The challenger is done with either way — success, error, or cancellation.
@@ -636,6 +653,14 @@ def run_eval_job(req: EvalRequest, emit: Emit, should_cancel: ShouldCancel = lam
         "eval_code_digest": eval_code_digest(),
         "corpus": corpus_audit(manifest, entries),
         "env": runtime_env(),
+        # Not part of the consensus surface (see eval/devices.py) — recorded here so a
+        # distance disagreement between validators can be checked against "did the two
+        # duelists even run on the same kind of device" before assuming a real bug.
+        "generation": {
+            "concurrent": devices.concurrent,
+            "king_device": devices.king_device,
+            "challenger_device": devices.challenger_device,
+        },
     }
     # Hashes ONLY the consensus surface — the decision, the exam, the parameters.
     # Deliberately excludes env and produced_at: two validators on different GPUs
