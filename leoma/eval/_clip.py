@@ -67,7 +67,12 @@ def clip_video_distance(gen: np.ndarray, truth: np.ndarray) -> float:
     """Mean per-frame CLIP cosine distance between generation and truth."""
     g = np.asarray(gen)
     t = np.asarray(truth)
-    n = min(g.shape[0], t.shape[0])
+    if g.shape[0] < t.shape[0]:
+        raise ValueError(
+            f"generation too short: {g.shape[0]} frames < {t.shape[0]} ground-truth frames"
+        )
+    n = t.shape[0]
     if n == 0:
-        return 0.0
+        # Used to return 0.0 — a PERFECT score for an empty generation.
+        raise ValueError("no frames to compare")
     return cosine_distance(_embed(g[:n]), _embed(t[:n]))

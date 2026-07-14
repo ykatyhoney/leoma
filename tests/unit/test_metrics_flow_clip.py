@@ -10,7 +10,14 @@ and that importing the metric modules never pulls in cv2/torch.
 import numpy as np
 import pytest
 
-from leoma.eval.metrics import get_metric, flow_distance, clip_distance, make_composite
+from leoma.eval.metrics import (
+    get_metric,
+    flow_distance,
+    clip_distance,
+    make_composite,
+    mse,
+    temporal_distance,
+)
 from leoma.eval._flow import flow_endpoint_error
 from leoma.eval._clip import cosine_distance
 
@@ -89,3 +96,50 @@ class TestImportSafety:
         importlib.reload(c)
         assert hasattr(f, "flow_video_distance")
         assert hasattr(c, "clip_video_distance")
+
+
+class TestShortGenerationIsNotFree:
+    """THE freeze/1-frame cheat, closed at the root.
+
+    Before: `_align` truncated the TRUTH down to the generation's length, so a
+    1-frame output was scored against frame 0 of the truth — which IS the
+    conditioning frame the model was handed. Every metric, including the
+    production default (lpips), returned a near-perfect score.
+    """
+
+    @pytest.mark.parametrize("metric", ["mse", "ssim", "temporal", "flow", "lpips", "clip"])
+    def test_one_frame_generation_is_rejected_by_every_metric(self, metric):
+        rng = np.random.default_rng(0)
+        truth = rng.integers(0, 255, size=(8, 8, 8, 3)).astype("uint8")
+        one_frame = truth[:1].copy()          # the cheat: echo the conditioning frame
+
+        fn = get_metric(metric)
+        # The guard sits ABOVE the lazy import, so this runs with no torch/cv2.
+        with pytest.raises(ValueError, match="too short|at least 2 frames"):
+            fn(one_frame, truth)
+
+    @pytest.mark.parametrize("metric", ["mse", "ssim", "temporal", "flow", "lpips", "clip"])
+    def test_partial_generation_is_rejected(self, metric):
+        rng = np.random.default_rng(1)
+        truth = rng.integers(0, 255, size=(8, 6, 6, 3)).astype("uint8")
+        short = truth[:5].copy()              # 5 < 8: still short, still a cheat
+        with pytest.raises(ValueError, match="too short"):
+            get_metric(metric)(short, truth)
+
+    def test_composite_propagates_the_rejection(self):
+        rng = np.random.default_rng(2)
+        truth = rng.integers(0, 255, size=(6, 5, 5, 3)).astype("uint8")
+        with pytest.raises(ValueError, match="too short"):
+            get_metric("composite:mse=1.0,temporal=0.5")(truth[:1], truth)
+
+    def test_full_length_generation_still_scores(self):
+        rng = np.random.default_rng(3)
+        truth = rng.integers(0, 255, size=(6, 5, 5, 3)).astype("uint8")
+        assert mse(truth, truth) == 0.0                    # identical -> 0
+        assert temporal_distance(truth, truth) == 0.0
+
+    def test_longer_generation_is_truncated_not_rejected(self):
+        rng = np.random.default_rng(4)
+        truth = rng.integers(0, 255, size=(4, 5, 5, 3)).astype("uint8")
+        longer = np.concatenate([truth, truth[:2]], axis=0)   # 6 frames vs 4
+        assert mse(longer, truth) == 0.0                      # truncated to the truth

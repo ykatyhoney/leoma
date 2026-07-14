@@ -1,32 +1,62 @@
 """Single source of truth for the pinned architecture + genesis king.
 
-Reads ``chain.toml`` at the repo root and exposes the constants used by the
-miner (default challenger namespace), the validator (repo naming + config-lock),
-and the eval server (arch loading + seed king). To swap the pinned base model or
-the genesis king, edit ``chain.toml`` — no code edits should be necessary.
+``chain.toml`` ships **inside the package** (``leoma/chain.toml``) because it is
+consensus-critical: the pin must travel with the code, in a wheel as well as in a
+git checkout. It is read at import and exposes the constants used by the miner
+(default challenger namespace), the validator (repo naming + config-lock), and the
+eval server (arch loading + seed king). To swap the pinned base model or the
+genesis king, edit ``chain.toml`` — no code edits should be necessary.
 
-Override knob: ``LEOMA_CHAIN_OVERRIDE`` env var, when set, points at an
-alternate TOML (relative to the repo root or an absolute path). Used by local
-testing and archived alternate configs so the default ``chain.toml`` can stay
-pointed at the live chain.
+Override knob: ``LEOMA_CHAIN_OVERRIDE`` env var points at an alternate TOML
+(absolute, or relative to the current working directory). Used by local testing and
+archived alternate configs so the shipped ``chain.toml`` can stay pointed at the
+live chain.
 """
 from __future__ import annotations
 
 import importlib
+import importlib.resources
 import os
 import pathlib
 import re
 import tomllib
 from types import ModuleType
 
-# repo root = two parents up from this file (leoma/infra/chain_config.py -> repo/)
-_REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
-_OVERRIDE = os.environ.get("LEOMA_CHAIN_OVERRIDE", "").strip()
-if _OVERRIDE:
-    _candidate = pathlib.Path(_OVERRIDE)
-    _TOML_PATH = _candidate if _candidate.is_absolute() else (_REPO_ROOT / _candidate)
-else:
-    _TOML_PATH = _REPO_ROOT / "chain.toml"
+
+def _resolve_toml_path() -> pathlib.Path:
+    """Locate chain.toml in a wheel, an editable install, or the repo.
+
+    Order: LEOMA_CHAIN_OVERRIDE -> packaged (leoma/chain.toml) -> legacy repo root.
+    """
+    override = os.environ.get("LEOMA_CHAIN_OVERRIDE", "").strip()
+    if override:
+        candidate = pathlib.Path(override)
+        if not candidate.is_absolute():
+            candidate = pathlib.Path.cwd() / candidate
+        if not candidate.is_file():
+            raise RuntimeError(f"LEOMA_CHAIN_OVERRIDE points at a missing file: {candidate}")
+        return candidate
+
+    # Packaged location — works for both a wheel and an editable install.
+    try:
+        packaged = importlib.resources.files("leoma") / "chain.toml"
+        if packaged.is_file():
+            return pathlib.Path(str(packaged))
+    except (ModuleNotFoundError, AttributeError, TypeError):
+        pass
+
+    pkg_dir = pathlib.Path(__file__).resolve().parents[1]  # .../leoma/
+    for candidate in (pkg_dir / "chain.toml", pkg_dir.parent / "chain.toml"):
+        if candidate.is_file():
+            return candidate
+
+    raise RuntimeError(
+        "chain.toml not found. It must ship inside the package (leoma/chain.toml); "
+        "ensure [tool.setuptools.package-data] includes it, or set LEOMA_CHAIN_OVERRIDE."
+    )
+
+
+_TOML_PATH = _resolve_toml_path()
 
 with open(_TOML_PATH, "rb") as _f:
     _doc = tomllib.load(_f)

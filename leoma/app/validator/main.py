@@ -17,6 +17,7 @@ persists to this validator's own bucket (``state_store``).
 import os
 import json
 import asyncio
+from datetime import datetime, timezone
 from typing import Optional
 
 import bittensor as bt
@@ -30,9 +31,23 @@ from leoma.bootstrap import (
 )
 from leoma.bootstrap import emit_log as log, emit_header as log_header, log_exception
 from leoma.infra.storage_backend import create_own_write_client, ensure_bucket_exists
-from leoma.infra.chain_config import SEED_REPO, SEED_DIGEST
+from leoma.infra.chain_config import NAME as CHAIN_NAME, SEED_REPO, SEED_DIGEST
 from leoma.app.validator.reveal_scan import scan_reveals, ChallengerEntry
-from leoma.app.validator.state_store import JsonBucketStore, KingState
+from leoma.app.validator.state_store import (
+    JsonBucketStore,
+    KingState,
+    StateInconsistent,
+    StoreUnavailable,
+)
+from leoma.app.validator.dashboard import build_dashboard, publish_dashboard
+from leoma.app.validator.failures import (
+    DuelFailure,
+    EvalBusy,
+    EvalJobFailed,
+    classify,
+    classify_remote,
+)
+from leoma.app.validator.state_store import MAX_DUEL_ATTEMPTS
 from leoma.app.validator import king as K
 
 EVAL_SERVER_URL = os.environ.get("EVAL_SERVER_URL", "http://localhost:9000")
@@ -69,11 +84,14 @@ async def dispatch_duel(
     entry: ChallengerEntry,
     king: dict,
     block_hash: str,
-) -> Optional[dict]:
+) -> dict:
     """POST a duel to the eval server and stream its verdict.
 
-    Returns the verdict dict, or None when the server is busy (409) so the
-    caller retries later. Raises on an eval-server error event.
+    Raises ``EvalBusy`` when the server is already running a duel (409), and
+    ``EvalJobFailed`` on a terminal error — including a stream that ends without
+    a verdict. It used to return ``None`` for BOTH cases, so "the server is busy"
+    was indistinguishable from "the duel broke", and the caller treated a broken
+    duel as a reason to stop processing everyone else.
     """
     import httpx
 
@@ -94,8 +112,7 @@ async def dispatch_duel(
     async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.post(f"{EVAL_SERVER_URL}/eval", json=payload)
         if resp.status_code == 409:
-            log("Eval server busy; will retry", "warn")
-            return None
+            raise EvalBusy("eval server is already running a duel")
         resp.raise_for_status()
         eval_id = resp.json()["eval_id"]
 
@@ -109,8 +126,73 @@ async def dispatch_duel(
                 if phase == "verdict":
                     verdict = event
                 elif phase == "error":
-                    raise RuntimeError(f"eval server error: {event.get('error')}")
+                    raise EvalJobFailed(
+                        str(event.get("error") or "eval server error"),
+                        reason=str(event.get("reason") or ""),
+                    )
+
+    if verdict is None:
+        # The stream ended with neither a verdict nor an error. That is a broken
+        # duel, not a busy server — surface it as an explicit transient failure.
+        raise EvalJobFailed(
+            "eval stream ended without a terminal verdict", reason="stream_no_terminal"
+        )
     return verdict
+
+
+# bittensor 9.12.2's set_weights returns (success: bool, message: str). Its
+# rate-limit path returns this literal WITHOUT ever submitting an extrinsic.
+_RATE_LIMIT_TOKENS = (
+    "no attempt made",
+    "too soon",
+    "rate limit",
+    "settingweightstoofast",
+)
+
+
+def _unpack_set_weights(result) -> tuple[bool, str]:
+    """Tolerate (bool, str), a bare bool, or an ExtrinsicResponse-like object."""
+    if isinstance(result, tuple) and len(result) == 2:
+        return bool(result[0]), str(result[1])
+    if hasattr(result, "success"):
+        return bool(result.success), str(getattr(result, "message", "") or "")
+    return bool(result), ""
+
+
+def _is_rate_limited(message: str) -> bool:
+    lowered = (message or "").lower()
+    return any(token in lowered for token in _RATE_LIMIT_TOKENS)
+
+
+async def _chain_says_too_soon(subtensor: bt.AsyncSubtensor, wallet: bt.Wallet) -> bool:
+    """Ask the CHAIN whether it is too soon to set weights.
+
+    The chain is the queue, so the chain is also the weight clock. Trusting our
+    own ``last_weight_block`` is what made "state says the weights landed but they
+    didn't" possible; asking the chain makes that structurally impossible.
+    Degrades to False (i.e. attempt the set) if the node doesn't expose these.
+    """
+    try:
+        uid = await subtensor.get_uid_for_hotkey_on_subnet(wallet.hotkey.ss58_address, NETUID)
+        if uid is None:
+            return False
+        since = await subtensor.blocks_since_last_update(NETUID, uid)
+        limit = await subtensor.weights_rate_limit(NETUID)
+    except Exception:
+        return False
+    if since is None or limit is None:
+        return False
+    return since <= limit
+
+
+def _weight_failed(state: KingState, block: int, message: str) -> bool:
+    state.weight_failures += 1
+    # Exponential block backoff, capped — a genuine failure should be retried
+    # soon, NOT after a full WEIGHT_INTERVAL.
+    state.next_weight_block = block + min(2**state.weight_failures, 20)
+    state.touch()
+    log(f"[{block}] set_weights FAILED ({state.weight_failures}x): {message}", "error")
+    return False
 
 
 async def maybe_set_weights(
@@ -122,24 +204,53 @@ async def maybe_set_weights(
     *,
     force: bool = False,
 ) -> bool:
-    """Set equal weights over the king chain (else burn UID 0), rate-limited."""
-    current_block = await subtensor.get_current_block()
-    if not force and current_block - state.last_weight_block < K.WEIGHT_INTERVAL:
-        return False
+    """Set equal weights over the king chain (else burn UID 0), rate-limited.
 
-    uids, weights, label = K.weight_targets(state.king, state.king_chain, uid_map)
-    log(f"[{current_block}] set_weights -> {label}: uids={uids} weights={[round(w,4) for w in weights]}", "info")
+    The return value of ``set_weights`` used to be discarded. bittensor returns
+    ``(success, message)`` and its rate-limit path returns ``False`` *without
+    submitting anything* — so a no-op advanced ``last_weight_block`` as if the
+    weights had landed, blocking any retry for a full WEIGHT_INTERVAL (~1h) and
+    misreporting the state. We now only advance on a real success.
+    """
+    current_block = await subtensor.get_current_block()
+
+    if not force:
+        if current_block < state.next_weight_block:
+            return False  # backing off after a genuine failure
+        if current_block - state.last_weight_block < K.WEIGHT_INTERVAL:
+            return False
+        if await _chain_says_too_soon(subtensor, wallet):
+            return False
+
+    uids, weights, label = K.weight_targets(
+        state.king, state.king_chain, uid_map, burn_uid=K.BURN_UID
+    )
+    log(
+        f"[{current_block}] set_weights -> {label}: uids={uids} "
+        f"weights={[round(w, 4) for w in weights]}",
+        "info",
+    )
     try:
-        await subtensor.set_weights(
+        result = await subtensor.set_weights(
             wallet=wallet, netuid=NETUID, uids=uids, weights=weights, wait_for_inclusion=True
         )
     except Exception as e:
-        log(f"[{current_block}] set_weights failed: {e}", "error")
-        return False
+        return _weight_failed(state, current_block, f"exception: {e}")
+
+    success, message = _unpack_set_weights(result)
+    if not success:
+        if _is_rate_limited(message):
+            # A no-op, not a failure: do NOT advance last_weight_block.
+            log(f"[{current_block}] set_weights rate-limited ({message}); retrying next tick", "warn")
+            return False
+        return _weight_failed(state, current_block, message)
 
     state.last_weight_block = current_block
     state.last_winner_hotkey = label
-    state.flush(store)
+    state.weight_failures = 0
+    state.next_weight_block = 0
+    state.touch()
+    await state.flush(store)
     return True
 
 
@@ -156,7 +267,145 @@ def ensure_genesis_king(state: KingState, block: int) -> None:
         block=block, challenge_id=K.SEED_CHALLENGE_ID,
     )
     state.king, state.king_chain = king, chain
+    state.touch()
     log(f"Seeded genesis king from {SEED_REPO}@{SEED_DIGEST[:16]}...", "success")
+
+
+def _duel_history_entry(entry: ChallengerEntry, verdict: dict, uid_map: dict[str, int]) -> dict:
+    """A dashboard history row from a completed duel verdict."""
+    return {
+        "challenge_id": verdict.get("challenge_id") or f"block-{entry.block}",
+        "hotkey": entry.hotkey,
+        "uid": uid_map.get(entry.hotkey),
+        "model_repo": entry.model_repo,
+        "model_digest": entry.model_digest,
+        "accepted": bool(verdict.get("accepted")),
+        "verdict": verdict.get("verdict", "unknown"),
+        "mu_hat": verdict.get("mu_hat"),
+        "lcb": verdict.get("lcb"),
+        "delta": verdict.get("delta_threshold"),
+        "avg_king_distance": verdict.get("avg_king_distance"),
+        "avg_challenger_distance": verdict.get("avg_challenger_distance"),
+        "metric": DUEL_METRIC,
+        "n_clips": verdict.get("n_clips"),
+        "block": entry.block,
+        "timestamp": verdict.get("timestamp"),
+    }
+
+
+def _build_queue(state: KingState, entries: list[ChallengerEntry], uid_map: dict[str, int]) -> list[dict]:
+    """Pending-challenger view for the dashboard (excludes the reigning king)."""
+    queue = []
+    for e in entries:
+        if _is_current_king(state, e):
+            continue
+        seen = _seen_key(e.hotkey, e.model_digest) in state.seen_hotkeys
+        queue.append({
+            "hotkey": e.hotkey,
+            "uid": uid_map.get(e.hotkey),
+            "model_repo": e.model_repo,
+            "model_digest": e.model_digest,
+            "block": e.block,
+            "status": "seen" if seen else "unseen",
+        })
+    return queue
+
+
+async def _publish_dashboard(
+    state: KingState,
+    uid_map: dict[str, int],
+    store: JsonBucketStore,
+    queue: list[dict],
+) -> None:
+    """Build + publish the public dashboard.json snapshot (best-effort)."""
+    try:
+        payload = build_dashboard(
+            state,
+            uid_map,
+            chain_meta={
+                "name": CHAIN_NAME,
+                "seed_repo": SEED_REPO,
+                "seed_digest": SEED_DIGEST,
+                "netuid": NETUID,
+            },
+            duel_params={
+                "metric": DUEL_METRIC,
+                "n_clips": DUEL_N_CLIPS,
+                "delta_threshold": DELTA_THRESHOLD,
+                "alpha": ALPHA,
+                "n_bootstrap": N_BOOTSTRAP,
+            },
+            updated_at=datetime.now(timezone.utc).isoformat(),
+            queue=queue,
+        )
+        await publish_dashboard(store, payload)
+    except Exception as e:
+        log(f"Dashboard publish failed: {e}", "warn")
+
+
+def _error_history_entry(
+    entry: ChallengerEntry,
+    failure: DuelFailure,
+    uid_map: dict[str, int],
+    row: dict,
+) -> dict:
+    """A dashboard history row for a QUARANTINED challenger.
+
+    The frontend has typed `DuelHistoryEntry.error` since day one and it never
+    had a producer: dispatch failures were only logged, so the dashboard could
+    never explain why a miner's model was ignored.
+    """
+    return {
+        "challenge_id": f"block-{entry.block}",
+        "hotkey": entry.hotkey,
+        "uid": uid_map.get(entry.hotkey),
+        "model_repo": entry.model_repo,
+        "model_digest": entry.model_digest,
+        "accepted": False,
+        "verdict": "error",
+        "error": (failure.detail or "")[:500],
+        "error_reason": failure.reason,
+        "attempts": row.get("attempts"),
+        "metric": DUEL_METRIC,
+        "block": entry.block,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+async def _note_failure(
+    state: KingState,
+    store: JsonBucketStore,
+    uid_map: dict[str, int],
+    entry: ChallengerEntry,
+    key: str,
+    failure: DuelFailure,
+    block: int,
+) -> None:
+    """Record a failed attempt; quarantine + surface it when the budget is spent."""
+    row = state.record_failure(key, block=block, failure=failure)
+
+    if not row["quarantined"]:
+        state.stats["transient_errors"] = state.stats.get("transient_errors", 0) + 1
+        state.touch()
+        log(
+            f"Duel failed ({failure.reason}) for {entry.hotkey[:12]}...: "
+            f"attempt {row['attempts']}/{MAX_DUEL_ATTEMPTS}, retry at block {row['next_retry_block']}",
+            "warn",
+        )
+    else:
+        # stats.failed counts QUARANTINED challengers, once each. Retries go to
+        # transient_errors so the dashboard number doesn't inflate with backoff.
+        state.stats["failed"] = state.stats.get("failed", 0) + 1
+        state.touch()
+        state.record_duel(_error_history_entry(entry, failure, uid_map, row))
+        state.mark_seen(key)  # never retried
+        log(
+            f"Challenger {entry.hotkey[:12]}... QUARANTINED "
+            f"({row['quarantine_reason']}: {failure.reason})",
+            "error",
+        )
+
+    await state.flush(store)
 
 
 async def process_challengers(
@@ -166,38 +415,61 @@ async def process_challengers(
     uid_map: dict[str, int],
     store: JsonBucketStore,
     entries: list[ChallengerEntry],
+    block: int,
 ) -> None:
-    """Duel each new challenger; crown the winners and refresh weights."""
+    """Duel each new challenger; crown the winners and refresh weights.
+
+    A failing challenger must NEVER block the ones behind it. This loop used to
+    ``return`` on any duel error, so one challenger whose repo 404s (or whose
+    weights crash the pipeline) permanently blocked every later challenger — a
+    free griefing vector. Now:
+
+      * BUSY  -> ``break``    (a property of the SERVER: continuing would just 409)
+      * error -> ``continue`` (a property of the CHALLENGER: everyone else proceeds)
+    """
     for entry in entries:
         key = _seen_key(entry.hotkey, entry.model_digest)
+
         if key in state.seen_hotkeys or _is_current_king(state, entry):
             continue
+        if state.is_quarantined(key):
+            continue  # this artifact can never be evaluated
+        if block < state.next_retry_block(key):
+            continue  # backoff has not elapsed
+
         if not state.king:
-            # No king to duel against and no seed configured; the first valid
-            # challenger takes the crown unopposed.
-            state.king, state.king_chain = K.crown(
-                None, state.king_chain, hotkey=entry.hotkey, model_repo=entry.model_repo,
-                model_digest=entry.model_digest, block=entry.block, challenge_id="first",
+            # No king AND no chain.toml seed_digest. We refuse to crown an
+            # unevaluated model — the burn path already exists and is correct
+            # (king_hotkeys -> [] -> weight_targets -> burn UID 0). The old code
+            # short-circuited it by crowning the first reveal it happened to see.
+            log(
+                "No king and no chain.toml seed_digest — refusing to crown an "
+                "unevaluated challenger. Burning to UID 0 until seed_digest is pinned.",
+                "error",
             )
-            state.seen_hotkeys.add(key)
-            state.stats["accepted"] = state.stats.get("accepted", 0) + 1
-            state.flush(store)
-            log(f"Crowned first king {entry.hotkey[:12]}... ({entry.model_repo})", "success")
-            await maybe_set_weights(subtensor, wallet, state, uid_map, store, force=True)
-            continue
+            state.degraded = "no_seed_digest"
+            break
 
-        block_hash = await subtensor.get_block_hash(entry.block)
-        log(f"Dueling challenger {entry.hotkey[:12]}... vs king {state.king.get('hotkey','')[:12] or 'base'}...", "info")
         try:
+            block_hash = await subtensor.get_block_hash(entry.block)
+            log(
+                f"Dueling challenger {entry.hotkey[:12]}... vs king "
+                f"{state.king.get('hotkey','')[:12] or 'base'}...",
+                "info",
+            )
             verdict = await dispatch_duel(entry, state.king, block_hash)
-        except Exception as e:
-            log(f"Duel dispatch failed for {entry.hotkey[:12]}...: {e}", "error")
-            return  # leave unseen so it retries next tick
+        except EvalBusy:
+            log("Eval server busy; remaining challengers deferred to next tick", "warn")
+            break
+        except Exception as e:  # noqa: BLE001 — deliberate: classify, never crash the tick
+            await _note_failure(state, store, uid_map, entry, key, classify(e), block)
+            continue  # <<< THE FIX: one bad challenger no longer blocks the rest
 
-        if verdict is None:
-            return  # server busy; retry later, keep entry unseen
+        # A completed duel clears the artifact's failure history.
+        state.clear_attempts(key)
+        state.mark_seen(key)
+        state.record_duel(_duel_history_entry(entry, verdict, uid_map))
 
-        state.seen_hotkeys.add(key)
         if verdict.get("accepted"):
             state.king, state.king_chain = K.crown(
                 state.king, state.king_chain, hotkey=entry.hotkey, model_repo=entry.model_repo,
@@ -205,12 +477,14 @@ async def process_challengers(
                 challenge_id=verdict.get("challenge_id") or f"block-{entry.block}",
             )
             state.stats["accepted"] = state.stats.get("accepted", 0) + 1
-            state.flush(store)
+            state.touch()
+            await state.flush(store)
             log(f"Challenger {entry.hotkey[:12]}... CROWNED (lcb={verdict.get('lcb')})", "success")
             await maybe_set_weights(subtensor, wallet, state, uid_map, store, force=True)
         else:
             state.stats["rejected"] = state.stats.get("rejected", 0) + 1
-            state.flush(store)
+            state.touch()
+            await state.flush(store)
             log(f"Challenger {entry.hotkey[:12]}... rejected (lcb={verdict.get('lcb')})", "info")
 
 
@@ -225,12 +499,17 @@ async def tick(
     ensure_genesis_king(state, block)
 
     commits = await subtensor.get_all_revealed_commitments(NETUID, block=block)
-    entries = scan_reveals(commits)
+    # Hotkeys with several quarantined artifacts are dropped at scan time — this
+    # finally wires reveal_scan's long-dead `blacklist=` hook.
+    entries = scan_reveals(commits, blacklist=state.banned_hotkeys())
     if entries:
-        await process_challengers(subtensor, wallet, state, uid_map, store, entries)
+        await process_challengers(subtensor, wallet, state, uid_map, store, entries, block)
 
     # Periodic weight refresh (also keeps the king chain aligned as UIDs change).
     await maybe_set_weights(subtensor, wallet, state, uid_map, store)
+
+    # Publish the public dashboard snapshot for the website.
+    await _publish_dashboard(state, uid_map, store, _build_queue(state, entries, uid_map))
 
 
 async def main() -> None:
@@ -249,12 +528,44 @@ async def main() -> None:
     own_client = create_own_write_client()
     await ensure_bucket_exists(own_client, R2_OWN_BUCKET)
     store = JsonBucketStore(own_client, R2_OWN_BUCKET)
-    state = KingState.load(store)
+
+    # A validator that cannot read its state must NOT run: on a chain-derived
+    # system, running on blank state re-duels every past challenger and re-seeds
+    # genesis over the reigning king — and the first flush would then overwrite
+    # the good bucket state with the blank one.
+    try:
+        state = await KingState.load(store)
+    except (StoreUnavailable, StateInconsistent) as e:
+        if os.environ.get("LEOMA_FORCE_FRESH_STATE") == "1":
+            log(f"State unreadable ({e}); LEOMA_FORCE_FRESH_STATE=1 — starting BLANK", "warn")
+            state = KingState()
+        else:
+            log(f"Cannot read validator state: {e}", "critical")
+            log("Refusing to start on unknown state. Restore the bucket, or set "
+                "LEOMA_FORCE_FRESH_STATE=1 to deliberately start blank.", "critical")
+            raise SystemExit(1)
+
     log(f"Loaded king: {(state.king or {}).get('model_repo', 'none')} chain={len(state.king_chain)}", "info")
+
+    # Re-assert weights immediately on startup. Without this, a restarted
+    # validator with a recently-persisted last_weight_block sits idle for up to a
+    # full WEIGHT_INTERVAL (~1h) before it sets weights again.
+    try:
+        block = await subtensor.get_current_block()
+        ensure_genesis_king(state, block)
+        uid_map = await refresh_uid_map(subtensor)
+        await maybe_set_weights(subtensor, wallet, state, uid_map, store, force=True)
+    except Exception as e:
+        log(f"Startup weight-set failed (will retry on the first tick): {e}", "warn")
 
     while True:
         try:
             await tick(subtensor, wallet, state, store)
+        except (StoreUnavailable, StateInconsistent) as e:
+            # Losing the store mid-run means we can no longer persist crowns.
+            log(f"State store unavailable: {e}", "critical")
+            log_exception("State store unavailable — exiting for supervisor restart", e)
+            raise SystemExit(1)
         except Exception as e:
             log(f"Validator tick error: {e}", "error")
             log_exception("Validator tick error", e)

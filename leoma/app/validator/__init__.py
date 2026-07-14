@@ -1,6 +1,9 @@
-"""Validator service entry points (king-of-the-hill duel + weight-setter)."""
+"""Validator service (king-of-the-hill duel + weight-setter).
 
-from leoma.app.validator.main import main, main_sync
+Deliberately re-exports nothing. Importing the ``main`` *function* here shadowed
+the ``main`` *module*, so ``leoma.app.validator.main`` resolved to a function —
+which made the module unreachable by attribute access (and unpatchable in tests).
+Import the entry point from its module instead:
 
-
-__all__ = ["main", "main_sync"]
+    from leoma.app.validator.main import main
+"""

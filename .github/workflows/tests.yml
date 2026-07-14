@@ -1,0 +1,101 @@
+# Leoma — tests + build safety.
+#
+# The repo previously had NO test workflow at all, which is how three bugs
+# shipped: a Dockerfile COPY of a deleted file, a chain.toml that was read at
+# import but never packaged, and numpy declared only in the [eval] extra while
+# being imported on the validator path.
+#
+# Each job below exists to catch exactly one of those classes.
+name: Tests
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # 1. The unit suite (pure logic: verdict, king chain, seeds, metrics, state, HTTP contract).
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # ffprobe/ffmpeg are declared system deps (video utilities).
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+
+      - name: Install package + test extra
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[test]'
+
+      - name: Run tests
+        run: pytest -q
+
+  # 2. Import-safety on a BASE (non-eval) install.
+  #    Catches: numpy-only-in-[eval], and chain.toml not shipping in the wheel.
+  #    Deliberately installs from a BUILT WHEEL, not the source tree, so a missing
+  #    package-data entry fails here rather than in production.
+  import-safety:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build wheel and install it (no [eval] extra)
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel
+          pip install dist/*.whl
+
+      - name: Import the validator path from OUTSIDE the source tree
+        # cd /tmp so python cannot accidentally import the repo checkout.
+        run: |
+          cd /tmp
+          python - <<'PY'
+          import leoma.infra.chain_config as c   # reads chain.toml at import -> must be packaged
+          import leoma.app.validator.main        # the validator entrypoint
+          import leoma.eval.metrics              # imports numpy at module scope
+          import leoma.eval_server               # FastAPI app factory
+          print("import-safety OK:", c.NAME, c.ARCH_PIPELINE)
+          PY
+
+      - name: CLI entrypoint resolves
+        run: |
+          cd /tmp
+          leoma --help > /dev/null && echo "CLI OK"
+
+  # 3. Docker build smoke. Catches a broken COPY / a missing file in the image.
+  #    Only the slim validator image is built here (the CUDA eval image is large;
+  #    it is built on publish). Both Dockerfiles run an in-image import check.
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build validator image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          push: false
+          load: true
+          tags: leoma:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke-run the image
+        run: |
+          docker run --rm leoma:ci leoma --help > /dev/null
+          docker run --rm leoma:ci python -c "import leoma.infra.chain_config as c; print('chain.toml in image:', c.NAME)"
