@@ -242,6 +242,107 @@ def corpus_verify(sample):
 
 
 @cli.group()
+def calibrate():
+    """Measure the cross-GPU noise floor so delta_threshold can be set, not guessed.
+
+    Leoma crowns a challenger whose bootstrap LCB beats the king by delta_threshold.
+    That margin only means anything if it is wider than the hardware noise: the same
+    model generates slightly different frames on different GPUs, hence different
+    distances, hence potentially a different verdict. This is the subnet's largest open
+    consensus risk. Two steps:
+
+      1. `leoma calibrate generate` on EACH GPU type in the fleet -> one record per box.
+      2. `leoma calibrate analyze box_*.json` -> the measured floor + a delta recommendation.
+    """
+
+
+@calibrate.command("generate")
+@click.option("--model", default="", help="repo@digest to calibrate on (default: the pinned seed king)")
+@click.option("--n-clips", type=int, default=32, help="How many clips to generate")
+@click.option("--gpu", "gpu_name", default="", help="Label for this box (default: the detected GPU name)")
+@click.option("--out", "-o", default="calibration.json", help="Where to write this box's record")
+def calibrate_generate(model, n_clips, gpu_name, out):
+    """Generate the calibration model on this box and record per-clip distances.
+
+    Run this ONCE ON EACH GPU TYPE in the fleet. Every box uses the same model, clips
+    and seed, so any distance difference between two boxes is pure hardware noise.
+    """
+    import json
+
+    from leoma.bootstrap import emit_log as log, emit_header as log_header
+    from leoma.eval.calibrate import box_record
+    from leoma.eval.determinism import runtime_env
+    from leoma.infra.chain_config import SEED_REPO, SEED_DIGEST, SPEC
+    from leoma.infra.model_store import ModelRef
+
+    log_header("Calibration — generate")
+    SPEC.require_duel_ready()
+
+    if model:
+        repo, _, digest = model.partition("@")
+        ref = ModelRef(repo, digest)
+    elif SEED_DIGEST:
+        ref = ModelRef(SEED_REPO, SEED_DIGEST)
+    else:
+        raise click.ClickException(
+            "no --model given and chain.toml [seed].seed_digest is not pinned; "
+            "pass --model repo@digest to calibrate on a specific model"
+        )
+
+    label = gpu_name or (runtime_env().get("gpu") or "unknown-gpu")
+    log(f"Model: {ref.immutable_ref}  GPU: {label}  clips: {n_clips}", "info")
+    log("Generating (this uses the real duel path — expect it to take a while)...", "info")
+
+    record = box_record(ref, spec=SPEC, n_clips=n_clips, gpu_name=label)
+    with open(out, "w") as f:
+        json.dump(record, f, indent=2)
+
+    log_header("Done")
+    log(f"Wrote {len(record['clips'])} clip distances for {label} -> {out}", "success")
+    log("Run this on every GPU type, then: leoma calibrate analyze <all the records>", "info")
+
+
+@calibrate.command("analyze")
+@click.argument("records", nargs=-1, type=click.Path(exists=True), required=True)
+@click.option("--safety", type=float, default=3.0, help="Multiple of the noise floor to recommend")
+def calibrate_analyze(records, safety):
+    """Compare box records and print the measured floor + a delta_threshold recommendation.
+
+    Pure analysis — no GPU. Give it the JSON records from `generate` on each box.
+    """
+    import json
+
+    from leoma.bootstrap import emit_log as log, emit_header as log_header
+    from leoma.eval.calibrate import analyze
+    from leoma.infra.chain_config import SPEC
+
+    log_header("Calibration — analyze")
+    loaded = []
+    for path in records:
+        with open(path) as f:
+            loaded.append(json.load(f))
+        log(f"loaded {path}: {loaded[-1].get('gpu')} ({len(loaded[-1].get('clips', []))} clips)", "info")
+
+    report = analyze(loaded, current_delta_threshold=SPEC.duel.delta_threshold, safety_factor=safety)
+
+    log_header("Cross-GPU noise")
+    log(f"boxes: {report.n_boxes}  pairs: {report.n_pairs}  gpus: {', '.join(report.gpus)}", "info")
+    for p in report.pairs:
+        repro = "bit-identical" if p.bit_identical_clips == p.n_clips else \
+                f"{p.bit_identical_clips}/{p.n_clips} clips identical"
+        log(f"  {p.gpu_a} vs {p.gpu_b}: |Δ| max={p.abs_delta_max:.2e} p99={p.abs_delta_p99:.2e}  "
+            f"mu_hat={p.mu_hat:+.2e} lcb={p.lcb:+.2e} ucb={p.ucb:+.2e}  ({repro})", "info")
+
+    log(f"worst spurious mean-advantage (any pair): {report.max_abs_mu_hat:.3e}", "info")
+    log(f"worst single-clip disagreement:           {report.max_abs_delta:.3e}", "info")
+    log(f"recommended delta_threshold (>= {safety}x): {report.recommended_delta_threshold}", "success")
+
+    level = "success" if report.verdict.startswith("PASS") else \
+            "error" if report.verdict.startswith("FAIL") else "info"
+    log(report.verdict, level)
+
+
+@cli.group()
 def miner():
     """Miner management commands.
 
