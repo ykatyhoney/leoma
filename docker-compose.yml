@@ -20,12 +20,7 @@ services:
       WALLET_NAME: ${WALLET_NAME:-default}
       HOTKEY_NAME: ${HOTKEY_NAME:-default}
       EVAL_SERVER_URL: ${EVAL_SERVER_URL:-http://eval-server:9000}
-      # Duel parameters — identical across validators for consensus.
-      LEOMA_DUEL_METRIC: ${LEOMA_DUEL_METRIC:-lpips}
-      LEOMA_DUEL_N_CLIPS: ${LEOMA_DUEL_N_CLIPS:-32}
-      LEOMA_DELTA_THRESHOLD: ${LEOMA_DELTA_THRESHOLD:-0.0025}
-      LEOMA_ALPHA: ${LEOMA_ALPHA:-0.001}
-      LEOMA_N_BOOTSTRAP: ${LEOMA_N_BOOTSTRAP:-10000}
+      # Duel parameters live in chain.toml (the consensus surface), not here.
       # This validator's own state bucket (durable king state).
       OBJECT_STORAGE_BACKEND: ${OBJECT_STORAGE_BACKEND:-r2}
       R2_OWN_BUCKET: ${R2_OWN_BUCKET:-}

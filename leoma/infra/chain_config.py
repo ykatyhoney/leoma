@@ -22,6 +22,15 @@ import re
 import tomllib
 from types import ModuleType
 
+from leoma.eval.spec import (
+    ArchSpec,
+    ConsensusSpec,
+    CorpusSpec,
+    DeterminismSpec,
+    DuelSpec,
+    GenSpec,
+)
+
 
 def _resolve_toml_path() -> pathlib.Path:
     """Locate chain.toml in a wheel, an editable install, or the repo.
@@ -64,6 +73,10 @@ with open(_TOML_PATH, "rb") as _f:
 _chain = _doc.get("chain", {})
 _arch = _doc.get("arch", {})
 _seed = _doc.get("seed", {})
+_corpus = _doc.get("corpus", {})
+_gen = _doc.get("gen", {})
+_duel = _doc.get("duel", {})
+_determinism = _doc.get("determinism", {})
 
 _VALID_SEED_REPO_BACKENDS = {"hf", "hippius"}
 
@@ -105,6 +118,44 @@ if SEED_REPO_BACKEND not in _VALID_SEED_REPO_BACKENDS:
 SEED_NAMESPACE: str = SEED_REPO.split("/", 1)[0] if "/" in SEED_REPO else ""
 
 
+def _build_spec() -> ConsensusSpec:
+    """Validate the pinned consensus surface — loudly, at import.
+
+    A missing or malformed field here is a **startup** failure, not a runtime one.
+    That is the whole point: a validator that silently defaults ``num_frames`` or
+    ``metric`` produces a plausible verdict that quietly disagrees with the rest of
+    the subnet, and nobody notices for weeks. Better to refuse to boot with a
+    message naming the field.
+
+    (An *unpinned* corpus digest is the one exception — see
+    ``ConsensusSpec.require_duel_ready``. That degrades to "run, but burn", because
+    a crash-looping validator can't even tell you why it's unhappy.)
+    """
+    try:
+        return ConsensusSpec(
+            corpus=CorpusSpec(**_corpus),
+            gen=GenSpec(**_gen),
+            duel=DuelSpec(**_duel),
+            arch=ArchSpec(base_repo=ARCH_BASE_REPO, pipeline=ARCH_PIPELINE),
+            determinism=DeterminismSpec(**_determinism),
+        )
+    except Exception as e:  # pydantic ValidationError / TypeError
+        raise RuntimeError(
+            f"chain.toml does not define a valid consensus surface ({_TOML_PATH}):\n{e}\n\n"
+            "Every field of [corpus], [gen], [duel] and [determinism] is REQUIRED and has "
+            "no default. A field with a default is a field a validator can silently forget, "
+            "and a forgotten field means two validators grade the same challenger "
+            "differently."
+        ) from e
+
+
+#: The pinned consensus surface. Sent with every eval request, echoed in every verdict.
+SPEC: ConsensusSpec = _build_spec()
+
+#: The one hash that says "we are running the same exam".
+CONSENSUS_DIGEST: str = SPEC.digest()
+
+
 def load_arch() -> ModuleType:
     """Import the configured custom-arch module (registers HF/diffusers classes).
 
@@ -127,5 +178,7 @@ __all__ = [
     "SEED_DIGEST",
     "SEED_REPO_BACKEND",
     "SEED_NAMESPACE",
+    "SPEC",
+    "CONSENSUS_DIGEST",
     "load_arch",
 ]

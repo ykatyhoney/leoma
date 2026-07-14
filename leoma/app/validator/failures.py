@@ -5,22 +5,35 @@ Leoma has no persistent queue — the chain *is* the queue, re-derived from
 queue with ``requeue_front``/``retry_count``; we need a *decision function* over a
 stateless work list. This module is that decision.
 
-Three classes, and the distinction matters:
+Four classes, and the distinctions all matter:
 
 * ``BUSY``      — a property of the SERVER (the eval box is running someone else's
                   duel). Not a failure; consumes no attempt. The caller must
                   ``break`` (continuing would just 409 N more times).
-* ``TRANSIENT`` — a property of the ENVIRONMENT (network, disk, GPU, our corpus).
-                  Retry with block-based backoff; quarantine only after the attempt
-                  budget is exhausted.
+* ``TRANSIENT`` — a property of the ENVIRONMENT (network, disk, GPU). Retry with
+                  block-based backoff; quarantine only after the attempt budget is
+                  exhausted.
 * ``PERMANENT`` — a property of the ARTIFACT (the repo 404s, the weights won't
                   load, the arch is wrong). ``repo@digest`` is immutable, so this
                   can never succeed; quarantine it.
+* ``LOCAL``     — a property of **THIS VALIDATOR** (our corpus doesn't match the
+                  pinned manifest, our eval box runs a stale chain.toml). Costs the
+                  challenger **nothing**: no attempt, no backoff, no quarantine. The
+                  caller must ``break`` — every challenger would hit the identical
+                  wall, including the king.
 
 **Design rule: when in doubt, TRANSIENT.** A misclassified transient costs four
-retries. A misclassified permanent locks a legitimate miner out of an artifact.
-That asymmetry is why auth errors are deliberately *not* permanent: a validator's
-own token misconfiguration would otherwise quarantine every miner on the subnet.
+retries. A misclassified permanent locks a legitimate miner out of an artifact. That
+asymmetry is why auth errors are deliberately *not* permanent: a validator's own
+token misconfiguration would otherwise quarantine every miner on the subnet.
+
+**LOCAL exists because TRANSIENT is not actually harmless.** The attempt ledger
+quarantines an artifact once its attempts are ``exhausted``, whatever the class. So a
+validator whose *own* corpus was broken would fail every duel transiently, four times
+each, and then quarantine **every miner on the subnet** — permanently locking out
+honest models because of its own misconfiguration. Faults that are ours must therefore
+not touch the challenger's ledger at all. They are a reason to stop dueling, not a
+reason to blame whoever happened to be next in the queue.
 """
 from __future__ import annotations
 
@@ -32,6 +45,7 @@ class ErrorClass(str, Enum):
     BUSY = "busy"
     TRANSIENT = "transient"
     PERMANENT = "permanent"
+    LOCAL = "local"
 
 
 @dataclass(frozen=True)
@@ -48,6 +62,26 @@ class DuelFailure:
     def is_transient(self) -> bool:
         return self.kind is ErrorClass.TRANSIENT
 
+    @property
+    def is_local(self) -> bool:
+        return self.kind is ErrorClass.LOCAL
+
+
+# OUR fault, not the challenger's. These would fail identically for every model on
+# the subnet — including the reigning king — so they can never be evidence about a
+# particular challenger. Checked FIRST, before anything else can claim them.
+_LOCAL_SIGNS: tuple[tuple[str, str], ...] = (
+    ("corpus_integrity", "corpus_integrity"),
+    ("consensus_config", "consensus_config"),
+    ("consensus_mismatch", "consensus_mismatch"),
+    ("consensus_echo_mismatch", "consensus_echo_mismatch"),
+    ("code_mismatch", "code_mismatch"),
+    ("does not match the manifest", "corpus_integrity"),
+    ("decoded ground truth does not match", "corpus_integrity"),
+    ("corpus manifest digest mismatch", "corpus_integrity"),
+    ("manifest_digest is not pinned", "consensus_config"),
+    ("different consensus surface", "consensus_mismatch"),
+)
 
 # Substring -> (class, reason). Order matters: the first match wins, so the
 # PERMANENT artifact signatures are checked before the generic transient ones.
@@ -136,6 +170,9 @@ def classify_remote(message: str, reason: str = "") -> DuelFailure:
 
     token = reason.strip().lower()
     if token:
+        for _, r in _LOCAL_SIGNS:
+            if token == r:
+                return DuelFailure(ErrorClass.LOCAL, r, message)
         for _, r in _PERMANENT_SIGNS:
             if token == r:
                 return DuelFailure(ErrorClass.PERMANENT, r, message)
@@ -144,6 +181,10 @@ def classify_remote(message: str, reason: str = "") -> DuelFailure:
                 return DuelFailure(ErrorClass.TRANSIENT, r, message)
         if token.startswith("watchdog_stall"):
             return DuelFailure(ErrorClass.TRANSIENT, token, message)
+
+    hit = _match(text, _LOCAL_SIGNS)
+    if hit:
+        return DuelFailure(ErrorClass.LOCAL, hit, message)
 
     hit = _match(text, _PERMANENT_SIGNS)
     if hit:
@@ -165,6 +206,23 @@ def classify(exc: BaseException) -> DuelFailure:
     if isinstance(exc, EvalJobFailed):
         return classify_remote(exc.detail, exc.reason)
 
+    # The typed eval errors say who is at fault directly — no substring guessing.
+    from leoma.eval.errors import (
+        ChallengerFault,
+        ConsensusConfigError,
+        CorpusIntegrityError,
+        DuelCancelled,
+    )
+
+    if isinstance(exc, (CorpusIntegrityError, ConsensusConfigError)):
+        return DuelFailure(ErrorClass.LOCAL, exc.reason, str(exc))
+    if isinstance(exc, DuelCancelled):
+        # Checked BEFORE ChallengerFault would be, and deliberately transient: a
+        # watchdog stall or an operator's DELETE says nothing about the model.
+        return DuelFailure(ErrorClass.TRANSIENT, exc.reason, str(exc))
+    if isinstance(exc, ChallengerFault):
+        return DuelFailure(ErrorClass.PERMANENT, exc.reason, str(exc))
+
     type_name = type(exc).__name__.lower()
     message = str(exc)
     text = f"{type_name} {message}".lower()
@@ -172,6 +230,10 @@ def classify(exc: BaseException) -> DuelFailure:
     if type_name in _TRANSIENT_TYPES:
         reason = _match(text, _TRANSIENT_SIGNS) or "eval_unreachable"
         return DuelFailure(ErrorClass.TRANSIENT, reason, message)
+
+    hit = _match(text, _LOCAL_SIGNS)
+    if hit:
+        return DuelFailure(ErrorClass.LOCAL, hit, message)
 
     hit = _match(text, _PERMANENT_SIGNS)
     if hit:

@@ -1,13 +1,22 @@
-# Leoma — pinned video-generation architecture + genesis king.
+# Leoma — the pinned consensus surface.
 #
-# Every miner submits WEIGHTS for the single base architecture pinned here; the
-# validator loads king + challenger with the same pipeline and duels them on
-# held-out clips. To advance a generation, edit this file (and add a custom-code
-# module under [arch].module only if the architecture itself changes).
+# THIS FILE IS THE EXAM PAPER. Everything that can change a duel's outcome is
+# pinned here and nowhere else: the corpus, the generation parameters, the metric,
+# the acceptance threshold. It is hashed into a `consensus_digest` that is sent with
+# every eval request and echoed back in every verdict, so a validator running a
+# different config cannot quietly produce a verdict that disagrees with everyone
+# else's — it is caught at the door.
 #
-# The base is Wan2.1-I2V-14B-480P (480p matches Leoma's 832x480 corpus). The
-# genesis king is the base model itself until a challenger dethrones it;
-# seed_digest is pinned once the exact base revision is chosen (see [seed]).
+# The rule: if it can move a distance, it lives here. Nothing that affects a verdict
+# may come from an environment variable, because env vars are per-box and a per-box
+# exam is not consensus.
+#
+# Changing any value here is a consensus event: bump it, ship it to every validator,
+# and expect verdicts produced under the old and new digests to be mutually
+# unreproducible — which is the point. The digest makes it obvious instead of silent.
+#
+# The base architecture is Wan2.1-I2V-14B-480P (480p matches the 832x480 corpus).
+
 [chain]
 name = "leoma"
 seed_repo = "RendixNetwork/leoma-genesis"
@@ -17,16 +26,107 @@ repo_pattern = "^[^/]+/leoma-.+$"
 # The pinned base I2V/TI2V model — the reference architecture all challengers
 # fine-tune. Miners submit only weights compatible with this config.
 base_repo = "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"
-# diffusers pipeline class used to load + generate with king and challenger.
+# diffusers pipeline class used to load + generate with BOTH duelists. If this class
+# cannot be resolved the eval server refuses to run: a silent fallback to some other
+# pipeline would mean the pin is not a pin.
 pipeline = "WanImageToVideoPipeline"
 # Optional custom-code module (empty for a stock diffusers pipeline).
 module = ""
-# Config keys locked to the base arch's values; a challenger whose config.json
-# diverges on any of these is rejected (finalized alongside the Phase 2 runner).
+# Per-component config keys locked to the base arch's values; a challenger whose
+# config diverges on any of these is rejected.
 extra_lock_keys = []
 
 [seed]
-# Genesis king backend + immutable digest. Empty digest => seeded from the base
-# repo's default revision on first run (finalize with the pinned digest).
+# Genesis king backend + immutable digest.
+#
+# ⚠️ seed_digest MUST BE PINNED BEFORE MAINNET. With no king and no seed digest the
+# subnet burns 100% to UID 0 — deliberately. The old code crowned the first reveal it
+# ever saw, with no duel and no validation, which is strictly worse than burning: it
+# hands the subnet to whoever commits first.
 repo_backend = "hf"
 seed_digest = ""
+
+[corpus]
+# The held-out clips, pinned by the digest of the manifest that lists them.
+#
+# manifest_digest anchors the ENTIRE ground truth: which videos, which window inside
+# each video, and the hash of the decoded truth frames. Two validators with the same
+# digest are provably grading the same exam. An empty digest is a hard error at
+# import — a corpus that is "whatever the bucket holds today" is not a consensus
+# surface, and that is exactly what the live listing used to be.
+#
+# Build and publish:
+#   leoma corpus build-manifest --out manifest.json
+#   leoma corpus publish-manifest manifest.json    # prints the digest to paste below
+bucket = "videos"
+manifest_key = "manifests/leoma-corpus-v1.json"
+manifest_digest = ""
+
+[gen]
+# How king and challenger generate. Identical for both, always.
+#
+# num_frames/fps/width/height must match the corpus manifest's decode block: the
+# manifest's truth hashes were computed under exactly these numbers, so a mismatch is
+# caught up front instead of surfacing as 32 failing hash checks mid-duel.
+num_frames = 81
+fps = 16
+num_inference_steps = 30
+guidance_scale = 5.0
+width = 832
+height = 480
+negative_prompt = "low quality, blurry, distorted"
+# "manifest" = each clip carries its own caption; "fixed" = one prompt for every clip.
+prompt_mode = "manifest"
+prompt = ""
+dtype = "bfloat16"
+# Pinned even though it is always "none" today: CPU offload changes the generated
+# frames, hence the distances, hence potentially the crown. An eval box that switched
+# it on to save memory would silently diverge from the fleet. Not a knob — a pin.
+offload = "none"
+
+[duel]
+metric = "lpips"
+# CPU. Generation is already the one step that cannot be made bit-exact across GPU
+# architectures; scoring on the GPU too would add a second source of noise for no
+# benefit. On CPU in fp32 the metric is an exactly reproducible function of the
+# frames — minutes of CPU against the hours the generations take.
+metric_device = "cpu"
+n_clips = 32
+# The margin by which a challenger must confidently beat the king (lower distance is
+# better).
+# ⚠️ CALIBRATION: this must exceed the cross-GPU noise floor, measured by running the
+# SAME model as both king and challenger across the fleet and taking the |Δdistance|
+# tail. Until that measurement exists on real hardware it is the subnet's largest
+# open consensus risk — bigger than any bug.
+delta_threshold = 0.0025
+alpha = 0.001
+n_bootstrap = 10000
+base_seed = 0
+# Early stop fires once the challenger cannot reach delta_threshold even if every
+# remaining clip went as well as it possibly could. Expressed as a MULTIPLE of the
+# threshold so it tracks the metric's scale through any recalibration. At 20x it only
+# fires on a hopeless model and cannot touch a marginal contender — and since an early
+# stop can only ever yield verdict="king", a validator running with it still agrees
+# with one running without it.
+early_stop_factor = 20.0
+# The freeze-baseline gate. A challenger must beat not only the king but a trivial
+# "hold the conditioning frame" cheat — CONFIDENTLY — or it is rejected even if it beat
+# the king. Scoring closeness-to-the-real-continuation means a model that freezes scores
+# well on any clip that does not move much, so the cheat is materialized as a third
+# duelist and run through the same bootstrap.
+#
+# The margin is a FRACTION of the freeze baseline's own mean distance, so it is
+# dimensionless and survives a metric change (LPIPS, MSE and flow live on wildly
+# different scales; an absolute margin would silently mean something different on each).
+#
+# 0.0 = LCB-only: be confidently better than freezing, with no extra headroom demanded.
+# That is the honest launch setting — we have not yet measured how much headroom a
+# genuinely good model has over the cheat, and a margin guessed too high would reject
+# good models before we ever saw one. The dashboard publishes avg_freeze_distance so
+# the number can be measured rather than invented.
+freeze_margin_fraction = 0.0
+
+[determinism]
+torch_deterministic = true
+cudnn_benchmark = false
+allow_tf32 = false

@@ -372,7 +372,15 @@ class Settings:
         self.hippius_videos_write_access_key = _read_optional_str("HIPPIUS_VIDEOS_WRITE_ACCESS_KEY")
         self.hippius_videos_write_secret_key = _read_optional_str("HIPPIUS_VIDEOS_WRITE_SECRET_KEY")
         self.source_bucket = _read_str("HIPPIUS_SOURCE_BUCKET", "videos")
-        self.object_storage_backend = "r2"
+        # Was hardcoded to "r2", which made the entire Hippius branch of
+        # storage_backend unreachable — even though OBJECT_STORAGE_BACKEND is
+        # compose-wired, re-exported, documented, and set in the tests. The parser
+        # below it was written and then never called. Leoma's whole story is
+        # decentralized storage; the corpus living only on Cloudflare was an accident
+        # of a one-line hardcode, not a decision.
+        self.object_storage_backend = _parse_object_storage_backend(
+            _read_str("OBJECT_STORAGE_BACKEND", "r2")
+        )
 
         # ── Hippius Hub (OCI model registry) — miners upload weights here and
         #    validators download them by immutable digest. Distinct from the
@@ -383,9 +391,15 @@ class Settings:
         # Local cache for downloaded model snapshots (keyed by repo@digest).
         self.model_cache_dir = _read_str("LEOMA_MODEL_CACHE_DIR", "/tmp/leoma/hippius_models")
 
-        self.r2_endpoint_raw = "https://cce499ad4f3a4703b069771d8ff4215a.r2.cloudflarestorage.com"
-        self.r2_region = "auto"
-        self.r2_source_bucket = "leoma-videos"
+        # Env-driven, with today's live values as the defaults — so nothing changes for
+        # an existing operator, but a validator is no longer *unable* to point at a
+        # different account. These were hardcoded, which meant the whole fleet's corpus
+        # access was baked into the source.
+        self.r2_endpoint_raw = _read_str(
+            "R2_ENDPOINT", "https://cce499ad4f3a4703b069771d8ff4215a.r2.cloudflarestorage.com"
+        )
+        self.r2_region = _read_str("R2_REGION", "auto")
+        self.r2_source_bucket = _read_str("R2_SOURCE_BUCKET", "leoma-videos")
         self.r2_videos_read_access_key = _read_optional_str("R2_VIDEOS_READ_ACCESS_KEY")
         self.r2_videos_read_secret_key = _read_optional_str("R2_VIDEOS_READ_SECRET_KEY")
         self.r2_videos_write_access_key = _read_optional_str("R2_VIDEOS_WRITE_ACCESS_KEY")

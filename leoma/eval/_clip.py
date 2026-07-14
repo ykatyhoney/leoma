@@ -14,16 +14,17 @@ from __future__ import annotations
 
 import numpy as np
 
-_model = None
-_preprocess = None
+_models: dict[str, tuple] = {}  # device -> (model, preprocess)
 
 CLIP_MODEL = "ViT-B-32"
 CLIP_PRETRAINED = "openai"
 
+DEFAULT_DEVICE = "cpu"
 
-def _get_model():
-    global _model, _preprocess
-    if _model is None:
+
+def _get_model(device: str):
+    cached = _models.get(device)
+    if cached is None:
         import torch
         import open_clip
 
@@ -31,10 +32,12 @@ def _get_model():
             CLIP_MODEL, pretrained=CLIP_PRETRAINED
         )
         model.eval()
-        if torch.cuda.is_available():
-            model = model.to("cuda")
-        _model, _preprocess = model, preprocess
-    return _model, _preprocess
+        if device.startswith("cuda") and not torch.cuda.is_available():
+            raise RuntimeError("metric_device='cuda' but no CUDA device is available")
+        model = model.to(device)
+        cached = (model, preprocess)
+        _models[device] = cached
+    return cached
 
 
 def cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
@@ -48,12 +51,11 @@ def cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.mean(1.0 - (a * b).sum(axis=-1)))
 
 
-def _embed(frames: np.ndarray) -> np.ndarray:
+def _embed(frames: np.ndarray, device: str) -> np.ndarray:
     import torch
     from PIL import Image
 
-    model, preprocess = _get_model()
-    device = next(model.parameters()).device
+    model, preprocess = _get_model(device)
     batch = torch.stack([
         preprocess(Image.fromarray(np.asarray(f).astype("uint8")))
         for f in frames
@@ -63,7 +65,7 @@ def _embed(frames: np.ndarray) -> np.ndarray:
     return emb.detach().cpu().numpy()
 
 
-def clip_video_distance(gen: np.ndarray, truth: np.ndarray) -> float:
+def clip_video_distance(gen: np.ndarray, truth: np.ndarray, *, device: str = DEFAULT_DEVICE) -> float:
     """Mean per-frame CLIP cosine distance between generation and truth."""
     g = np.asarray(gen)
     t = np.asarray(truth)
@@ -75,4 +77,4 @@ def clip_video_distance(gen: np.ndarray, truth: np.ndarray) -> float:
     if n == 0:
         # Used to return 0.0 — a PERFECT score for an empty generation.
         raise ValueError("no frames to compare")
-    return cosine_distance(_embed(g[:n]), _embed(t[:n]))
+    return cosine_distance(_embed(g[:n], device), _embed(t[:n], device))

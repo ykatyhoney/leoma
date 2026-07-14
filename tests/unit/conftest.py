@@ -81,3 +81,134 @@ class FakeMinio:
 @pytest.fixture
 def fake_minio() -> FakeMinio:
     return FakeMinio()
+
+
+# ---------------------------------------------------------------------------
+# The pinned consensus surface
+# ---------------------------------------------------------------------------
+
+#: The digest a test corpus manifest pretends to have.
+TEST_MANIFEST_DIGEST = "sha256:" + "c" * 64
+
+
+def pinned_spec():
+    """The shipped SPEC, but with the corpus pinned.
+
+    The chain.toml in the repo ships with ``manifest_digest = ""`` — deliberately,
+    because the corpus has not been published yet and a validator must refuse to
+    duel on an unpinned corpus. Tests that exercise the duel path need a spec that
+    is duel-ready, so they pin a fake digest here rather than weakening the shipped
+    default (which is exactly the safety property we want to keep testing).
+    """
+    from leoma.infra.chain_config import SPEC
+
+    return SPEC.model_copy(
+        update={"corpus": SPEC.corpus.model_copy(update={"manifest_digest": TEST_MANIFEST_DIGEST})}
+    )
+
+
+@pytest.fixture
+def duel_ready(monkeypatch):
+    """Give the validator a pinned corpus so the duel path can run.
+
+    The architecture prescreen is switched off here: it fetches real configs from the
+    Hub, and these tests are about the dispatch/settle policy, not about the lock. The
+    lock has its own tests (``test_arch_lock.py``), and one test below deliberately
+    turns the prescreen back on to prove it is wired in.
+    """
+    import leoma.app.validator.main as vmain
+
+    spec = pinned_spec()
+    monkeypatch.setattr(vmain, "SPEC", spec)
+    monkeypatch.setattr(vmain, "CONSENSUS_DIGEST", spec.digest())
+    monkeypatch.setattr(vmain, "PRESCREEN_ENABLED", False)
+    return spec
+
+
+def make_verdict(spec, *, accepted: bool, **extra) -> dict:
+    """A verdict shaped like the real thing — including the consensus echo.
+
+    Tests that skip the echo would sail past ``verify_echo``, which is precisely the
+    guard standing between the subnet and a verdict produced under someone else's
+    parameters. So every fake verdict carries one.
+    """
+    return {
+        "accepted": accepted,
+        "verdict": "challenger" if accepted else "king",
+        "lcb": 0.01 if accepted else -0.01,
+        "mu_hat": 0.02 if accepted else -0.02,
+        "n_clips": spec.duel.n_clips,
+        "echo": spec.model_dump(mode="json"),
+        "audit": {"consensus_digest": spec.digest(), "corpus": {"clip_keys_digest": "sha256:x"}},
+        "verdict_digest": "sha256:v",
+        "produced_at": "2026-07-13T00:00:00+00:00",
+        **extra,
+    }
+
+
+class FakeEvalBox:
+    """In-memory eval server: dispatch returns an id, poll returns the outcome.
+
+    The validator no longer blocks on a duel — it dispatches, persists a slot, and
+    collects the verdict on a later tick. So a test has to drive *ticks*, not calls.
+    :meth:`drive` does that.
+    """
+
+    def __init__(self, monkeypatch, outcome, spec):
+        import leoma.app.validator.main as vmain
+
+        self._outcome = outcome        # (entry) -> dict | BaseException (raised at dispatch)
+        self.spec = spec
+        self.dispatched: list[str] = []
+        self.polled: list[str] = []
+        self.jobs: dict[str, dict] = {}
+        monkeypatch.setattr(vmain, "start_duel", self.start_duel)
+        monkeypatch.setattr(vmain, "poll_duel", self.poll_duel)
+
+    async def start_duel(self, entry, king, block_hash):
+        outcome = self._outcome(entry)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        eval_id = f"eval-{len(self.jobs):04d}"
+        self.jobs[eval_id] = outcome
+        self.dispatched.append(entry.hotkey)
+        return eval_id
+
+    async def poll_duel(self, eval_id):
+        self.polled.append(eval_id)
+        outcome = self.jobs[eval_id]
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    async def drive(self, state, store, entries, *, block, ticks=None):
+        """Run enough ticks to settle + dispatch every challenger."""
+        import leoma.app.validator.main as vmain
+
+        for _ in range(ticks or (len(entries) * 2 + 2)):
+            await vmain.process_challengers(
+                _FakeSubtensor(), object(), state, {}, store, entries, block
+            )
+
+
+class _FakeSubtensor:
+    async def get_block_hash(self, block):
+        return f"0x{block:064x}"
+
+    async def get_current_block(self):
+        return 1000
+
+    async def blocks_since_last_update(self, netuid, uid):
+        return 10_000
+
+    async def weights_rate_limit(self, netuid):
+        return 100
+
+    async def set_weights(self, **kwargs):
+        return True, "ok"
+
+    async def metagraph(self, netuid):
+        class M:
+            hotkeys: list = []
+
+        return M()

@@ -55,12 +55,15 @@ class TestVerdict:
     def test_deterministic_same_seed(self):
         king = [0.5, 0.52, 0.48, 0.55] * 5
         chall = [0.45, 0.47, 0.44, 0.5] * 5
-        # Same seed -> identical scoring, every field (consensus requires this).
-        # (timestamp is wall-clock and excluded.)
+        # Same seed -> identical scoring, EVERY field. The verdict is a pure
+        # function of its arguments: it used to carry a wall-clock `timestamp`,
+        # which meant two validators that agreed perfectly still produced
+        # different verdict bytes — and so different verdict_digests. The
+        # eval server stamps `produced_at` outside the digested surface instead.
         a = _verdict(king, chall, seed=99)
         b = _verdict(king, chall, seed=99)
-        a.pop("timestamp"); b.pop("timestamp")
         assert a == b
+        assert "timestamp" not in a
 
     def test_reports_averages_and_counts(self):
         king = [0.6, 0.6, 0.6, 0.6]

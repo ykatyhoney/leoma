@@ -126,6 +126,121 @@ def corpus_expand(count, concurrent, query):
     _run_async(run())
 
 
+@corpus.command("build-manifest")
+@click.option("--corpus-id", required=True, help="Version label for this corpus, e.g. leoma-corpus-v1")
+@click.option("--out", "-o", default="manifest.json", help="Where to write the manifest")
+@click.option("--limit", type=int, default=None, help="Only consider the first N source videos (testing)")
+def corpus_build_manifest(corpus_id, out, limit):
+    """Build the pinned corpus manifest from the source bucket.
+
+    Decides each clip's window ONCE, decodes its ground truth, and records the
+    hashes. This is what makes a duel reproducible: at duel time nobody detects
+    scenes, lists buckets, or skips a clip — they just decode the pinned window and
+    check it against the hash recorded here.
+
+    Prints the manifest digest to paste into chain.toml [corpus].manifest_digest.
+    """
+    from leoma.bootstrap import (
+        MAX_VIDEO_SIZE,
+        MIN_VIDEO_SIZE,
+        SOURCE_BUCKET,
+        emit_log as log,
+        emit_header as log_header,
+    )
+    from leoma.eval.manifest import DecodeParams
+    from leoma.infra.chain_config import SPEC
+    from leoma.infra.corpus_manifest import build_manifest, write_manifest
+    from leoma.infra.storage_backend import create_source_read_client
+
+    log_header("Building Corpus Manifest")
+
+    # The decode params come from the PINNED [gen] block, never from flags: the
+    # truth hashes are only meaningful relative to them, and a manifest built under
+    # different numbers would fail every hash check at duel time.
+    decode = DecodeParams(
+        width=SPEC.gen.width,
+        height=SPEC.gen.height,
+        fps=SPEC.gen.fps,
+        num_frames=SPEC.gen.num_frames,
+    )
+    log(f"Decode: {decode.width}x{decode.height} @ {decode.fps}fps x {decode.num_frames} frames", "info")
+
+    client = create_source_read_client()
+    keys = [
+        obj.object_name
+        for obj in client.list_objects(SOURCE_BUCKET, recursive=True)
+        if obj.object_name.endswith(".mp4") and MIN_VIDEO_SIZE < obj.size < MAX_VIDEO_SIZE
+    ]
+    keys.sort()
+    if limit:
+        keys = keys[:limit]
+    log(f"Considering {len(keys)} source videos from {SOURCE_BUCKET}", "info")
+
+    manifest = build_manifest(
+        client, SOURCE_BUCKET, corpus_id=corpus_id, decode=decode, keys=keys,
+        log=lambda m: log(m, "info"),
+    )
+    digest = write_manifest(manifest, out)
+
+    log_header("Manifest Built")
+    log(f"{len(manifest)} clips -> {out}", "success")
+    log(f"digest: {digest}", "success")
+    log("Paste into chain.toml [corpus].manifest_digest, then `leoma corpus publish-manifest`", "info")
+
+
+@corpus.command("publish-manifest")
+@click.argument("path", type=click.Path(exists=True))
+def corpus_publish_manifest(path):
+    """Upload a built manifest to the corpus bucket at the pinned key."""
+    from leoma.bootstrap import emit_log as log, emit_header as log_header
+    from leoma.infra.chain_config import SPEC
+    from leoma.infra.corpus_manifest import publish_manifest, read_manifest
+    from leoma.infra.storage_backend import create_source_write_client
+
+    log_header("Publishing Corpus Manifest")
+    manifest = read_manifest(path)
+    client = create_source_write_client()
+    digest = publish_manifest(client, SPEC.corpus.bucket, SPEC.corpus.manifest_key, manifest)
+
+    log(f"Published {len(manifest)} clips to {SPEC.corpus.bucket}/{SPEC.corpus.manifest_key}", "success")
+    log(f"digest: {digest}", "success")
+    if digest != SPEC.corpus.manifest_digest:
+        log("chain.toml [corpus].manifest_digest does NOT match this manifest — "
+            "validators will refuse to duel until it is pinned to the digest above", "warn")
+
+
+@corpus.command("verify")
+@click.option("--sample", type=int, default=4, help="How many clips to re-decode (0 = all)")
+def corpus_verify(sample):
+    """Prove THIS box decodes the pinned corpus byte-identically.
+
+    Run this on every new eval box before it duels. A box whose ffmpeg produces even
+    slightly different pixels measures every distance against different ground truth
+    — silently, confidently, and wrongly. A minute here, or a broken consensus in
+    production.
+    """
+    from leoma.bootstrap import emit_log as log, emit_header as log_header
+    from leoma.eval.dataset import fetch_manifest
+    from leoma.infra.chain_config import SPEC
+    from leoma.infra.corpus_manifest import verify_manifest
+    from leoma.infra.storage_backend import create_source_read_client
+
+    log_header("Verifying Corpus")
+    SPEC.require_duel_ready()
+
+    client = create_source_read_client()
+    manifest = fetch_manifest(client, SPEC.corpus)
+    log(f"Manifest {manifest.corpus_id}: {len(manifest)} clips, digest matches chain.toml", "success")
+
+    checked = verify_manifest(
+        client, SPEC.corpus.bucket, manifest,
+        sample=None if sample == 0 else sample,
+        log=lambda m: log(m, "info"),
+    )
+    log_header("Corpus Verified")
+    log(f"{checked} clips decoded byte-identically to the manifest — this box can duel", "success")
+
+
 @cli.group()
 def miner():
     """Miner management commands.
