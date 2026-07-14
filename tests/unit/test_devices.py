@@ -18,6 +18,54 @@ class TestDisabled:
         assert d.challenger_device is None
         assert d.concurrent is False
 
+    def test_a_single_override_with_concurrency_disabled_is_still_ignored(self):
+        """Only one side pinned isn't enough information to safely pick the other,
+        same rule as the concurrent case."""
+        d = resolve_duel_devices(
+            concurrent_enabled=False, cuda_device_count=8, king_device_override="cuda:2",
+        )
+        assert d.king_device is None
+        assert d.challenger_device is None
+        assert d.concurrent is False
+
+
+class TestPinningWithoutConcurrency:
+    """Pinning answers 'which devices to load onto'; concurrency answers 'do the two
+    generations overlap in time'. An operator running several eval-server PROCESSES on
+    one multi-GPU box wants each process's king+challenger spread across its own
+    device pair even if that process still runs its two generations sequentially — so
+    an explicit pair of overrides must be honored regardless of the concurrency flag.
+    """
+
+    def test_both_overrides_are_honored_for_loading_even_with_concurrency_off(self):
+        d = resolve_duel_devices(
+            concurrent_enabled=False, cuda_device_count=8,
+            king_device_override="cuda:2", challenger_device_override="cuda:3",
+        )
+        assert d.king_device == "cuda:2"
+        assert d.challenger_device == "cuda:3"
+        assert d.concurrent is False   # generation is still sequential — not requested
+        assert "sequentially" in d.note
+
+    def test_identical_overrides_with_concurrency_off_still_load_there(self):
+        d = resolve_duel_devices(
+            concurrent_enabled=False, cuda_device_count=8,
+            king_device_override="cuda:0", challenger_device_override="cuda:0",
+        )
+        assert d.king_device == d.challenger_device == "cuda:0"
+        assert d.concurrent is False
+
+    def test_pinning_without_concurrency_ignores_the_reported_device_count(self):
+        """Loading is not a claim about overlap, so it doesn't need >=2 real devices —
+        it works even (degenerately) on a single-GPU box that just wants a named
+        device rather than whatever 'cuda' defaults to."""
+        d = resolve_duel_devices(
+            concurrent_enabled=False, cuda_device_count=1,
+            king_device_override="cuda:0", challenger_device_override="cuda:0",
+        )
+        assert d.king_device == "cuda:0"
+        assert d.concurrent is False
+
 
 class TestInsufficientDevices:
     @pytest.mark.parametrize("count", [0, 1])

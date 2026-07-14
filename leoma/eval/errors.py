@@ -19,6 +19,36 @@ Three faults, three very different consequences:
 """
 from __future__ import annotations
 
+# ---------------------------------------------------------------------------
+# Fatal-CUDA detection — shared by the eval server (whose self-kill logic must
+# see it) and the duel runner (whose concurrent generation must never let one
+# fatal exception get silently outrun by a benign one from the other thread).
+# ---------------------------------------------------------------------------
+#
+# Once a CUDA context is corrupted — an illegal memory access, a device-side
+# assert, a cuBLAS execution failure — the VRAM allocator and every stream on
+# this process are poisoned, and every subsequent call keeps raising against the
+# same dead context. This module is the one place both sides check for it, so
+# the token list can't drift into two different definitions of "fatal."
+_CUDA_FATAL_TOKENS = (
+    "an illegal memory access",
+    "cudaerrorillegaladdress",
+    "device-side assert",
+    "cuda error: misaligned address",
+    "cuda error: unspecified launch failure",
+    "cuda error: an illegal instruction",
+    "cublas_status_execution_failed",
+    "cublas_status_not_initialized",
+    "cudnn_status_execution_failed",
+    "bus error",
+    "segmentation fault",
+)
+
+
+def is_cuda_fatal(exc_or_msg) -> bool:
+    """Does this error mean the CUDA context is unrecoverable (not just this duel)?"""
+    return any(tok in str(exc_or_msg or "").lower() for tok in _CUDA_FATAL_TOKENS)
+
 
 class DuelError(RuntimeError):
     """Base class for every duel-path failure."""
@@ -92,4 +122,5 @@ __all__ = [
     "ChallengerFault",
     "DegenerateGeneration",
     "DuelCancelled",
+    "is_cuda_fatal",
 ]

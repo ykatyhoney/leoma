@@ -62,14 +62,38 @@ def resolve_duel_devices(
     where ``torch.cuda.device_count()`` undercounts what's actually usable). When
     both are given explicitly, they are trusted even if the detected device count
     looks insufficient.
+
+    Pinning is independent of ``concurrent_enabled`` — the two answer different
+    questions. An operator running *several* eval-server processes on one multi-GPU
+    box (one per ``EVAL_SERVER_URLS`` entry) wants each process's king and challenger
+    loaded onto that process's own assigned device pair, so VRAM spreads across GPUs
+    instead of every process piling onto the default device — even if that particular
+    process still runs its own two generations sequentially. So an explicit pair of
+    overrides is honored for *where to load* regardless of ``concurrent_enabled``;
+    only the auto-assigned default (``cuda:0``/``cuda:1`` with no override) requires
+    concurrency to be requested, since picking devices nobody asked for is only
+    justified by the throughput it buys.
     """
+    both_overridden = bool(king_device_override and challenger_device_override)
+
     if not concurrent_enabled:
+        if not both_overridden:
+            return DuelDevices(
+                None, None, False,
+                "concurrent generation disabled; king and challenger share the default device",
+            )
+        if king_device_override == challenger_device_override:
+            return DuelDevices(
+                king_device_override, challenger_device_override, False,
+                f"both duelists pinned to {king_device_override!r}; loading there, generating "
+                "sequentially (concurrent generation not requested)",
+            )
         return DuelDevices(
-            None, None, False,
-            "concurrent generation disabled; king and challenger share the default device",
+            king_device_override, challenger_device_override, False,
+            f"king pinned to {king_device_override}, challenger to {challenger_device_override}; "
+            "loading there, generating sequentially (concurrent generation not requested)",
         )
 
-    both_overridden = bool(king_device_override and challenger_device_override)
     if cuda_device_count < 2 and not both_overridden:
         return DuelDevices(
             king_device_override, challenger_device_override, False,

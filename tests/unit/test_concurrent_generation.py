@@ -147,6 +147,116 @@ class TestFailureModes:
                      delta_threshold=0.0025, alpha=0.05, n_bootstrap=50, concurrent=True)
 
 
+class TestNeitherFutureIsSilentlyDropped:
+    """THE bug this class exists to catch. `king_future.result()` raising immediately
+    would leave `chall_future`'s outcome never retrieved — and an exception nobody ever
+    calls .result()/.exception() on is simply gone: not logged, not re-raised, not
+    seen by the eval server's is_cuda_fatal() self-kill check. A CUDA-fatal error on
+    ONE side must propagate even when the OTHER side raises first, or a benign king-
+    side error, is CUDA-fatal error and the poisoned context both go undetected.
+    """
+
+    def test_a_challenger_side_CUDA_fatal_error_propagates_over_a_benign_king_error(self):
+        """The exact scenario the review reproduced: king benign, challenger fatal —
+        without the fix, only the benign one ever surfaces."""
+        def king_benign(clip, seed):
+            raise RuntimeError("benign king-side hiccup")
+
+        def chall_fatal(clip, seed):
+            raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+        with pytest.raises(RuntimeError, match="illegal memory access"):
+            run_duel(_clips(n=2), king_benign, chall_fatal, mse, master_seed=1,
+                     delta_threshold=0.0025, alpha=0.05, n_bootstrap=50, concurrent=True)
+
+    def test_a_king_side_CUDA_fatal_error_still_propagates_over_a_benign_challenger_error(self):
+        def king_fatal(clip, seed):
+            raise RuntimeError("CUDNN_STATUS_EXECUTION_FAILED")
+
+        def chall_benign(clip, seed):
+            raise RuntimeError("benign challenger-side hiccup")
+
+        with pytest.raises(RuntimeError, match="CUDNN_STATUS_EXECUTION_FAILED"):
+            run_duel(_clips(n=2), king_fatal, chall_benign, mse, master_seed=1,
+                     delta_threshold=0.0025, alpha=0.05, n_bootstrap=50, concurrent=True)
+
+    def test_the_propagated_exception_is_something_is_cuda_fatal_recognizes(self):
+        """Directly proves the eval server's self-kill check would actually fire: the
+        exception that ESCAPES run_duel must itself satisfy is_cuda_fatal()."""
+        from leoma.eval.errors import is_cuda_fatal
+
+        def king_benign(clip, seed):
+            raise RuntimeError("benign")
+
+        def chall_fatal(clip, seed):
+            raise RuntimeError("device-side assert triggered")
+
+        try:
+            run_duel(_clips(n=2), king_benign, chall_fatal, mse, master_seed=1,
+                     delta_threshold=0.0025, alpha=0.05, n_bootstrap=50, concurrent=True)
+            assert False, "expected an exception"
+        except RuntimeError as e:
+            assert is_cuda_fatal(e), "the propagated exception must be the CUDA-fatal one"
+
+    def test_when_neither_is_fatal_king_still_wins_matching_the_old_default_order(self):
+        """No behavior change for the common case: both benign -> king's error
+        surfaces, exactly as before concurrency existed."""
+        def king_benign(clip, seed):
+            raise RuntimeError("king benign")
+
+        def chall_benign(clip, seed):
+            raise RuntimeError("challenger benign")
+
+        with pytest.raises(RuntimeError, match="king benign"):
+            run_duel(_clips(n=2), king_benign, chall_benign, mse, master_seed=1,
+                     delta_threshold=0.0025, alpha=0.05, n_bootstrap=50, concurrent=True)
+
+    def test_when_both_are_fatal_the_propagated_one_is_still_recognized_as_fatal(self):
+        from leoma.eval.errors import is_cuda_fatal
+
+        def king_fatal(clip, seed):
+            raise RuntimeError("bus error")
+
+        def chall_fatal(clip, seed):
+            raise RuntimeError("segmentation fault")
+
+        try:
+            run_duel(_clips(n=2), king_fatal, chall_fatal, mse, master_seed=1,
+                     delta_threshold=0.0025, alpha=0.05, n_bootstrap=50, concurrent=True)
+            assert False, "expected an exception"
+        except RuntimeError as e:
+            assert is_cuda_fatal(e)
+
+
+class TestGeneratePairDirectly:
+    """Unit tests on _generate_pair itself, isolated from the rest of run_duel."""
+
+    def test_sequential_mode_is_unaffected_by_the_fix(self):
+        from leoma.eval.video_runner import Clip, GenParams, _generate_pair
+
+        clip = Clip(clip_index=0, first_frame=np.zeros((8, 8, 3), dtype="uint8"), prompt="p",
+                   truth_frames=np.zeros((4, 8, 8, 3), dtype="uint8"), params=GenParams())
+        king = lambda c, s: np.full((4, 8, 8, 3), 1, dtype="uint8")
+        chall = lambda c, s: np.full((4, 8, 8, 3), 2, dtype="uint8")
+
+        k, c = _generate_pair(king, chall, clip, 42, executor=None)
+        assert (k == 1).all() and (c == 2).all()
+
+    def test_concurrent_mode_with_no_errors_returns_both_results(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        from leoma.eval.video_runner import Clip, GenParams, _generate_pair
+
+        clip = Clip(clip_index=0, first_frame=np.zeros((8, 8, 3), dtype="uint8"), prompt="p",
+                   truth_frames=np.zeros((4, 8, 8, 3), dtype="uint8"), params=GenParams())
+        king = lambda c, s: np.full((4, 8, 8, 3), 1, dtype="uint8")
+        chall = lambda c, s: np.full((4, 8, 8, 3), 2, dtype="uint8")
+
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            k, c = _generate_pair(king, chall, clip, 42, executor=ex)
+        assert (k == 1).all() and (c == 2).all()
+
+
 class TestNoThreadLeak:
     def test_the_executor_is_torn_down_after_every_run(self):
         baseline = threading.active_count()

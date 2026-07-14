@@ -47,7 +47,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
-from leoma.eval.errors import DuelCancelled
+from leoma.eval.errors import DuelCancelled, is_cuda_fatal
 from leoma.eval.spec import ConsensusSpec
 
 
@@ -135,27 +135,14 @@ STREAM_POLL_SECONDS = 0.05
 # `cuda_fatal` as TRANSIENT and retries against a — now freshly restarted — box), then
 # `os._exit` to skip atexit hooks that would touch the corrupted GPU and hang.
 # Ported from Teutonic's eval_server self-kill, which cites a real 2.5h box degradation.
-_CUDA_FATAL_TOKENS = (
-    "an illegal memory access",
-    "cudaerrorillegaladdress",
-    "device-side assert",
-    "cuda error: misaligned address",
-    "cuda error: unspecified launch failure",
-    "cuda error: an illegal instruction",
-    "cublas_status_execution_failed",
-    "cublas_status_not_initialized",
-    "cudnn_status_execution_failed",
-    "bus error",
-    "segmentation fault",
-)
+#
+# is_cuda_fatal() itself lives in eval/errors.py, not here: with concurrent king/
+# challenger generation, the duel runner ALSO needs it (to decide which of two
+# simultaneous exceptions must be the one that propagates), and it must be the same
+# token list on both sides rather than two definitions that can drift apart.
 CUDA_FATAL_EXIT_DELAY_S = float(os.environ.get("LEOMA_CUDA_FATAL_DELAY", "3"))
 CUDA_FATAL_EXIT_CODE = int(os.environ.get("LEOMA_CUDA_FATAL_EXIT_CODE", "75"))
 _self_kill_scheduled = threading.Event()
-
-
-def is_cuda_fatal(exc_or_msg) -> bool:
-    """Does this error mean the CUDA context is unrecoverable (not just this duel)?"""
-    return any(tok in str(exc_or_msg or "").lower() for tok in _CUDA_FATAL_TOKENS)
 
 
 def schedule_self_kill(reason: str, *, delay_s: Optional[float] = None) -> None:

@@ -36,7 +36,7 @@ import numpy as np
 
 from leoma.eval.bootstrap import can_still_win, paired_bootstrap_verdict
 from leoma.eval.digests import digest_frames
-from leoma.eval.errors import DuelCancelled
+from leoma.eval.errors import DuelCancelled, is_cuda_fatal
 from leoma.eval.guards import validate_generation
 from leoma.eval.metrics import Metric, get_metric
 from leoma.app.validator.seeds import clip_generation_seed
@@ -105,15 +105,40 @@ def _generate_pair(
     Only the raw pipeline call is concurrent; validation, digesting and scoring stay
     on the caller's thread afterward exactly as in the sequential path, so this is the
     *only* place threading touches the duel at all.
+
+    Both futures are always retrieved before either exception is raised. Calling
+    ``king_future.result()`` first and letting it raise immediately would leave
+    ``chall_future``'s outcome never retrieved — and an exception nobody ever calls
+    ``.result()``/``.exception()`` on is simply dropped, not logged, not re-raised,
+    gone. That is exactly how a CUDA-fatal error on the CHALLENGER side could vanish
+    behind a merely-benign KING-side error: the eval server's self-kill logic only
+    ever inspects the one exception that actually propagates out of ``run_duel``, so a
+    dropped fatal exception means a poisoned CUDA context is never detected, the lock
+    is released, and the *next* challenger inherits a dead GPU.
     """
     if executor is None:
         return generate_king(clip, gseed), generate_challenger(clip, gseed)
     king_future = executor.submit(generate_king, clip, gseed)
     chall_future = executor.submit(generate_challenger, clip, gseed)
-    # If both raise, the king's exception surfaces first — matching the sequential
-    # path, where the king generates before the challenger and a king-side failure
-    # would be seen first.
-    return king_future.result(), chall_future.result()
+
+    king_exc = king_future.exception()   # blocks until done; never raises itself
+    chall_exc = chall_future.exception()
+
+    if king_exc is None and chall_exc is None:
+        return king_future.result(), chall_future.result()
+
+    # At least one side failed. A CUDA-fatal exception must be what propagates,
+    # whichever side it came from — the context is poisoned regardless of which
+    # duelist's generate() call happened to surface it. Otherwise, king-first,
+    # matching the order generation always ran in before concurrency existed.
+    chall_is_the_fatal_one = chall_exc is not None and is_cuda_fatal(chall_exc) and (
+        king_exc is None or not is_cuda_fatal(king_exc)
+    )
+    if chall_is_the_fatal_one:
+        raise chall_exc
+    if king_exc is not None:
+        raise king_exc
+    raise chall_exc
 
 
 def run_duel(
