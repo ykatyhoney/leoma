@@ -85,6 +85,37 @@ class TestRunDuel:
         assert v["early_stopped"] is True
         assert len(v["per_clip"]) < 20  # bailed early
 
+    def test_disabled_early_stop_preserves_a_late_comeback(self):
+        """An assumed bound can be exceeded; None must always score the full exam."""
+        clips = _clips(n=20)
+
+        def king(clip, _seed):
+            if clip.clip_index < 2:
+                return clip.truth_frames
+            return np.clip(clip.truth_frames.astype(float) + 90, 0, 255).astype("uint8")
+
+        def challenger(clip, _seed):
+            if clip.clip_index < 2:
+                return np.clip(clip.truth_frames.astype(float) + 90, 0, 255).astype("uint8")
+            return clip.truth_frames
+
+        complete = run_duel(
+            clips, king, challenger, mse, master_seed=3,
+            delta_threshold=0.0025, alpha=0.001, n_bootstrap=500,
+            early_stop_max_advantage=None,
+        )
+        unsafe = run_duel(
+            clips, king, challenger, mse, master_seed=3,
+            delta_threshold=0.0025, alpha=0.001, n_bootstrap=500,
+            early_stop_max_advantage=0.05,
+        )
+
+        assert complete["verdict"] == "challenger"
+        assert complete["early_stopped"] is False
+        assert len(complete["per_clip"]) == len(clips)
+        assert unsafe["verdict"] == "king"
+        assert unsafe["early_stopped"] is True
+
     def test_no_clips_raises(self):
         with pytest.raises(ValueError):
             run_duel([], _far, _near, mse, master_seed=1, delta_threshold=0.0025, alpha=0.001, n_bootstrap=10)

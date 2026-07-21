@@ -525,6 +525,7 @@ async def _publish_dashboard(
                 "delta_threshold": SPEC.duel.delta_threshold,
                 "alpha": SPEC.duel.alpha,
                 "n_bootstrap": SPEC.duel.n_bootstrap,
+                "early_stop_enabled": SPEC.duel.early_stop_enabled,
                 "consensus_digest": CONSENSUS_DIGEST,
                 "corpus_pinned": SPEC.corpus.pinned,
             },

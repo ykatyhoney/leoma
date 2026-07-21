@@ -20,7 +20,8 @@ class TestNoDefaults:
     """A field with a default is a field a validator can silently forget."""
 
     @pytest.mark.parametrize("missing", ["metric", "metric_device", "n_clips",
-                                         "delta_threshold", "alpha", "n_bootstrap"])
+                                         "delta_threshold", "alpha", "n_bootstrap",
+                                         "early_stop_enabled"])
     def test_a_missing_duel_field_raises(self, missing):
         spec = pinned_spec()
         fields = spec.duel.model_dump()
@@ -120,36 +121,23 @@ class TestUnpinnedCorpusFailsClosed:
 
 
 class TestEarlyStopBound:
-    def test_derived_from_the_threshold_so_it_tracks_recalibration(self):
+    def test_shipped_consensus_disables_unproven_bound(self):
         spec = pinned_spec()
-        assert spec.early_stop_max_advantage == pytest.approx(
-            spec.duel.early_stop_factor * spec.duel.delta_threshold
-        )
+        assert spec.duel.early_stop_enabled is False
+        assert spec.early_stop_max_advantage is None
 
-    def test_at_20x_it_cannot_touch_a_marginal_challenger(self):
-        """Sanity-check the bound is loose enough to only kill hopeless models.
-
-        With 32 clips and delta=0.0025, early stop can only fire if the challenger
-        is already so far behind that even a perfect run of the remaining clips
-        can't reach the threshold. A challenger that is merely *slightly* worse
-        must always be scored to the end — otherwise the bound is silently changing
-        verdicts, not just saving GPU.
-        """
-        from leoma.eval.bootstrap import can_still_win
-
+    def test_enabled_bound_is_derived_from_pinned_factor(self):
         spec = pinned_spec()
-        bound = spec.early_stop_max_advantage
-        n = spec.duel.n_clips
-
-        # Halfway in, and marginally behind: must keep going.
-        marginal = [-0.001] * (n // 2)
-        assert can_still_win(
-            [0.0] * (n // 2), [-d for d in marginal], remaining=n // 2,
-            delta_threshold=spec.duel.delta_threshold, best_possible_advantage=bound,
+        enabled = spec.model_copy(
+            update={"duel": spec.duel.model_copy(update={"early_stop_enabled": True})}
+        )
+        assert enabled.early_stop_max_advantage == pytest.approx(
+            enabled.duel.early_stop_factor * enabled.duel.delta_threshold
         )
 
-        # Halfway in, and hopelessly behind: stop.
-        assert not can_still_win(
-            [0.0] * (n // 2), [10.0] * (n // 2), remaining=n // 2,
-            delta_threshold=spec.duel.delta_threshold, best_possible_advantage=bound,
+    def test_enablement_changes_consensus_digest(self):
+        spec = pinned_spec()
+        enabled = spec.model_copy(
+            update={"duel": spec.duel.model_copy(update={"early_stop_enabled": True})}
         )
+        assert enabled.digest() != spec.digest()

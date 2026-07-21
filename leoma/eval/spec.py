@@ -21,7 +21,7 @@ Two design rules do the real work:
 """
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -100,9 +100,13 @@ class DuelSpec(_Pinned):
     alpha: float = Field(gt=0, lt=1)
     n_bootstrap: int = Field(ge=1)
     base_seed: int
-    #: Early stop fires at ``early_stop_factor × delta_threshold`` of best-possible
-    #: remaining advantage. Expressed as a multiple so it tracks the metric's scale
-    #: through any recalibration instead of being a magic constant.
+    #: Early stopping is consensus-visible because enabling it can change how many
+    #: clips are scored. It must remain disabled unless ``early_stop_factor`` is
+    #: backed by a proven global upper bound for the pinned metric's per-clip
+    #: advantage. An empirical quantile or a convenient multiple is not such a bound.
+    early_stop_enabled: bool
+    #: When enabled, each remaining clip is assumed able to contribute at most
+    #: ``early_stop_factor × delta_threshold`` of challenger advantage.
     early_stop_factor: float = Field(ge=0)
     #: The freeze-baseline gate's margin, as a fraction of the cheat's own mean score.
     #: Dimensionless on purpose — see chain.toml.
@@ -143,8 +147,10 @@ class ConsensusSpec(_Pinned):
         return digest_obj(self.model_dump(mode="json"))
 
     @property
-    def early_stop_max_advantage(self) -> float:
-        """The absolute early-stop bound, derived from the pinned multiple."""
+    def early_stop_max_advantage(self) -> Optional[float]:
+        """Return the pinned bound only when early stopping is explicitly enabled."""
+        if not self.duel.early_stop_enabled:
+            return None
         return self.duel.early_stop_factor * self.duel.delta_threshold
 
     def require_duel_ready(self) -> None:
