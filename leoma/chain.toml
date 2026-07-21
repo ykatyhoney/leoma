@@ -102,12 +102,14 @@ delta_threshold = 0.0025
 alpha = 0.001
 n_bootstrap = 10000
 base_seed = 0
-# Early stop fires once the challenger cannot reach delta_threshold even if every
-# remaining clip went as well as it possibly could. Expressed as a MULTIPLE of the
-# threshold so it tracks the metric's scale through any recalibration. At 20x it only
-# fires on a hopeless model and cannot touch a marginal contender — and since an early
-# stop can only ever yield verdict="king", a validator running with it still agrees
-# with one running without it.
+# Disabled for launch safety. Early stopping is only verdict-preserving when the
+# assumed per-clip advantage is a proven global upper bound for the pinned metric.
+# LPIPS has no established 0.05 bound, so the old 20x heuristic could reject a model
+# before later clips completed a legitimate comeback.
+early_stop_enabled = false
+# Retained as a pinned future setting. It has no effect while disabled. Do not enable
+# it based on an empirical percentile or observed maximum; first establish a true
+# metric bound and cover the equivalence with adversarial tests.
 early_stop_factor = 20.0
 # The freeze-baseline gate. A challenger must beat not only the king but a trivial
 # "hold the conditioning frame" cheat — CONFIDENTLY — or it is rejected even if it beat
