@@ -28,11 +28,16 @@ SCORED_MODULES = (
     "eval/_clip.py",
     "eval/bootstrap.py",
     "eval/video_runner.py",
+    "eval/devices.py",
+    "eval/arch_lock.py",
     "eval/dataset.py",
     "eval/manifest.py",
     "eval/spec.py",
     "eval/digests.py",
     "eval/determinism.py",
+    "eval_server.py",
+    "app/validator/prescreen.py",
+    "infra/model_store.py",
     "chain.toml",
 )
 

@@ -29,21 +29,20 @@ from typing import Optional
 from leoma.bootstrap import emit_log as log
 from leoma.eval.arch_lock import ArchMismatch, validate
 from leoma.eval.errors import TransientDuelError
-from leoma.infra.chain_config import ARCH_BASE_REPO, EXTRA_LOCK_KEYS, SPEC
+from leoma.infra.chain_config import EXTRA_LOCK_KEYS, SPEC
 from leoma.infra.model_store import ModelRef, materialize_model
 
 
 def _base_ref() -> Optional[ModelRef]:
     """The pinned base architecture, as a fetchable ref.
 
-    ``base_repo`` is an HF repo id with no digest — it is the *definition* of the
-    architecture, not a competitor in the duel, so it is pinned by name and fetched at
-    its default revision. The configs it yields are what every challenger is diffed
-    against.
+    Both repo and digest are part of the consensus surface. A mutable default revision
+    is not an architecture definition: it could change prescreen decisions without a
+    code deploy or consensus-digest change.
     """
-    if not ARCH_BASE_REPO:
+    if not SPEC.arch.base_repo or not SPEC.arch.base_digest:
         return None
-    return ModelRef(ARCH_BASE_REPO, "hf:" + "0" * 40)
+    return ModelRef(SPEC.arch.base_repo, SPEC.arch.base_digest)
 
 
 def prescreen(repo: str, digest: str, *, base_dir: Optional[str] = None) -> dict:
@@ -75,7 +74,8 @@ def prescreen(repo: str, digest: str, *, base_dir: Optional[str] = None) -> dict
             base_dir = materialize_model(base, config_only=True)
         except Exception as e:  # noqa: BLE001 — the BASE failing to fetch is OUR problem
             raise TransientDuelError(
-                f"could not fetch the pinned base architecture's configs ({ARCH_BASE_REPO}): {e}"
+                "could not fetch the pinned base architecture's configs "
+                f"({SPEC.arch.base_repo}@{SPEC.arch.base_digest}): {e}"
             ) from e
 
     return validate(

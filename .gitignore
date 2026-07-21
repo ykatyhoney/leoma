@@ -15,6 +15,9 @@ venv/
 .env.local
 .env.*.local
 
+# Held-out corpus exam paper; publish to the protected source bucket, never Git.
+/manifest.json
+
 # Docker volumes
 validator-data/
 

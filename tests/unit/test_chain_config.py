@@ -34,6 +34,13 @@ class TestPackagedLocation:
         assert chain_config.NAME == "leoma"
         assert chain_config.ARCH_PIPELINE  # the one live [arch] key
 
+    def test_wan22_base_and_genesis_are_immutably_pinned_together(self):
+        assert chain_config.ARCH_BASE_REPO == "leoma/wan2.2-i2v-a14b-diffusers"
+        assert chain_config.ARCH_BASE_DIGEST.startswith("sha256:")
+        assert chain_config.ARCH_BASE_DIGEST == chain_config.SEED_DIGEST
+        assert chain_config.SEED_REPO == chain_config.ARCH_BASE_REPO
+        assert chain_config.SEED_REPO_BACKEND == "hippius"
+
 
 class TestOverride:
     def test_override_absolute_path(self, tmp_path, monkeypatch):

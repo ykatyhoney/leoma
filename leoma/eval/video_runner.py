@@ -355,6 +355,30 @@ _TORCH_DTYPES = {"bfloat16": "bfloat16", "float16": "float16", "float32": "float
 _king_cache: dict[str, object] = {}
 
 
+def _place_pipeline(pipeline, *, offload: str, device: str):
+    """Apply the consensus-pinned placement policy to a loaded pipeline.
+
+    Wan2.2 A14B contains two transformer experts. Keeping the entire pipeline on a
+    single 80 GB H100 leaves too little room for 480p/81-frame activations, so the
+    production spec uses Diffusers' model-level CPU offload. This helper is kept
+    separate from loading so all three pinned modes can be tested without importing
+    the GPU stack.
+    """
+    if offload == "none":
+        return pipeline.to(device)
+    if not str(device).startswith("cuda"):
+        raise RuntimeError(
+            f"pinned gen.offload={offload!r} requires a CUDA target, got {device!r}"
+        )
+    if offload == "model":
+        pipeline.enable_model_cpu_offload(device=device)
+        return pipeline
+    if offload == "sequential":
+        pipeline.enable_sequential_cpu_offload(device=device)
+        return pipeline
+    raise RuntimeError(f"unsupported pinned gen.offload mode: {offload!r}")
+
+
 def load_video_pipeline(snapshot_dir: str, *, gen, device: Optional[str] = None, cache_key: str = ""):
     """Load the pinned diffusers I2V pipeline for a materialized model snapshot.
 
@@ -391,8 +415,9 @@ def load_video_pipeline(snapshot_dir: str, *, gen, device: Optional[str] = None,
     else:
         dtype = torch.float32  # CPU has no usable bf16 path; tests only
 
+    target_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     pipe = pipeline_cls.from_pretrained(snapshot_dir, torch_dtype=dtype)
-    pipe = pipe.to(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    pipe = _place_pipeline(pipe, offload=gen.offload, device=target_device)
 
     if cache_key:
         # A new king deposed the old one: drop the stale pipeline before holding two.
@@ -418,6 +443,13 @@ def release_pipeline(pipeline) -> None:
     """
     if pipeline is None:
         return
+    try:
+        # Offloaded pipelines carry Accelerate hooks that own device placement.
+        # Remove them before the best-effort CPU move so teardown really releases
+        # their target GPU instead of asking a stale hook to move tensors again.
+        pipeline.remove_all_hooks()
+    except Exception:  # noqa: BLE001 — not every test/fake pipeline has hooks
+        pass
     try:
         pipeline.to("cpu")
     except Exception:  # noqa: BLE001 — a failed move must not mask the real error
@@ -449,7 +481,11 @@ def generate(pipeline, clip: Clip, seed: int) -> np.ndarray:
     from leoma.app.validator.seeds import torch_seed
 
     p = clip.params
-    device = getattr(pipeline, "device", None)
+    # Under CPU offload ``pipeline.device`` is CPU by design, while Diffusers'
+    # execution-device property is the CUDA device selected for its hooks. Preserve
+    # the existing CUDA-generator semantics instead of silently changing RNG streams
+    # just because the weights rest on CPU between component calls.
+    device = getattr(pipeline, "_execution_device", None) or getattr(pipeline, "device", None)
     gen = torch.Generator(device=str(device) if device is not None else "cpu")
     gen.manual_seed(torch_seed(seed))
 

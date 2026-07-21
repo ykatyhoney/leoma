@@ -5,6 +5,7 @@ Provides commands for running the validator and individual services.
 """
 
 import asyncio
+from itertools import islice
 
 import click
 
@@ -118,7 +119,11 @@ def preflight():
         probes = []
         for url in urls:
             try:
-                health = httpx.get(f"{url}/health", timeout=httpx.Timeout(15.0)).json()
+                token = os.environ.get("LEOMA_EVAL_TOKEN", "")
+                headers = {"Authorization": f"Bearer {token}"} if token else {}
+                health = httpx.get(
+                    f"{url}/health", timeout=httpx.Timeout(15.0), headers=headers
+                ).json()
                 probes.append(EvalServerProbe(url, health, None))
             except Exception as e:  # noqa: BLE001
                 probes.append(EvalServerProbe(url, None, str(e)))
@@ -267,7 +272,12 @@ def corpus_expand(count, concurrent, query):
 @corpus.command("build-manifest")
 @click.option("--corpus-id", required=True, help="Version label for this corpus, e.g. leoma-corpus-v1")
 @click.option("--out", "-o", default="manifest.json", help="Where to write the manifest")
-@click.option("--limit", type=int, default=None, help="Only consider the first N source videos (testing)")
+@click.option(
+    "--limit",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Only consider the first N eligible source videos",
+)
 def corpus_build_manifest(corpus_id, out, limit):
     """Build the pinned corpus manifest from the source bucket.
 
@@ -285,12 +295,21 @@ def corpus_build_manifest(corpus_id, out, limit):
         emit_log as log,
         emit_header as log_header,
     )
-    from leoma.eval.manifest import DecodeParams
+    from leoma.eval.manifest import DecodeParams, check_corpus_size, check_decode_compat
     from leoma.infra.chain_config import SPEC
     from leoma.infra.corpus_manifest import build_manifest, write_manifest
     from leoma.infra.storage_backend import create_source_read_client
 
     log_header("Building Corpus Manifest")
+
+    if SOURCE_BUCKET != SPEC.corpus.bucket:
+        raise click.ClickException(
+            "source bucket mismatch: runtime configuration selects "
+            f"{SOURCE_BUCKET!r}, but chain.toml [corpus].bucket pins "
+            f"{SPEC.corpus.bucket!r}. Building from one bucket and evaluating from "
+            "another would make every duel fail. Point R2_SOURCE_BUCKET or "
+            "HIPPIUS_SOURCE_BUCKET at the pinned bucket before building."
+        )
 
     # The decode params come from the PINNED [gen] block, never from flags: the
     # truth hashes are only meaningful relative to them, and a manifest built under
@@ -303,21 +322,40 @@ def corpus_build_manifest(corpus_id, out, limit):
     )
     log(f"Decode: {decode.width}x{decode.height} @ {decode.fps}fps x {decode.num_frames} frames", "info")
 
-    client = create_source_read_client()
-    keys = [
-        obj.object_name
-        for obj in client.list_objects(SOURCE_BUCKET, recursive=True)
-        if obj.object_name.endswith(".mp4") and MIN_VIDEO_SIZE < obj.size < MAX_VIDEO_SIZE
-    ]
-    keys.sort()
-    if limit:
-        keys = keys[:limit]
-    log(f"Considering {len(keys)} source videos from {SOURCE_BUCKET}", "info")
+    try:
+        client = create_source_read_client()
+        eligible_keys = (
+            obj.object_name
+            for obj in client.list_objects(SPEC.corpus.bucket, recursive=True)
+            if obj.object_name.endswith(".mp4") and MIN_VIDEO_SIZE < obj.size < MAX_VIDEO_SIZE
+        )
+        if limit is None:
+            keys = sorted(eligible_keys)
+        else:
+            # S3 ListObjectsV2 returns keys in lexicographic order. Preserve that
+            # deterministic order while stopping after N eligible objects; collecting
+            # the entire archive before slicing made a bounded testnet build unbounded.
+            keys = list(islice(eligible_keys, limit))
+            if keys != sorted(keys):
+                raise RuntimeError(
+                    "object storage returned a non-lexicographic listing; refusing a "
+                    "limited build because its first N inputs would not be reproducible"
+                )
+    except Exception as e:
+        raise click.ClickException(
+            f"could not list source bucket {SPEC.corpus.bucket!r}: {e}"
+        ) from None
+    log(f"Considering {len(keys)} source videos from {SPEC.corpus.bucket}", "info")
 
     manifest = build_manifest(
-        client, SOURCE_BUCKET, corpus_id=corpus_id, decode=decode, keys=keys,
+        client, SPEC.corpus.bucket, corpus_id=corpus_id, decode=decode, keys=keys,
         log=lambda m: log(m, "info"),
     )
+    try:
+        check_decode_compat(manifest, SPEC.gen)
+        check_corpus_size(manifest, SPEC.duel.n_clips)
+    except Exception as e:
+        raise click.ClickException(f"built manifest is not duel-ready: {e}") from None
     digest = write_manifest(manifest, out)
 
     log_header("Manifest Built")
@@ -332,13 +370,19 @@ def corpus_publish_manifest(path):
     """Upload a built manifest to the corpus bucket at the pinned key."""
     from leoma.bootstrap import emit_log as log, emit_header as log_header
     from leoma.infra.chain_config import SPEC
+    from leoma.eval.manifest import check_corpus_size, check_decode_compat
     from leoma.infra.corpus_manifest import publish_manifest, read_manifest
     from leoma.infra.storage_backend import create_source_write_client
 
     log_header("Publishing Corpus Manifest")
-    manifest = read_manifest(path)
-    client = create_source_write_client()
-    digest = publish_manifest(client, SPEC.corpus.bucket, SPEC.corpus.manifest_key, manifest)
+    try:
+        manifest = read_manifest(path)
+        check_decode_compat(manifest, SPEC.gen)
+        check_corpus_size(manifest, SPEC.duel.n_clips)
+        client = create_source_write_client()
+        digest = publish_manifest(client, SPEC.corpus.bucket, SPEC.corpus.manifest_key, manifest)
+    except Exception as e:
+        raise click.ClickException(f"could not publish a duel-ready manifest: {e}") from None
 
     log(f"Published {len(manifest)} clips to {SPEC.corpus.bucket}/{SPEC.corpus.manifest_key}", "success")
     log(f"digest: {digest}", "success")
