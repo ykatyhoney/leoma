@@ -14,13 +14,24 @@ module.exports = {
       autorestart: true,
       max_restarts: 1000,
       env: {
-        NETWORK: "finney",
-        NETUID: "99",
-        WALLET_NAME: "default",
-        HOTKEY_NAME: "default",
+        NETWORK: process.env.NETWORK || "finney",
+        NETUID: process.env.NETUID || "99",
+        WALLET_NAME: process.env.WALLET_NAME || "default",
+        HOTKEY_NAME: process.env.HOTKEY_NAME || "default",
 
         // Where duels are dispatched (SSH-tunnel to the GPU eval box).
-        EVAL_SERVER_URL: "http://localhost:9000",
+        EVAL_SERVER_URL: process.env.EVAL_SERVER_URL || "http://localhost:9000",
+        EVAL_SERVER_URLS: process.env.EVAL_SERVER_URLS || "",
+        LEOMA_EVAL_TOKEN: process.env.LEOMA_EVAL_TOKEN || "",
+
+        // Prescreen + corpus access.
+        HIPPIUS_HUB_TOKEN: process.env.HIPPIUS_HUB_TOKEN || "",
+        OBJECT_STORAGE_BACKEND: process.env.OBJECT_STORAGE_BACKEND || "hippius",
+        HIPPIUS_ENDPOINT: process.env.HIPPIUS_ENDPOINT || "s3.hippius.com",
+        HIPPIUS_REGION: process.env.HIPPIUS_REGION || "decentralized",
+        HIPPIUS_SOURCE_BUCKET: process.env.HIPPIUS_SOURCE_BUCKET || "leoma-source",
+        HIPPIUS_VIDEOS_READ_ACCESS_KEY: process.env.HIPPIUS_VIDEOS_READ_ACCESS_KEY || "",
+        HIPPIUS_VIDEOS_READ_SECRET_KEY: process.env.HIPPIUS_VIDEOS_READ_SECRET_KEY || "",
 
         // Duel parameters live in chain.toml (the consensus surface), not here.
         LEOMA_KING_CHAIN_SIZE: "5",
@@ -28,9 +39,11 @@ module.exports = {
         LEOMA_BURN_UID: "0",
 
         // This validator's own state bucket (durable king state).
-        R2_OWN_BUCKET: "",
-        R2_OWN_WRITE_ACCESS_KEY: "",
-        R2_OWN_WRITE_SECRET_KEY: "",
+        R2_OWN_BUCKET: process.env.R2_OWN_BUCKET || "",
+        R2_OWN_ENDPOINT: process.env.R2_OWN_ENDPOINT || "",
+        R2_OWN_REGION: process.env.R2_OWN_REGION || "auto",
+        R2_OWN_WRITE_ACCESS_KEY: process.env.R2_OWN_WRITE_ACCESS_KEY || "",
+        R2_OWN_WRITE_SECRET_KEY: process.env.R2_OWN_WRITE_SECRET_KEY || "",
       },
     },
   ],

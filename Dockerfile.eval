@@ -27,17 +27,20 @@ ENV PATH="/opt/venv/bin:${PATH}"
 WORKDIR /app
 RUN pip install --no-cache-dir uv
 
-COPY pyproject.toml README.md ./
+COPY pyproject.toml uv.lock README.md ./
 COPY leoma ./leoma
 
-# The [eval] extra is the whole point of this image.
-RUN uv pip install --no-cache '.[eval]'
+# The [eval] extra is the whole point of this image. Frozen sync makes rebuilds use
+# the exact tested CUDA/Diffusers/Transformers graph from uv.lock; an open-ended GPU
+# stack can change generated frames even when Leoma's own source is unchanged.
+RUN uv sync --active --frozen --extra eval --no-dev --no-editable --no-cache
 
 # Fail at BUILD time if the eval stack can't import (torch/diffusers/chain.toml).
 RUN python -c "import leoma.eval_server, leoma.eval.metrics, leoma.infra.chain_config as c; print('eval image OK, pipeline =', c.ARCH_PIPELINE)"
 
 EXPOSE 9000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-  CMD curl -fsS http://127.0.0.1:9000/health || exit 1
+  CMD curl -fsS -H "Authorization: Bearer ${LEOMA_EVAL_TOKEN}" \
+      http://127.0.0.1:9000/health || exit 1
 
 CMD ["leoma", "servers", "eval-server"]

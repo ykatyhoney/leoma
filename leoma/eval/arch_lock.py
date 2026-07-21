@@ -54,6 +54,20 @@ LOCKED_KEYS: dict[str, tuple[str, ...]] = {
         "ffn_dim",
         "text_dim",
     ),
+    # Wan2.2 A14B is a mixture-of-experts pipeline with a second transformer.
+    # It has the same shape-critical surface and must be locked independently;
+    # checking only the first expert would allow incompatible weights through.
+    "transformer_2": (
+        "num_layers",
+        "num_attention_heads",
+        "attention_head_dim",
+        "in_channels",
+        "out_channels",
+        "patch_size",
+        "freq_dim",
+        "ffn_dim",
+        "text_dim",
+    ),
     "vae": (
         "latent_channels",
         "z_dim",
@@ -96,11 +110,22 @@ def load_model_index(snapshot: str | os.PathLike[str]) -> dict:
 
 
 def components(index: dict) -> dict[str, list]:
-    """The component map: name -> [library, class]. Ignores the ``_``-prefixed metadata."""
+    """The enabled component map: name -> [library, class].
+
+    Diffusers serializes intentionally disabled optional components as
+    ``[null, null]``. They load no code and carry no weights, so they are metadata,
+    not executable components. Partially-null pairs remain visible and fail the
+    library/class checks below.
+    """
     return {
         name: value
         for name, value in index.items()
-        if not name.startswith("_") and isinstance(value, list) and len(value) == 2
+        if (
+            not name.startswith("_")
+            and isinstance(value, list)
+            and len(value) == 2
+            and value != [None, None]
+        )
     }
 
 

@@ -15,17 +15,19 @@
 # and expect verdicts produced under the old and new digests to be mutually
 # unreproducible — which is the point. The digest makes it obvious instead of silent.
 #
-# The base architecture is Wan2.1-I2V-14B-480P (480p matches the 832x480 corpus).
+# The base architecture is Wan2.2-I2V-A14B (480p generation matches the 832x480 corpus).
 
 [chain]
 name = "leoma"
-seed_repo = "RendixNetwork/leoma-genesis"
+seed_repo = "leoma/wan2.2-i2v-a14b-diffusers"
 repo_pattern = "^[^/]+/leoma-.+$"
 
 [arch]
 # The pinned base I2V/TI2V model — the reference architecture all challengers
-# fine-tune. Miners submit only weights compatible with this config.
-base_repo = "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"
+# fine-tune. Wan2.2 A14B has two transformer experts; miners must submit weights
+# compatible with this exact immutable config.
+base_repo = "leoma/wan2.2-i2v-a14b-diffusers"
+base_digest = "sha256:79e4cc89edd935e8ea843ae2bd80fb85d3444128bb946990109a33ffafb2184e"
 # diffusers pipeline class used to load + generate with BOTH duelists. If this class
 # cannot be resolved the eval server refuses to run: a silent fallback to some other
 # pipeline would mean the pin is not a pin.
@@ -43,8 +45,8 @@ extra_lock_keys = []
 # subnet burns 100% to UID 0 — deliberately. The old code crowned the first reveal it
 # ever saw, with no duel and no validation, which is strictly worse than burning: it
 # hands the subnet to whoever commits first.
-repo_backend = "hf"
-seed_digest = ""
+repo_backend = "hippius"
+seed_digest = "sha256:79e4cc89edd935e8ea843ae2bd80fb85d3444128bb946990109a33ffafb2184e"
 
 [corpus]
 # The held-out clips, pinned by the digest of the manifest that lists them.
@@ -58,9 +60,9 @@ seed_digest = ""
 # Build and publish:
 #   leoma corpus build-manifest --out manifest.json
 #   leoma corpus publish-manifest manifest.json    # prints the digest to paste below
-bucket = "videos"
-manifest_key = "manifests/leoma-corpus-v1.json"
-manifest_digest = ""
+bucket = "leoma-source"
+manifest_key = "manifests/leoma-testnet-v1.json"
+manifest_digest = "sha256:723a48e655ee7087bd7750892b8e98bc48bd7b61b5097de7e55a020c26a8c159"
 
 [gen]
 # How king and challenger generate. Identical for both, always.
@@ -79,10 +81,11 @@ negative_prompt = "low quality, blurry, distorted"
 prompt_mode = "manifest"
 prompt = ""
 dtype = "bfloat16"
-# Pinned even though it is always "none" today: CPU offload changes the generated
-# frames, hence the distances, hence potentially the crown. An eval box that switched
-# it on to save memory would silently diverge from the fleet. Not a knob — a pin.
-offload = "none"
+# Wan2.2 A14B has two transformer experts. Model-level CPU offload keeps only the
+# active component on each H100, leaving safe VRAM headroom for 480p/81-frame
+# activations. This changes execution and is therefore a consensus pin, not an
+# operator knob: every eval box must run this exact mode.
+offload = "model"
 
 [duel]
 metric = "lpips"

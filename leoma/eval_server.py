@@ -34,6 +34,7 @@ a restart costs exactly one duel, which comes back for free.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import os
 import threading
@@ -269,6 +270,22 @@ class _Job:
 def create_app(runner: Optional[Runner] = None) -> FastAPI:
     app = FastAPI(title="leoma-eval-server")
     run_job: Runner = runner or run_eval_job
+
+    @app.middleware("http")
+    async def require_eval_token(request: Request, call_next):
+        """Authenticate every route when ``LEOMA_EVAL_TOKEN`` is configured.
+
+        Health, poll, stream and cancel expose operational state; POST starts costly
+        model execution. Protecting only POST would still leak job data and leave an
+        unauthenticated cancellation surface.
+        """
+        expected = os.environ.get("LEOMA_EVAL_TOKEN", "")
+        if expected:
+            supplied = request.headers.get("authorization", "")
+            wanted = f"Bearer {expected}"
+            if not hmac.compare_digest(supplied, wanted):
+                return JSONResponse(status_code=401, content={"error": "unauthorized"})
+        return await call_next(request)
 
     lock = threading.Lock()
     lock_guard = threading.Lock()
@@ -542,7 +559,8 @@ def run_eval_job(req: EvalRequest, emit: Emit, should_cancel: ShouldCancel = lam
     Heavy deps (torch/diffusers, the corpus) are imported here, lazily, so the server
     module stays import-safe.
     """
-    from leoma.infra.model_store import ModelRef, cache_path, materialize_model
+    from leoma.infra.model_store import ModelRef, cache_path, materialize_model, snapshot_size
+    from leoma.eval.arch_lock import check_size
     from leoma.infra.storage_backend import create_source_read_client
     from leoma.eval.video_runner import GenParams, load_video_pipeline, duel, release_pipeline
     from leoma.eval.codehash import eval_code_digest
@@ -576,6 +594,11 @@ def run_eval_job(req: EvalRequest, emit: Emit, should_cancel: ShouldCancel = lam
 
     king_dir = _materialize(king_ref, "king")
     chall_dir = _materialize(chall_ref, "challenger")
+    # Prescreen intentionally fetches configs only, so the authoritative full-size
+    # bound can only be applied after materialization. A tiny stub or a disk-filling
+    # artifact must never reach pipeline loading merely because its configs looked
+    # plausible.
+    check_size(snapshot_size(chall_dir))
 
     # A throughput setting, not a consensus one — see eval/devices.py. Resolved from
     # this box's own environment, never from the request: if it changed per-request
@@ -689,10 +712,10 @@ def run_eval_job(req: EvalRequest, emit: Emit, should_cancel: ShouldCancel = lam
 def _check_bind_safety(host: str) -> None:
     """Refuse to expose an unauthenticated GPU box to the network.
 
-    Every route is unauthenticated, and ``POST /eval`` makes the box download and
-    execute an arbitrary model repo. Bound to 0.0.0.0 with no token, that is a remote
-    code execution primitive with a REST API. The validator normally reaches it over
-    an SSH tunnel, so loopback is both safe and sufficient.
+    Without a token, ``POST /eval`` would let a remote caller consume the GPU with
+    arbitrary model refs. The validator normally reaches the box over an SSH tunnel,
+    so loopback is both safe and sufficient. A public bind is allowed only when the
+    Bearer-token middleware above is active.
     """
     if host in ("127.0.0.1", "localhost", "::1"):
         return

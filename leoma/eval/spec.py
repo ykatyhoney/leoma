@@ -73,9 +73,9 @@ class GenSpec(_Pinned):
     prompt: str
     #: bf16 on GPU is the production path; fp32 exists for CPU test runs.
     dtype: Literal["bfloat16", "float16", "float32"]
-    #: Pinned even though it is currently always "none" — an eval box that quietly
-    #: enabled CPU offload would produce different frames, hence different
-    #: distances, hence a different crown. Pinning it makes that impossible to hide.
+    #: Placement is consensus-pinned because changing CPU offload can change frames,
+    #: distances, and therefore the crown. Wan2.2 production uses ``model`` so its
+    #: two transformer experts leave enough H100 VRAM for video activations.
     offload: Literal["none", "model", "sequential"]
 
     @model_validator(mode="after")
@@ -117,6 +117,9 @@ class ArchSpec(_Pinned):
     """The pinned architecture both duelists must be."""
 
     base_repo: str = Field(min_length=1)
+    #: Immutable revision whose configs define the architecture lock. A repo name
+    #: alone is mutable and could silently change which challengers validators accept.
+    base_digest: str = Field(pattern=r"^(sha256:[0-9a-f]{64}|hf:[0-9a-f]{40})$")
     pipeline: str = Field(min_length=1)
 
 

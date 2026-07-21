@@ -20,9 +20,16 @@ services:
       WALLET_NAME: ${WALLET_NAME:-default}
       HOTKEY_NAME: ${HOTKEY_NAME:-default}
       EVAL_SERVER_URL: ${EVAL_SERVER_URL:-http://eval-server:9000}
+      LEOMA_EVAL_TOKEN: ${LEOMA_EVAL_TOKEN:?set LEOMA_EVAL_TOKEN in .env}
       # Duel parameters live in chain.toml (the consensus surface), not here.
       # This validator's own state bucket (durable king state).
-      OBJECT_STORAGE_BACKEND: ${OBJECT_STORAGE_BACKEND:-r2}
+      OBJECT_STORAGE_BACKEND: ${OBJECT_STORAGE_BACKEND:-hippius}
+      HIPPIUS_HUB_TOKEN: ${HIPPIUS_HUB_TOKEN:-}
+      HIPPIUS_ENDPOINT: ${HIPPIUS_ENDPOINT:-s3.hippius.com}
+      HIPPIUS_REGION: ${HIPPIUS_REGION:-decentralized}
+      HIPPIUS_SOURCE_BUCKET: ${HIPPIUS_SOURCE_BUCKET:-leoma-source}
+      HIPPIUS_VIDEOS_READ_ACCESS_KEY: ${HIPPIUS_VIDEOS_READ_ACCESS_KEY:-}
+      HIPPIUS_VIDEOS_READ_SECRET_KEY: ${HIPPIUS_VIDEOS_READ_SECRET_KEY:-}
       R2_OWN_BUCKET: ${R2_OWN_BUCKET:-}
       R2_OWN_WRITE_ACCESS_KEY: ${R2_OWN_WRITE_ACCESS_KEY:-}
       R2_OWN_WRITE_SECRET_KEY: ${R2_OWN_WRITE_SECRET_KEY:-}
@@ -45,13 +52,21 @@ services:
     environment:
       PYTHONUNBUFFERED: "1"
       # 0.0.0.0 is required for cross-container networking; the port is NOT
-      # published to the host. See LEOMA_EVAL_TOKEN in the hardening plan.
+      # published to the host, and every route requires LEOMA_EVAL_TOKEN.
       EVAL_SERVER_HOST: "0.0.0.0"
       EVAL_SERVER_PORT: "9000"
+      LEOMA_EVAL_TOKEN: ${LEOMA_EVAL_TOKEN:?set LEOMA_EVAL_TOKEN in .env}
       HIPPIUS_HUB_TOKEN: ${HIPPIUS_HUB_TOKEN:-}
       LEOMA_MODEL_CACHE_DIR: ${LEOMA_MODEL_CACHE_DIR:-/var/lib/leoma/models}
-      R2_VIDEOS_READ_ACCESS_KEY: ${R2_VIDEOS_READ_ACCESS_KEY:-}
-      R2_VIDEOS_READ_SECRET_KEY: ${R2_VIDEOS_READ_SECRET_KEY:-}
+      OBJECT_STORAGE_BACKEND: ${OBJECT_STORAGE_BACKEND:-hippius}
+      HIPPIUS_ENDPOINT: ${HIPPIUS_ENDPOINT:-s3.hippius.com}
+      HIPPIUS_REGION: ${HIPPIUS_REGION:-decentralized}
+      HIPPIUS_SOURCE_BUCKET: ${HIPPIUS_SOURCE_BUCKET:-leoma-source}
+      HIPPIUS_VIDEOS_READ_ACCESS_KEY: ${HIPPIUS_VIDEOS_READ_ACCESS_KEY:-}
+      HIPPIUS_VIDEOS_READ_SECRET_KEY: ${HIPPIUS_VIDEOS_READ_SECRET_KEY:-}
+      LEOMA_CONCURRENT_GENERATION: "1"
+      LEOMA_KING_DEVICE: cuda:0
+      LEOMA_CHALLENGER_DEVICE: cuda:1
     volumes:
       # Model snapshots are multi-GB; keep them off the container layer so a
       # restart doesn't re-download the king.
@@ -61,7 +76,7 @@ services:
     #     reservations:
     #       devices:
     #         - driver: nvidia
-    #           count: 1
+    #           count: 2
     #           capabilities: [gpu]
 
 volumes:

@@ -63,6 +63,11 @@ from leoma.app.validator.state_store import MAX_DUEL_ATTEMPTS
 from leoma.app.validator import king as K
 
 EVAL_SERVER_URL = os.environ.get("EVAL_SERVER_URL", "http://localhost:9000")
+EVAL_SERVER_TOKEN = os.environ.get("LEOMA_EVAL_TOKEN", "")
+
+
+def _eval_headers() -> dict[str, str]:
+    return {"Authorization": f"Bearer {EVAL_SERVER_TOKEN}"} if EVAL_SERVER_TOKEN else {}
 
 # One eval server means one duel at a time — the next bottleneck once the prescreen
 # is doing its job (a bad model is rejected in seconds, but a QUEUE of good ones still
@@ -219,7 +224,7 @@ async def start_duel(
         "consensus_digest": CONSENSUS_DIGEST,
     }
     timeout = httpx.Timeout(_EVAL_POLL_TIMEOUT, connect=_EVAL_CONNECT_TIMEOUT)
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx.AsyncClient(timeout=timeout, headers=_eval_headers()) as client:
         await preflight_eval_server(client, eval_server_url)
 
         resp = await client.post(f"{eval_server_url}/eval", json=payload)
@@ -235,7 +240,7 @@ async def cancel_duel(eval_id: str, *, eval_server_url: str = EVAL_SERVER_URL) -
 
     timeout = httpx.Timeout(_EVAL_POLL_TIMEOUT, connect=_EVAL_CONNECT_TIMEOUT)
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=timeout, headers=_eval_headers()) as client:
             await client.delete(f"{eval_server_url}/eval/{eval_id}")
     except Exception:  # noqa: BLE001 — the abandon must proceed whether or not this lands
         pass
@@ -254,7 +259,7 @@ async def poll_duel(eval_id: str, *, eval_server_url: str = EVAL_SERVER_URL) -> 
     import httpx
 
     timeout = httpx.Timeout(_EVAL_POLL_TIMEOUT, connect=_EVAL_CONNECT_TIMEOUT)
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx.AsyncClient(timeout=timeout, headers=_eval_headers()) as client:
         resp = await client.get(f"{eval_server_url}/eval/{eval_id}")
         if resp.status_code == 404:
             raise EvalJobFailed(

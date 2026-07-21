@@ -99,6 +99,9 @@ REPO_PATTERN: str = _chain.get("repo_pattern") or rf"^[^/]+/{re.escape(NAME)}-.+
 ARCH_MODULE: str = _arch.get("module", "")
 # The pinned video-gen base: every challenger is weights for THIS architecture.
 ARCH_BASE_REPO: str = _arch.get("base_repo", "")
+# Immutable config revision for the base architecture. Pinning only the repo name
+# would let a mutable tag silently change the prescreen decision across validators.
+ARCH_BASE_DIGEST: str = _arch.get("base_digest", "")
 # diffusers pipeline class used to load king + challenger (e.g. an I2V pipeline).
 ARCH_PIPELINE: str = _arch.get("pipeline", "")
 # Config keys locked to the base arch's values (challenger config must match).
@@ -136,7 +139,11 @@ def _build_spec() -> ConsensusSpec:
             corpus=CorpusSpec(**_corpus),
             gen=GenSpec(**_gen),
             duel=DuelSpec(**_duel),
-            arch=ArchSpec(base_repo=ARCH_BASE_REPO, pipeline=ARCH_PIPELINE),
+            arch=ArchSpec(
+                base_repo=ARCH_BASE_REPO,
+                base_digest=ARCH_BASE_DIGEST,
+                pipeline=ARCH_PIPELINE,
+            ),
             determinism=DeterminismSpec(**_determinism),
         )
     except Exception as e:  # pydantic ValidationError / TypeError
@@ -173,6 +180,7 @@ __all__ = [
     "REPO_PATTERN",
     "ARCH_MODULE",
     "ARCH_BASE_REPO",
+    "ARCH_BASE_DIGEST",
     "ARCH_PIPELINE",
     "EXTRA_LOCK_KEYS",
     "SEED_DIGEST",

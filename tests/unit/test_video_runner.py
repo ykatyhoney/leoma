@@ -12,7 +12,7 @@ from leoma.eval.metrics import (
     make_composite,
     get_metric,
 )
-from leoma.eval.video_runner import Clip, GenParams, run_duel
+from leoma.eval.video_runner import Clip, GenParams, _place_pipeline, run_duel
 
 
 def _clips(n=10, t=4, h=8, w=8, seed=0):
@@ -31,6 +31,35 @@ def _near(clip, seed):  # generation close to ground truth
 
 def _far(clip, seed):   # generation far from ground truth
     return np.clip(clip.truth_frames.astype(float) + 90, 0, 255).astype("uint8")
+
+
+class TestPipelinePlacement:
+    class FakePipeline:
+        def __init__(self):
+            self.calls = []
+
+        def to(self, device):
+            self.calls.append(("to", device))
+            return self
+
+        def enable_model_cpu_offload(self, *, device):
+            self.calls.append(("model", device))
+
+        def enable_sequential_cpu_offload(self, *, device):
+            self.calls.append(("sequential", device))
+
+    @pytest.mark.parametrize(
+        ("mode", "expected"),
+        [("none", "to"), ("model", "model"), ("sequential", "sequential")],
+    )
+    def test_honors_the_consensus_pinned_mode(self, mode, expected):
+        pipe = self.FakePipeline()
+        assert _place_pipeline(pipe, offload=mode, device="cuda:1") is pipe
+        assert pipe.calls == [(expected, "cuda:1")]
+
+    def test_offload_refuses_a_cpu_target(self):
+        with pytest.raises(RuntimeError, match="requires a CUDA target"):
+            _place_pipeline(self.FakePipeline(), offload="model", device="cpu")
 
 
 class TestRunDuel:

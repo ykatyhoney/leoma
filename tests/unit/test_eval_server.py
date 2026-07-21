@@ -55,6 +55,18 @@ def test_health_publishes_the_digests_a_validator_preflights_on():
     assert body["eval_code_digest"].startswith("sha256:")
 
 
+def test_configured_token_protects_every_route(monkeypatch):
+    monkeypatch.setenv("LEOMA_EVAL_TOKEN", "correct-horse")
+    c = TestClient(create_app(runner=lambda req, emit, cancel: {"accepted": False}))
+
+    assert c.get("/health").status_code == 401
+    assert c.get("/health", headers={"Authorization": "Bearer wrong"}).status_code == 401
+    auth = {"Authorization": "Bearer correct-horse"}
+    assert c.get("/health", headers=auth).status_code == 200
+    assert c.post("/eval", json=REQ).status_code == 401
+    assert c.post("/eval", json=REQ, headers=auth).status_code == 200
+
+
 def test_full_duel_flow():
     def runner(req, emit, cancel):
         emit({"phase": "materialize", "which": "king"})

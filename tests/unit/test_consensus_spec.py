@@ -11,7 +11,7 @@ from pydantic import ValidationError
 
 from leoma.eval.digests import canonical_json, digest_obj
 from leoma.eval.errors import ConsensusConfigError
-from leoma.eval.spec import ConsensusSpec, CorpusSpec, DuelSpec, GenSpec, verify_echo
+from leoma.eval.spec import ArchSpec, ConsensusSpec, CorpusSpec, DuelSpec, GenSpec, verify_echo
 
 from .conftest import pinned_spec
 
@@ -44,6 +44,14 @@ class TestNoDefaults:
         with pytest.raises(ValidationError):
             DuelSpec(**spec.duel.model_dump(), future_knob=1)
 
+    @pytest.mark.parametrize("missing", ["base_repo", "base_digest", "pipeline"])
+    def test_a_missing_arch_field_raises(self, missing):
+        spec = pinned_spec()
+        fields = spec.arch.model_dump()
+        fields.pop(missing)
+        with pytest.raises(ValidationError):
+            ArchSpec(**fields)
+
 
 class TestDigest:
     def test_same_spec_same_digest(self):
@@ -53,6 +61,14 @@ class TestDigest:
         base = pinned_spec()
         moved = base.model_copy(
             update={"duel": base.duel.model_copy(update={"n_clips": base.duel.n_clips + 1})}
+        )
+        assert moved.digest() != base.digest()
+
+    def test_base_architecture_digest_changes_the_consensus_digest(self):
+        base = pinned_spec()
+        replacement = "sha256:" + "a" * 64
+        moved = base.model_copy(
+            update={"arch": base.arch.model_copy(update={"base_digest": replacement})}
         )
         assert moved.digest() != base.digest()
 
@@ -102,15 +118,13 @@ class TestVerifyEcho:
             verify_echo(pinned_spec(), {"duel": "not a spec"})
 
 
-class TestUnpinnedCorpusFailsClosed:
-    def test_the_shipped_chain_toml_is_not_duel_ready(self):
-        """It ships unpinned ON PURPOSE. A validator must not duel on "whatever the
-        bucket holds today" — the corpus has to be published and pinned first."""
+class TestCorpusPin:
+    def test_the_shipped_chain_toml_is_pinned_and_duel_ready(self):
+        """The operator-published manifest is the only corpus validators may use."""
         from leoma.infra.chain_config import SPEC
 
-        assert not SPEC.corpus.pinned
-        with pytest.raises(ConsensusConfigError, match="not pinned"):
-            SPEC.require_duel_ready()
+        assert SPEC.corpus.pinned
+        SPEC.require_duel_ready()
 
     def test_a_pinned_corpus_is_duel_ready(self):
         pinned_spec().require_duel_ready()  # does not raise

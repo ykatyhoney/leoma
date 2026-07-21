@@ -90,6 +90,20 @@ class TestPipelineClass:
 
 
 class TestComponents:
+    def test_disabled_optional_components_are_not_executable_components(self, tmp_path):
+        index = {
+            **BASE_INDEX,
+            "image_encoder": [None, None],
+            "image_processor": [None, None],
+        }
+        base = _snapshot(tmp_path / "disabled-base", index=index)
+        mine = _snapshot(tmp_path / "disabled-mine", index=index)
+
+        result = validate(mine, base, pipeline=PIPELINE)
+
+        assert "image_encoder" not in result["components"]
+        assert "image_processor" not in result["components"]
+
     def test_a_missing_component_is_rejected(self, tmp_path, base):
         index = {k: v for k, v in BASE_INDEX.items() if k != "vae"}
         snap = _snapshot(tmp_path / "novae", index=index)
@@ -151,6 +165,23 @@ class TestLockedKeys:
                          transformer={**BASE_TRANSFORMER, "_name_or_path": "my-finetune-v3"})
         validate(snap, base, pipeline=PIPELINE)
 
+    def test_wan22_second_transformer_is_locked(self, tmp_path):
+        index = {**BASE_INDEX, "transformer_2": ["diffusers", "WanTransformer3DModel"]}
+        good = _snapshot(tmp_path / "dual-base", index=index)
+        second = good / "transformer_2"
+        second.mkdir()
+        second.joinpath("config.json").write_text(json.dumps(BASE_TRANSFORMER))
+
+        bad = _snapshot(tmp_path / "dual-bad", index=index)
+        bad_second = bad / "transformer_2"
+        bad_second.mkdir()
+        bad_second.joinpath("config.json").write_text(
+            json.dumps({**BASE_TRANSFORMER, "num_layers": 39})
+        )
+
+        with pytest.raises(ArchMismatch, match="transformer_2/config.json num_layers=39"):
+            validate(bad, good, pipeline=PIPELINE)
+
 
 class TestSizeBound:
     def test_a_stub_repo_is_rejected(self):
@@ -166,6 +197,12 @@ class TestSizeBound:
 
 
 class TestFaultAttribution:
+    def test_prescreen_base_ref_uses_the_consensus_pinned_digest(self):
+        ref = ps._base_ref()
+        assert ref is not None
+        assert ref.repo == ps.SPEC.arch.base_repo
+        assert ref.digest == ps.SPEC.arch.base_digest
+
     def test_an_arch_mismatch_is_PERMANENT_so_it_is_quarantined(self):
         """The artifact is immutable: a wrong-architecture model will be wrong forever.
         Retrying it four times would just waste four prescreens."""

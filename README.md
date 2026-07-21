@@ -93,7 +93,7 @@ The eval server is the GPU box that downloads and runs miner models. Install the
 
 ```bash
 pip install -e '.[eval]'
-cp env.eval.example .env    # fill in HIPPIUS_HUB_TOKEN, R2_VIDEOS_READ_*
+cp env.eval.example .env    # fill in HIPPIUS_HUB_TOKEN, HIPPIUS_VIDEOS_READ_*
 leoma servers eval-server   # FastAPI on EVAL_SERVER_PORT (default 9000)
 ```
 

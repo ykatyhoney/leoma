@@ -14,7 +14,7 @@ miner hotkeys you control.
 The subnet deliberately burns 100% to UID 0 until these are pinned. This is not optional.
 
 1. **Pick the base-model revision** and pin `chain.toml [seed].seed_digest` (the genesis
-   king) to the exact Wan2.1-I2V-14B-480P revision you will run — either a Hippius OCI
+   king) to the exact Wan2.2-I2V-A14B revision you will run — either a Hippius OCI
    digest (`sha256:<64hex>`) or a HuggingFace commit SHA (`hf:<40hex>`). `preflight`
    rejects anything else as unresolvable.
 2. **Build and publish the corpus:**
@@ -83,6 +83,9 @@ leoma servers eval-server           # binds 127.0.0.1; validator reaches it over
 # validator box — set EVAL_SERVER_URLS to the comma-separated list if running more than one
 leoma serve
 ```
+
+For the production 8xH100 layout, cache prewarming, per-device calibration, and
+authenticated four-process configuration, use `docs/PRODUCTION_8XH100_RUNBOOK.md`.
 
 ## 4. Drive the scenarios
 
